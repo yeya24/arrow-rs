@@ -964,7 +964,7 @@ where
 }
 
 /// An in-memory collection of column chunks
-struct InMemoryRowGroup<'a> {
+pub struct InMemoryRowGroup<'a> {
     offset_index: Option<&'a [OffsetIndexMetaData]>,
     /// Column chunks for this row group
     column_chunks: Vec<Option<Arc<ColumnChunkData>>>,
@@ -973,13 +973,28 @@ struct InMemoryRowGroup<'a> {
     metadata: &'a ParquetMetaData,
 }
 
-impl InMemoryRowGroup<'_> {
+impl<'a> InMemoryRowGroup<'a> {
+    pub fn new(
+        offset_index: Option<&'a [OffsetIndexMetaData]>,
+        column_chunks: Vec<Option<Arc<ColumnChunkData>>>,
+        row_count: usize,
+        row_group_idx: usize,
+        metadata: &'a ParquetMetaData,
+    ) -> Self {
+        Self {
+            offset_index,
+            column_chunks,
+            row_count,
+            row_group_idx,
+            metadata,
+        }
+    }
     /// Fetches any additional column data specified in `projection` that is not already
     /// present in `self.column_chunks`.
     ///
     /// If `selection` is provided, only the pages required for the selection
     /// are fetched. Otherwise, all pages are fetched.
-    async fn fetch<T: AsyncFileReader + Send>(
+    pub async fn fetch<T: AsyncFileReader + Send>(
         &mut self,
         input: &mut T,
         projection: &ProjectionMask,
@@ -1130,7 +1145,7 @@ impl RowGroups for InMemoryRowGroup<'_> {
 
 /// An in-memory column chunk
 #[derive(Clone)]
-enum ColumnChunkData {
+pub enum ColumnChunkData {
     /// Column chunk data representing only a subset of data pages
     Sparse {
         /// Length of the full column chunk
