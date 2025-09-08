@@ -29,7 +29,7 @@ use std::collections::VecDeque;
 
 /// A builder for [`ReadPlan`]
 #[derive(Clone)]
-pub(crate) struct ReadPlanBuilder {
+pub struct ReadPlanBuilder {
     batch_size: usize,
     /// Current to apply, includes all filters
     selection: Option<RowSelection>,
@@ -37,7 +37,7 @@ pub(crate) struct ReadPlanBuilder {
 
 impl ReadPlanBuilder {
     /// Create a `ReadPlanBuilder` with the given batch size
-    pub(crate) fn new(batch_size: usize) -> Self {
+    pub fn new(batch_size: usize) -> Self {
         Self {
             batch_size,
             selection: None,
@@ -45,14 +45,13 @@ impl ReadPlanBuilder {
     }
 
     /// Set the current selection to the given value
-    pub(crate) fn with_selection(mut self, selection: Option<RowSelection>) -> Self {
+    pub fn with_selection(mut self, selection: Option<RowSelection>) -> Self {
         self.selection = selection;
         self
     }
 
     /// Returns the current selection, if any
-    #[cfg(feature = "async")]
-    pub(crate) fn selection(&self) -> Option<&RowSelection> {
+    pub fn selection(&self) -> Option<&RowSelection> {
         self.selection.as_ref()
     }
 
@@ -63,12 +62,12 @@ impl ReadPlanBuilder {
     ///
     /// Call [`LimitedReadPlanBuilder::build_limited`] to apply the limits to this
     /// selection.
-    pub(crate) fn limited(self, row_count: usize) -> LimitedReadPlanBuilder {
+    pub fn limited(self, row_count: usize) -> LimitedReadPlanBuilder {
         LimitedReadPlanBuilder::new(self, row_count)
     }
 
     /// Returns true if the current plan selects any rows
-    pub(crate) fn selects_any(&self) -> bool {
+    pub fn selects_any(&self) -> bool {
         self.selection
             .as_ref()
             .map(|s| s.selects_any())
@@ -90,7 +89,7 @@ impl ReadPlanBuilder {
     /// Note: pre-existing selections may come from evaluating a previous predicate
     /// or if the [`ParquetRecordBatchReader`] specified an explicit
     /// [`RowSelection`] in addition to one or more predicates.
-    pub(crate) fn with_predicate(
+    pub fn with_predicate(
         mut self,
         array_reader: Box<dyn ArrayReader>,
         predicate: &mut dyn ArrowPredicate,
@@ -123,7 +122,7 @@ impl ReadPlanBuilder {
     }
 
     /// Create a final `ReadPlan` the read plan for the scan
-    pub(crate) fn build(mut self) -> ReadPlan {
+    pub fn build(mut self) -> ReadPlan {
         // If selection is empty, truncate
         if !self.selects_any() {
             self.selection = Some(RowSelection::from(vec![]));

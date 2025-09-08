@@ -186,4 +186,14 @@ impl RowFilter {
     pub fn new(predicates: Vec<Box<dyn ArrowPredicate>>) -> Self {
         Self { predicates }
     }
+
+    /// Get the predicates of the [`ArrowPredicate`] as a reference
+    pub fn predicates(&self) -> &Vec<Box<dyn ArrowPredicate>> {
+        &self.predicates
+    }
+
+    /// Get the predicates of the [`ArrowPredicate`] as a mutable reference
+    pub fn predicates_mut(&mut self) -> &mut Vec<Box<dyn ArrowPredicate>> {
+        &mut self.predicates
+    }
 }
