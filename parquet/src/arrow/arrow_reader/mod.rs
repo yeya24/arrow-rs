@@ -145,7 +145,7 @@ impl<T: Debug> Debug for ArrowReaderBuilder<T> {
 }
 
 impl<T> ArrowReaderBuilder<T> {
-    pub(crate) fn new_builder(input: T, metadata: ArrowReaderMetadata) -> Self {
+    pub fn new_builder(input: T, metadata: ArrowReaderMetadata) -> Self {
         Self {
             input,
             metadata: metadata.metadata,
