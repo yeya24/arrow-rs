@@ -416,6 +416,10 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
         Self::new_builder(AsyncReader(input), metadata)
     }
 
+    pub fn new_with_metadata_async_reader(input: T, metadata: ArrowReaderMetadata) -> Self {
+        Self::new_builder(AsyncReader(input), metadata)
+    }
+
     /// Read bloom filter for a column in a row group
     ///
     /// Returns `None` if the column does not have a bloom filter

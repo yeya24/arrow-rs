@@ -145,7 +145,7 @@ impl<T: Debug> Debug for ArrowReaderBuilder<T> {
 }
 
 impl<T> ArrowReaderBuilder<T> {
-    pub fn new_builder(input: T, metadata: ArrowReaderMetadata) -> Self {
+    fn new_builder(input: T, metadata: ArrowReaderMetadata) -> Self {
         Self {
             input,
             metadata: metadata.metadata,
@@ -787,6 +787,10 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
     /// assert_eq!(a.next().unwrap().unwrap(), b.next().unwrap().unwrap());
     /// ```
     pub fn new_with_metadata(input: T, metadata: ArrowReaderMetadata) -> Self {
+        Self::new_builder(SyncReader(input), metadata)
+    }
+
+    pub fn new_with_metadata_sync_reader(input: T, metadata: ArrowReaderMetadata) -> Self {
         Self::new_builder(SyncReader(input), metadata)
     }
 
