@@ -92,9 +92,8 @@ variant_test_case!(14);
 variant_test_case!(15);
 variant_test_case!(16);
 variant_test_case!(17);
-// https://github.com/apache/arrow-rs/issues/8330
-variant_test_case!(18, "Unsupported typed_value type: Date32");
-variant_test_case!(19, "Unsupported typed_value type: Date32");
+variant_test_case!(18);
+variant_test_case!(19);
 // https://github.com/apache/arrow-rs/issues/8331
 variant_test_case!(
     20,
@@ -119,9 +118,8 @@ variant_test_case!(26, "Unsupported typed_value type: Decimal128(18, 9)");
 variant_test_case!(27, "Unsupported typed_value type: Decimal128(18, 9)");
 variant_test_case!(28, "Unsupported typed_value type: Decimal128(38, 9)");
 variant_test_case!(29, "Unsupported typed_value type: Decimal128(38, 9)");
-// https://github.com/apache/arrow-rs/issues/8333
-variant_test_case!(30, "Unsupported typed_value type: BinaryView");
-variant_test_case!(31, "Unsupported typed_value type: Utf8");
+variant_test_case!(30);
+variant_test_case!(31);
 // https://github.com/apache/arrow-rs/issues/8334
 variant_test_case!(32, "Unsupported typed_value type: Time64(Microsecond)");
 // https://github.com/apache/arrow-rs/issues/8331
