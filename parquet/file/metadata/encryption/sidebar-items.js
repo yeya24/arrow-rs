@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["EncryptionAlgorithm"],"fn":["get_file_decryptor","parquet_metadata_with_encryption","read_column_metadata","row_group_from_encrypted_thrift"],"struct":["AesGcmCtrV1","AesGcmV1","ColumnMetaData","FileCryptoMetaData"]};
