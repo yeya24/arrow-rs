@@ -45,7 +45,7 @@ use crate::basic::Type;
 use crate::data_type::private::ParquetValueType;
 use crate::data_type::*;
 use crate::errors::{ParquetError, Result};
-use crate::file::metadata::thrift_gen::PageStatistics;
+use crate::file::metadata::thrift::PageStatistics;
 use crate::util::bit_util::FromBytes;
 
 pub(crate) mod private {
@@ -125,21 +125,32 @@ pub(crate) fn from_thrift_page_stats(
 ) -> Result<Option<Statistics>> {
     Ok(match thrift_stats {
         Some(stats) => {
-            // Number of nulls recorded, when it is not available, we just mark it as 0.
-            // TODO this should be `None` if there is no information about NULLS.
-            // see https://github.com/apache/arrow-rs/pull/6216/files
-            let null_count = stats.null_count.unwrap_or(0);
-
-            if null_count < 0 {
-                return Err(ParquetError::General(format!(
-                    "Statistics null count is negative {null_count}",
-                )));
-            }
-
             // Generic null count.
-            let null_count = Some(null_count as u64);
+            let null_count = stats
+                .null_count
+                .map(|null_count| {
+                    if null_count < 0 {
+                        return Err(ParquetError::General(format!(
+                            "Statistics null count is negative {null_count}",
+                        )));
+                    }
+                    Ok(null_count as u64)
+                })
+                .transpose()?;
             // Generic distinct count (count of distinct values occurring)
             let distinct_count = stats.distinct_count.map(|value| value as u64);
+            // Generic nan count for floating point types
+            let nan_count = stats
+                .nan_count
+                .map(|nan_count| {
+                    if nan_count < 0 {
+                        return Err(ParquetError::General(format!(
+                            "Statistics NaN count is negative {nan_count}",
+                        )));
+                    }
+                    Ok(nan_count as u64)
+                })
+                .transpose()?;
             // Whether or not statistics use deprecated min/max fields.
             let old_format = stats.min_value.is_none() && stats.max_value.is_none();
             // Generic min value as bytes.
@@ -155,31 +166,34 @@ pub(crate) fn from_thrift_page_stats(
                 stats.max_value
             };
 
-            fn check_len(min: &Option<Vec<u8>>, max: &Option<Vec<u8>>, len: usize) -> Result<()> {
-                if let Some(min) = min {
-                    if min.len() < len {
-                        return Err(ParquetError::General(
-                            "Insufficient bytes to parse min statistic".to_string(),
-                        ));
-                    }
+            fn check_len(min: Option<&[u8]>, max: Option<&[u8]>, len: usize) -> Result<()> {
+                if let Some(min) = min
+                    && min.len() < len
+                {
+                    return Err(ParquetError::General(
+                        "Insufficient bytes to parse min statistic".to_string(),
+                    ));
                 }
-                if let Some(max) = max {
-                    if max.len() < len {
-                        return Err(ParquetError::General(
-                            "Insufficient bytes to parse max statistic".to_string(),
-                        ));
-                    }
+                if let Some(max) = max
+                    && max.len() < len
+                {
+                    return Err(ParquetError::General(
+                        "Insufficient bytes to parse max statistic".to_string(),
+                    ));
                 }
                 Ok(())
             }
 
-            match physical_type {
-                Type::BOOLEAN => check_len(&min, &max, 1),
-                Type::INT32 | Type::FLOAT => check_len(&min, &max, 4),
-                Type::INT64 | Type::DOUBLE => check_len(&min, &max, 8),
-                Type::INT96 => check_len(&min, &max, 12),
-                _ => Ok(()),
-            }?;
+            {
+                let (min, max) = (min.as_deref(), max.as_deref());
+                match physical_type {
+                    Type::BOOLEAN => check_len(min, max, 1),
+                    Type::INT32 | Type::FLOAT => check_len(min, max, 4),
+                    Type::INT64 | Type::DOUBLE => check_len(min, max, 8),
+                    Type::INT96 => check_len(min, max, 12),
+                    _ => Ok(()),
+                }?;
+            }
 
             // Values are encoded using PLAIN encoding definition, except that
             // variable-length byte arrays do not include a length prefix.
@@ -210,32 +224,50 @@ pub(crate) fn from_thrift_page_stats(
                 Type::INT96 => {
                     // INT96 statistics may not be correct, because comparison is signed
                     let min = if let Some(data) = min {
-                        assert_eq!(data.len(), 12);
+                        if data.len() != 12 {
+                            return Err(ParquetError::General(
+                                "Incorrect Int96 min statistics".to_string(),
+                            ));
+                        }
                         Some(Int96::try_from_le_slice(&data)?)
                     } else {
                         None
                     };
                     let max = if let Some(data) = max {
-                        assert_eq!(data.len(), 12);
+                        if data.len() != 12 {
+                            return Err(ParquetError::General(
+                                "Incorrect Int96 max statistics".to_string(),
+                            ));
+                        }
                         Some(Int96::try_from_le_slice(&data)?)
                     } else {
                         None
                     };
                     Statistics::int96(min, max, distinct_count, null_count, old_format)
                 }
-                Type::FLOAT => Statistics::float(
-                    min.map(|data| f32::from_le_bytes(data[..4].try_into().unwrap())),
-                    max.map(|data| f32::from_le_bytes(data[..4].try_into().unwrap())),
-                    distinct_count,
-                    null_count,
-                    old_format,
+                Type::FLOAT => Statistics::Float(
+                    ValueStatistics::new(
+                        min.map(|data| f32::from_le_bytes(data[..4].try_into().unwrap())),
+                        max.map(|data| f32::from_le_bytes(data[..4].try_into().unwrap())),
+                        distinct_count,
+                        null_count,
+                        old_format,
+                    )
+                    .with_nan_count(nan_count)
+                    .with_max_is_exact(stats.is_max_value_exact.unwrap_or(false))
+                    .with_min_is_exact(stats.is_min_value_exact.unwrap_or(false)),
                 ),
-                Type::DOUBLE => Statistics::double(
-                    min.map(|data| f64::from_le_bytes(data[..8].try_into().unwrap())),
-                    max.map(|data| f64::from_le_bytes(data[..8].try_into().unwrap())),
-                    distinct_count,
-                    null_count,
-                    old_format,
+                Type::DOUBLE => Statistics::Double(
+                    ValueStatistics::new(
+                        min.map(|data| f64::from_le_bytes(data[..8].try_into().unwrap())),
+                        max.map(|data| f64::from_le_bytes(data[..8].try_into().unwrap())),
+                        distinct_count,
+                        null_count,
+                        old_format,
+                    )
+                    .with_nan_count(nan_count)
+                    .with_max_is_exact(stats.is_max_value_exact.unwrap_or(false))
+                    .with_min_is_exact(stats.is_min_value_exact.unwrap_or(false)),
                 ),
                 Type::BYTE_ARRAY => Statistics::ByteArray(
                     ValueStatistics::new(
@@ -256,6 +288,12 @@ pub(crate) fn from_thrift_page_stats(
                         null_count,
                         old_format,
                     )
+                    // Note: We set nan_count here even though we can't verify if this is Float16.
+                    // The spec says nan_count should only be set for Float16 logical type,
+                    // but this function doesn't have access to logical type information.
+                    // Writers should only set nan_count for Float16, and readers should
+                    // handle this gracefully.
+                    .with_nan_count(nan_count)
                     .with_max_is_exact(stats.is_max_value_exact.unwrap_or(false))
                     .with_min_is_exact(stats.is_min_value_exact.unwrap_or(false)),
                 ),
@@ -281,6 +319,11 @@ pub(crate) fn page_stats_to_thrift(stats: Option<&Statistics>) -> Option<PageSta
         .distinct_count_opt()
         .and_then(|value| i64::try_from(value).ok());
 
+    // record nan count if it can fit in i64
+    let nan_count = stats
+        .nan_count_opt()
+        .and_then(|value| i64::try_from(value).ok());
+
     let mut thrift_stats = PageStatistics {
         max: None,
         min: None,
@@ -290,6 +333,7 @@ pub(crate) fn page_stats_to_thrift(stats: Option<&Statistics>) -> Option<PageSta
         min_value: None,
         is_max_value_exact: None,
         is_min_value_exact: None,
+        nan_count,
     };
 
     // Get min/max if set.
@@ -423,11 +467,27 @@ impl Statistics {
     /// Returns number of null values for the column, if known.
     /// Note that this includes all nulls when column is part of the complex type.
     ///
-    /// Note this API returns Some(0) even if the null count was not present
-    /// in the statistics.
-    /// See <https://github.com/apache/arrow-rs/pull/6216/files>
+    /// Note: Versions of this library prior to `58.1.0` returned `0` if the null count
+    /// was not available. This method now returns `None` in that case.
+    ///
+    /// Also, versions of this library prior to `53.1.0` did not store a null count
+    /// statistic when the null count was `0`.
+    ///
+    /// It is unsound to assume that missing nullcount stats mean the column contains no nulls,
+    /// but code that depends on the old behavior can restore it by defaulting to zero:
+    ///
+    /// ```no_run
+    /// # use parquet::file::statistics::Statistics;
+    /// # let statistics: Statistics = todo!();
+    /// let null_count = statistics.null_count_opt().unwrap_or(0);
+    /// ```
     pub fn null_count_opt(&self) -> Option<u64> {
         statistics_enum_func![self, null_count_opt]
+    }
+
+    /// Returns NaN count for floating point types, if known.
+    pub fn nan_count_opt(&self) -> Option<u64> {
+        statistics_enum_func![self, nan_count_opt]
     }
 
     /// Returns `true` if the min value is set, and is an exact min value.
@@ -493,6 +553,8 @@ pub struct ValueStatistics<T> {
     // Distinct count could be omitted in some cases
     distinct_count: Option<u64>,
     null_count: Option<u64>,
+    // NaN count for floating point types
+    nan_count: Option<u64>,
 
     // Whether or not the min or max values are exact, or truncated.
     is_max_value_exact: bool,
@@ -507,7 +569,7 @@ pub struct ValueStatistics<T> {
     is_min_max_backwards_compatible: bool,
 }
 
-impl<T: ParquetValueType> ValueStatistics<T> {
+impl<T> ValueStatistics<T> {
     /// Creates new typed statistics.
     pub fn new(
         min: Option<T>,
@@ -523,6 +585,7 @@ impl<T: ParquetValueType> ValueStatistics<T> {
             max,
             distinct_count,
             null_count,
+            nan_count: None,
             is_min_max_deprecated,
             is_min_max_backwards_compatible: is_min_max_deprecated,
         }
@@ -562,6 +625,16 @@ impl<T: ParquetValueType> ValueStatistics<T> {
         }
     }
 
+    /// Returns NaN count for floating point types.
+    pub fn nan_count_opt(&self) -> Option<u64> {
+        self.nan_count
+    }
+
+    /// Set the NaN count for floating point types.
+    pub fn with_nan_count(self, nan_count: Option<u64>) -> Self {
+        Self { nan_count, ..self }
+    }
+
     /// Returns min value of the statistics, if known.
     pub fn min_opt(&self) -> Option<&T> {
         self.min.as_ref()
@@ -570,16 +643,6 @@ impl<T: ParquetValueType> ValueStatistics<T> {
     /// Returns max value of the statistics, if known.
     pub fn max_opt(&self) -> Option<&T> {
         self.max.as_ref()
-    }
-
-    /// Returns min value as bytes of the statistics, if min value is known.
-    pub fn min_bytes_opt(&self) -> Option<&[u8]> {
-        self.min_opt().map(AsBytes::as_bytes)
-    }
-
-    /// Returns max value as bytes of the statistics, if max value is known.
-    pub fn max_bytes_opt(&self) -> Option<&[u8]> {
-        self.max_opt().map(AsBytes::as_bytes)
     }
 
     /// Whether or not min and max values are set.
@@ -625,6 +688,18 @@ impl<T: ParquetValueType> ValueStatistics<T> {
     /// compatible with being stored in the deprecated `min` and `max` fields
     pub fn is_min_max_backwards_compatible(&self) -> bool {
         self.is_min_max_backwards_compatible
+    }
+}
+
+impl<T: AsBytes> ValueStatistics<T> {
+    /// Returns min value as bytes of the statistics, if min value is known.
+    pub fn min_bytes_opt(&self) -> Option<&[u8]> {
+        self.min_opt().map(AsBytes::as_bytes)
+    }
+
+    /// Returns max value as bytes of the statistics, if max value is known.
+    pub fn max_bytes_opt(&self) -> Option<&[u8]> {
+        self.max_opt().map(AsBytes::as_bytes)
     }
 }
 
@@ -709,6 +784,7 @@ mod tests {
             min_value: None,
             is_max_value_exact: None,
             is_min_value_exact: None,
+            nan_count: None,
         };
 
         from_thrift_page_stats(Type::INT32, Some(thrift_stats)).unwrap();
@@ -789,30 +865,46 @@ mod tests {
     fn test_statistics_partial_eq() {
         let expected = Statistics::int32(Some(12), Some(45), None, Some(11), true);
 
-        assert!(Statistics::int32(Some(12), Some(45), None, Some(11), true) == expected);
-        assert!(Statistics::int32(Some(11), Some(45), None, Some(11), true) != expected);
-        assert!(Statistics::int32(Some(12), Some(44), None, Some(11), true) != expected);
-        assert!(Statistics::int32(Some(12), Some(45), None, Some(23), true) != expected);
-        assert!(Statistics::int32(Some(12), Some(45), None, Some(11), false) != expected);
-
-        assert!(
-            Statistics::int32(Some(12), Some(45), None, Some(11), false)
-                != Statistics::int64(Some(12), Some(45), None, Some(11), false)
+        assert_eq!(
+            Statistics::int32(Some(12), Some(45), None, Some(11), true),
+            expected
+        );
+        assert_ne!(
+            Statistics::int32(Some(11), Some(45), None, Some(11), true),
+            expected
+        );
+        assert_ne!(
+            Statistics::int32(Some(12), Some(44), None, Some(11), true),
+            expected
+        );
+        assert_ne!(
+            Statistics::int32(Some(12), Some(45), None, Some(23), true),
+            expected
+        );
+        assert_ne!(
+            Statistics::int32(Some(12), Some(45), None, Some(11), false),
+            expected
         );
 
-        assert!(
-            Statistics::boolean(Some(false), Some(true), None, None, true)
-                != Statistics::double(Some(1.2), Some(4.5), None, None, true)
+        assert_ne!(
+            Statistics::int32(Some(12), Some(45), None, Some(11), false),
+            Statistics::int64(Some(12), Some(45), None, Some(11), false)
         );
 
-        assert!(
+        assert_ne!(
+            Statistics::boolean(Some(false), Some(true), None, None, true),
+            Statistics::double(Some(1.2), Some(4.5), None, None, true)
+        );
+
+        assert_ne!(
             Statistics::byte_array(
                 Some(ByteArray::from(vec![1, 2, 3])),
                 Some(ByteArray::from(vec![1, 2, 3])),
                 None,
                 None,
                 true
-            ) != Statistics::fixed_len_byte_array(
+            ),
+            Statistics::fixed_len_byte_array(
                 Some(ByteArray::from(vec![1, 2, 3]).into()),
                 Some(ByteArray::from(vec![1, 2, 3]).into()),
                 None,
@@ -821,14 +913,15 @@ mod tests {
             )
         );
 
-        assert!(
+        assert_ne!(
             Statistics::byte_array(
                 Some(ByteArray::from(vec![1, 2, 3])),
                 Some(ByteArray::from(vec![1, 2, 3])),
                 None,
                 None,
                 true,
-            ) != Statistics::ByteArray(
+            ),
+            Statistics::ByteArray(
                 ValueStatistics::new(
                     Some(ByteArray::from(vec![1, 2, 3])),
                     Some(ByteArray::from(vec![1, 2, 3])),
@@ -840,14 +933,15 @@ mod tests {
             )
         );
 
-        assert!(
+        assert_ne!(
             Statistics::fixed_len_byte_array(
                 Some(FixedLenByteArray::from(vec![1, 2, 3])),
                 Some(FixedLenByteArray::from(vec![1, 2, 3])),
                 None,
                 None,
                 true,
-            ) != Statistics::FixedLenByteArray(
+            ),
+            Statistics::FixedLenByteArray(
                 ValueStatistics::new(
                     Some(FixedLenByteArray::from(vec![1, 2, 3])),
                     Some(FixedLenByteArray::from(vec![1, 2, 3])),
@@ -864,10 +958,10 @@ mod tests {
     fn test_statistics_from_thrift() {
         // Helper method to check statistics conversion.
         fn check_stats(stats: Statistics) {
-            let tpe = stats.physical_type();
+            let type_ = stats.physical_type();
             let thrift_stats = page_stats_to_thrift(Some(&stats));
             assert_eq!(
-                from_thrift_page_stats(tpe, thrift_stats).unwrap(),
+                from_thrift_page_stats(type_, thrift_stats).unwrap(),
                 Some(stats)
             );
         }
@@ -1030,6 +1124,7 @@ mod tests {
             min_value: None,
             is_max_value_exact: None,
             is_min_value_exact: None,
+            nan_count: None,
         };
         let err = from_thrift_page_stats(Type::BOOLEAN, Some(tstatistics)).unwrap_err();
         assert_eq!(
@@ -1054,21 +1149,7 @@ mod tests {
         let round_tripped = from_thrift_page_stats(Type::BOOLEAN, Some(thrift_stats))
             .unwrap()
             .unwrap();
-        // TODO: remove branch when we no longer support assuming null_count==None in the thrift
-        // means null_count = Some(0)
-        if null_count.is_none() {
-            assert_ne!(round_tripped, statistics);
-            assert!(round_tripped.null_count_opt().is_some());
-            assert_eq!(round_tripped.null_count_opt(), Some(0));
-            assert_eq!(round_tripped.min_bytes_opt(), statistics.min_bytes_opt());
-            assert_eq!(round_tripped.max_bytes_opt(), statistics.max_bytes_opt());
-            assert_eq!(
-                round_tripped.distinct_count_opt(),
-                statistics.distinct_count_opt()
-            );
-        } else {
-            assert_eq!(round_tripped, statistics);
-        }
+        assert_eq!(round_tripped, statistics);
     }
 
     fn make_bool_stats(distinct_count: Option<u64>, null_count: Option<u64>) -> Statistics {
@@ -1084,5 +1165,193 @@ mod tests {
             null_count,
             is_min_max_deprecated,
         ))
+    }
+
+    #[test]
+    fn test_int96_invalid_statistics() {
+        let mut thrift_stats = PageStatistics {
+            max: None,
+            min: Some((0..13).collect()),
+            null_count: Some(0),
+            distinct_count: None,
+            max_value: None,
+            min_value: None,
+            is_max_value_exact: None,
+            is_min_value_exact: None,
+            nan_count: None,
+        };
+
+        let err = from_thrift_page_stats(Type::INT96, Some(thrift_stats.clone())).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Parquet error: Incorrect Int96 min statistics"
+        );
+
+        thrift_stats.min = None;
+        thrift_stats.max = Some((0..13).collect());
+        let err = from_thrift_page_stats(Type::INT96, Some(thrift_stats)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Parquet error: Incorrect Int96 max statistics"
+        );
+    }
+
+    // Ensures that we can call ValueStatistics::min_opt from a
+    // generic function without reyling on a bound to a private trait.
+    fn generic_statistics_handler<T: std::fmt::Display>(stats: ValueStatistics<T>) -> String {
+        match stats.min_opt() {
+            Some(s) => format!("min: {s}"),
+            None => "min: NA".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_generic_access() {
+        let stats = Statistics::int32(Some(12), Some(45), None, Some(11), false);
+
+        match stats {
+            Statistics::Int32(v) => {
+                let stats_string = generic_statistics_handler(v);
+                assert_eq!(&stats_string, "min: 12");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_nan_count_float() {
+        // Test NaN count for f32
+        let stats = Statistics::Float(
+            ValueStatistics::new(Some(1.0_f32), Some(5.0_f32), None, Some(0), false)
+                .with_nan_count(Some(3)),
+        );
+
+        assert_eq!(stats.nan_count_opt(), Some(3));
+
+        // Verify round-trip through thrift
+        let thrift_stats = page_stats_to_thrift(Some(&stats)).unwrap();
+        assert_eq!(thrift_stats.nan_count, Some(3));
+
+        let round_tripped = from_thrift_page_stats(Type::FLOAT, Some(thrift_stats))
+            .unwrap()
+            .unwrap();
+        assert_eq!(round_tripped.nan_count_opt(), Some(3));
+    }
+
+    #[test]
+    fn test_nan_count_double() {
+        // Test NaN count for f64
+        let stats = Statistics::Double(
+            ValueStatistics::new(Some(1.0_f64), Some(5.0_f64), None, Some(0), false)
+                .with_nan_count(Some(5)),
+        );
+
+        assert_eq!(stats.nan_count_opt(), Some(5));
+
+        // Verify round-trip through thrift
+        let thrift_stats = page_stats_to_thrift(Some(&stats)).unwrap();
+        assert_eq!(thrift_stats.nan_count, Some(5));
+
+        let round_tripped = from_thrift_page_stats(Type::DOUBLE, Some(thrift_stats))
+            .unwrap()
+            .unwrap();
+        assert_eq!(round_tripped.nan_count_opt(), Some(5));
+    }
+
+    #[test]
+    fn test_nan_count_none_for_non_float() {
+        // NaN count should not be set for non-floating point types
+        let stats = Statistics::int32(Some(1), Some(100), None, Some(0), false);
+        assert_eq!(stats.nan_count_opt(), None);
+
+        let thrift_stats = page_stats_to_thrift(Some(&stats)).unwrap();
+        assert_eq!(thrift_stats.nan_count, None);
+    }
+
+    #[test]
+    fn test_nan_count_backwards_compatible() {
+        // Test that missing nan_count field is handled correctly
+        let thrift_stats = PageStatistics {
+            min: None,
+            max: None,
+            min_value: Some(vec![0, 0, 0, 0]), // 0.0_f32 in bytes
+            max_value: Some(vec![0, 0, 128, 63]), // 1.0_f32 in bytes
+            null_count: Some(0),
+            distinct_count: None,
+            nan_count: None, // Not set
+            is_min_value_exact: None,
+            is_max_value_exact: None,
+        };
+
+        let stats = from_thrift_page_stats(Type::FLOAT, Some(thrift_stats))
+            .unwrap()
+            .unwrap();
+
+        // nan_count should be None when not provided
+        assert_eq!(stats.nan_count_opt(), None);
+    }
+
+    #[test]
+    fn test_statistics_with_nan_min_max() {
+        // Test that when there are only NaN values, min/max are NaN
+        let stats = Statistics::Float(
+            ValueStatistics::new(
+                Some(f32::NAN), // min and max should have NaN values
+                Some(f32::NAN),
+                None,
+                Some(0),
+                false,
+            )
+            .with_nan_count(Some(10)), // All values are NaN
+        );
+
+        assert_eq!(stats.min_bytes_opt(), Some(f32::NAN.as_bytes()));
+        assert_eq!(stats.max_bytes_opt(), Some(f32::NAN.as_bytes()));
+        assert_eq!(stats.nan_count_opt(), Some(10));
+
+        // Verify serialization handles this case
+        let thrift_stats = page_stats_to_thrift(Some(&stats)).unwrap();
+        assert_eq!(thrift_stats.min_value, Some(f32::NAN.as_bytes().to_vec()));
+        assert_eq!(thrift_stats.max_value, Some(f32::NAN.as_bytes().to_vec()));
+        assert_eq!(thrift_stats.nan_count, Some(10));
+    }
+
+    #[test]
+    fn test_nan_count_too_large() {
+        // Test that nan_count larger than i64::MAX is not serialized
+        let stats = Statistics::Float(
+            ValueStatistics::new(Some(1.0_f32), Some(2.0_f32), None, Some(0), false)
+                .with_nan_count(Some(u64::MAX)),
+        );
+
+        let thrift_stats = page_stats_to_thrift(Some(&stats)).unwrap();
+        // u64::MAX can't fit in i64, so it should be None
+        assert_eq!(thrift_stats.nan_count, None);
+    }
+
+    #[test]
+    fn test_nan_counts_in_column_index() {
+        // Test that nan_counts are properly collected in page index
+        use crate::file::metadata::ColumnIndexBuilder;
+
+        // Test for floating-point column - all pages must have Some(n)
+        let mut float_builder = ColumnIndexBuilder::new(Type::FLOAT);
+        float_builder.append(false, vec![0u8; 4], vec![255u8; 4], 0, Some(5));
+        float_builder.append(false, vec![0u8; 4], vec![255u8; 4], 2, Some(3));
+        float_builder.append(false, vec![0u8; 4], vec![255u8; 4], 0, Some(0)); // No NaN but still Some(0)
+
+        let float_column_index = float_builder.build().unwrap();
+        // Verify nan_counts field is properly set for float column
+        assert_eq!(float_column_index.nan_counts(), Some(&vec![5, 3, 0]));
+
+        // Test for non-floating-point column - all pages must have None
+        let mut int_builder = ColumnIndexBuilder::new(Type::INT32);
+        int_builder.append(false, vec![0u8; 4], vec![255u8; 4], 0, None);
+        int_builder.append(false, vec![0u8; 4], vec![255u8; 4], 2, None);
+        int_builder.append(false, vec![0u8; 4], vec![255u8; 4], 0, None);
+
+        let int_column_index = int_builder.build().unwrap();
+        // Verify nan_counts field is None for non-float column
+        assert_eq!(int_column_index.nan_counts(), None);
     }
 }

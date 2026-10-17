@@ -19,6 +19,15 @@ use arrow::datatypes::{DataType, Field, Fields, IntervalUnit, TimeUnit, UnionMod
 use arrow::error::{ArrowError, Result};
 use std::sync::Arc;
 
+/// Read a JSON number as an integer of type `T`.
+fn json_int<T: TryFrom<i64>>(what: &str, value: &serde_json::Value) -> Result<T> {
+    let int = value
+        .as_i64()
+        .ok_or_else(|| ArrowError::ParseError(format!("Expecting {what} to be an integer")))?;
+    T::try_from(int)
+        .map_err(|_| ArrowError::ParseError(format!("{what} is out of range for its type: {int}")))
+}
+
 /// Parse a data type from a JSON representation.
 pub fn data_type_from_json(json: &serde_json::Value) -> Result<DataType> {
     use serde_json::Value;
@@ -29,12 +38,17 @@ pub fn data_type_from_json(json: &serde_json::Value) -> Result<DataType> {
             Some(s) if s == "bool" => Ok(DataType::Boolean),
             Some(s) if s == "binary" => Ok(DataType::Binary),
             Some(s) if s == "largebinary" => Ok(DataType::LargeBinary),
+            Some(s) if s == "binaryview" => Ok(DataType::BinaryView),
+            Some(s) if s == "utf8view" => Ok(DataType::Utf8View),
             Some(s) if s == "utf8" => Ok(DataType::Utf8),
             Some(s) if s == "largeutf8" => Ok(DataType::LargeUtf8),
             Some(s) if s == "fixedsizebinary" => {
                 // return a list with any type as its child isn't defined in the map
                 if let Some(Value::Number(size)) = map.get("byteWidth") {
-                    Ok(DataType::FixedSizeBinary(size.as_i64().unwrap() as i32))
+                    Ok(DataType::FixedSizeBinary(json_int(
+                        "byteWidth",
+                        &Value::Number(size.clone()),
+                    )?))
                 } else {
                     Err(ArrowError::ParseError(
                         "Expecting a byteWidth for fixedsizebinary".to_string(),
@@ -44,19 +58,19 @@ pub fn data_type_from_json(json: &serde_json::Value) -> Result<DataType> {
             Some(s) if s == "decimal" => {
                 // return a list with any type as its child isn't defined in the map
                 let precision = match map.get("precision") {
-                    Some(p) => Ok(p.as_u64().unwrap().try_into().unwrap()),
+                    Some(p) => json_int("precision", p),
                     None => Err(ArrowError::ParseError(
                         "Expecting a precision for decimal".to_string(),
                     )),
                 }?;
                 let scale = match map.get("scale") {
-                    Some(s) => Ok(s.as_u64().unwrap().try_into().unwrap()),
+                    Some(s) => json_int("scale", s),
                     _ => Err(ArrowError::ParseError(
                         "Expecting a scale for decimal".to_string(),
                     )),
                 }?;
                 let bit_width: usize = match map.get("bitWidth") {
-                    Some(b) => b.as_u64().unwrap() as usize,
+                    Some(b) => json_int("bitWidth", b)?,
                     _ => 128, // Default bit width
                 };
 
@@ -182,12 +196,20 @@ pub fn data_type_from_json(json: &serde_json::Value) -> Result<DataType> {
                 // return a largelist with any type as its child isn't defined in the map
                 Ok(DataType::LargeList(default_field))
             }
+            Some(s) if s == "listview" => {
+                // return a listview with any type as its child isn't defined in the map
+                Ok(DataType::ListView(default_field))
+            }
+            Some(s) if s == "largelistview" => {
+                // return a large listview with any type as its child isn't defined in the map
+                Ok(DataType::LargeListView(default_field))
+            }
             Some(s) if s == "fixedsizelist" => {
                 // return a list with any type as its child isn't defined in the map
                 if let Some(Value::Number(size)) = map.get("listSize") {
                     Ok(DataType::FixedSizeList(
                         default_field,
-                        size.as_i64().unwrap() as i32,
+                        json_int("listSize", &Value::Number(size.clone()))?,
                     ))
                 } else {
                     Err(ArrowError::ParseError(
@@ -198,6 +220,17 @@ pub fn data_type_from_json(json: &serde_json::Value) -> Result<DataType> {
             Some(s) if s == "struct" => {
                 // return an empty `struct` type as its children aren't defined in the map
                 Ok(DataType::Struct(Fields::empty()))
+            }
+            Some(s) if s == "runendencoded" => {
+                // return a run end encoded with placeholder types as children aren't defined in the map
+                Ok(DataType::RunEndEncoded(
+                    Arc::new(Field::new(
+                        Field::REE_RUN_ENDS_FIELD_DEFAULT_NAME,
+                        DataType::Int32,
+                        false,
+                    )),
+                    default_field,
+                ))
             }
             Some(s) if s == "map" => {
                 if let Some(Value::Bool(keys_sorted)) = map.get("keysSorted") {
@@ -221,10 +254,14 @@ pub fn data_type_from_json(json: &serde_json::Value) -> Result<DataType> {
                         )));
                     };
                     if let Some(values) = map.get("typeIds") {
-                        let values = values.as_array().unwrap();
+                        let values = values.as_array().ok_or_else(|| {
+                            ArrowError::ParseError("Expecting typeIds to be an array".to_string())
+                        })?;
                         let fields = values
                             .iter()
-                            .map(|t| (t.as_i64().unwrap() as i8, default_field.clone()))
+                            .map(|t| Ok((json_int::<i8>("a type id", t)?, default_field.clone())))
+                            .collect::<Result<Vec<_>>>()?
+                            .into_iter()
                             .collect();
 
                         Ok(DataType::Union(fields, union_mode))
@@ -271,9 +308,8 @@ pub fn data_type_to_json(data_type: &DataType) -> serde_json::Value {
         DataType::LargeUtf8 => json!({"name": "largeutf8"}),
         DataType::Binary => json!({"name": "binary"}),
         DataType::LargeBinary => json!({"name": "largebinary"}),
-        DataType::BinaryView | DataType::Utf8View => {
-            unimplemented!("BinaryView/Utf8View not implemented")
-        }
+        DataType::BinaryView => json!({"name": "binaryview"}),
+        DataType::Utf8View => json!({"name": "utf8view"}),
         DataType::FixedSizeBinary(byte_width) => {
             json!({"name": "fixedsizebinary", "byteWidth": byte_width})
         }
@@ -281,9 +317,8 @@ pub fn data_type_to_json(data_type: &DataType) -> serde_json::Value {
         DataType::Union(_, _) => json!({"name": "union"}),
         DataType::List(_) => json!({ "name": "list"}),
         DataType::LargeList(_) => json!({ "name": "largelist"}),
-        DataType::ListView(_) | DataType::LargeListView(_) => {
-            unimplemented!("ListView/LargeListView not implemented")
-        }
+        DataType::ListView(_) => json!({ "name": "listview"}),
+        DataType::LargeListView(_) => json!({ "name": "largelistview"}),
         DataType::FixedSizeList(_, length) => {
             json!({"name":"fixedsizelist", "listSize": length})
         }
@@ -352,7 +387,7 @@ pub fn data_type_to_json(data_type: &DataType) -> serde_json::Value {
         DataType::Map(_, keys_sorted) => {
             json!({"name": "map", "keysSorted": keys_sorted})
         }
-        DataType::RunEndEncoded(_, _) => todo!(),
+        DataType::RunEndEncoded(_, _) => json!({"name": "runendencoded"}),
     }
 }
 

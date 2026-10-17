@@ -27,6 +27,7 @@ use crate::arrow::record_reader::GenericRecordReader;
 use crate::arrow::record_reader::buffer::ValuesBuffer;
 use crate::column::page::PageIterator;
 use crate::column::reader::decoder::ColumnValueDecoder;
+use crate::file::metadata::ParquetMetaData;
 use crate::file::reader::{FilePageIterator, FileReader};
 
 mod builder;
@@ -38,25 +39,33 @@ mod empty_array;
 mod fixed_len_byte_array;
 mod fixed_size_list_array;
 mod list_array;
+mod list_view_array;
 mod map_array;
 mod null_array;
 mod primitive_array;
 mod row_group_cache;
+mod row_group_index;
+mod row_number;
 mod struct_array;
 
 #[cfg(test)]
-mod test_util;
+pub(crate) mod test_util;
 
 // Note that this crate is public under the `experimental` feature flag.
+use crate::file::metadata::RowGroupMetaData;
 pub use builder::{ArrayReaderBuilder, CacheOptions, CacheOptionsBuilder};
 pub use byte_array::make_byte_array_reader;
+// Re-exported (beyond the `experimental` feature) so `file::metadata::dictionary`
+// can PLAIN-decode a raw dictionary page without duplicating this logic.
+pub(crate) use byte_array::ByteArrayDecoderPlain;
 pub use byte_array_dictionary::make_byte_array_dictionary_reader;
-#[allow(unused_imports)] // Only used for benchmarks
+#[cfg_attr(not(feature = "experimental"), expect(unused_imports))]
 pub use byte_view_array::make_byte_view_array_reader;
-#[allow(unused_imports)] // Only used for benchmarks
+#[cfg_attr(not(feature = "experimental"), expect(unused_imports))]
 pub use fixed_len_byte_array::make_fixed_len_byte_array_reader;
 pub use fixed_size_list_array::FixedSizeListArrayReader;
 pub use list_array::ListArrayReader;
+pub use list_view_array::ListViewArrayReader;
 pub use map_array::MapArrayReader;
 pub use null_array::NullArrayReader;
 pub use primitive_array::PrimitiveArrayReader;
@@ -82,7 +91,6 @@ pub use struct_array::StructArrayReader;
 pub trait ArrayReader: Send {
     // TODO: this function is never used, and the trait is not public. Perhaps this should be
     // removed.
-    #[allow(dead_code)]
     fn as_any(&self) -> &dyn Any;
 
     /// Returns the arrow type of this array reader.
@@ -129,6 +137,19 @@ pub trait ArrayReader: Send {
     ///
     /// This is used by parent [`ArrayReader`] to compute their array offsets
     fn get_rep_levels(&self) -> Option<&[i16]>;
+
+    /// Returns the maximum definition level for this reader as defined by
+    /// the Parquet schema. For leaf readers this is the column's max def level;
+    /// for composite readers it is the level at which the composite itself is
+    /// fully defined.
+    ///
+    /// The default panics. Synthetic readers that are not backed by a Parquet
+    /// column (e.g. row-number or empty-struct readers) may rely on this
+    /// default because they are never used as children of schema-driven
+    /// composite readers (list, map, struct), which are the only callers.
+    fn max_def_level(&self) -> i16 {
+        panic!("max_def_level called on a reader that does not track definition levels")
+    }
 }
 
 /// Interface for reading data pages from the columns of one or more RowGroups.
@@ -139,16 +160,34 @@ pub trait RowGroups {
     /// Returns a [`PageIterator`] for all pages in the specified column chunk
     /// across all row groups in this collection.
     fn column_chunks(&self, i: usize) -> Result<Box<dyn PageIterator>>;
+
+    /// Returns an iterator over the row groups in this collection
+    ///
+    /// Note this may not include all row groups in [`Self::metadata`].
+    fn row_groups(&self) -> Box<dyn Iterator<Item = &RowGroupMetaData> + '_>;
+
+    /// Returns the parquet metadata
+    fn metadata(&self) -> &ParquetMetaData;
 }
 
 impl RowGroups for Arc<dyn FileReader> {
     fn num_rows(&self) -> usize {
-        self.metadata().file_metadata().num_rows() as usize
+        FileReader::metadata(self.as_ref())
+            .file_metadata()
+            .num_rows() as usize
     }
 
     fn column_chunks(&self, column_index: usize) -> Result<Box<dyn PageIterator>> {
         let iterator = FilePageIterator::new(column_index, Arc::clone(self))?;
         Ok(Box::new(iterator))
+    }
+
+    fn row_groups(&self) -> Box<dyn Iterator<Item = &RowGroupMetaData> + '_> {
+        Box::new(FileReader::metadata(self.as_ref()).row_groups().iter())
+    }
+
+    fn metadata(&self) -> &ParquetMetaData {
+        FileReader::metadata(self.as_ref())
     }
 }
 

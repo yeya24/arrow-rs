@@ -22,7 +22,7 @@ use crate::encryption::encrypt::{FileEncryptor, encrypt_thrift_object};
 use crate::encryption::modules::{ModuleType, create_module_aad};
 use crate::errors::ParquetError;
 use crate::errors::Result;
-use crate::file::metadata::thrift_gen::PageHeader;
+use crate::file::metadata::thrift::PageHeader;
 use bytes::Bytes;
 use std::io::Write;
 use std::sync::Arc;
@@ -40,7 +40,7 @@ pub(crate) struct PageEncryptor {
 impl PageEncryptor {
     /// Create a [`PageEncryptor`] for a column if it should be encrypted
     pub fn create_if_column_encrypted(
-        file_encryptor: &Option<Arc<FileEncryptor>>,
+        file_encryptor: Option<&Arc<FileEncryptor>>,
         row_group_index: usize,
         column_index: usize,
         column_path: &str,
@@ -99,7 +99,7 @@ impl PageEncryptor {
             PageType::DATA_PAGE => ModuleType::DataPageHeader,
             PageType::DATA_PAGE_V2 => ModuleType::DataPageHeader,
             PageType::DICTIONARY_PAGE => ModuleType::DictionaryPageHeader,
-            _ => {
+            PageType::INDEX_PAGE => {
                 return Err(general_err!(
                     "Unsupported page type for page header encryption: {:?}",
                     page_header.r#type

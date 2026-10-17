@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_ipc::writer;
-use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
+use arrow_schema::{DataType, Field, FieldRef, Fields, Schema, TimeUnit};
 
 use crate::basic::{
     ConvertedType, LogicalType, Repetition, TimeUnit as ParquetTimeUnit, Type as PhysicalType,
@@ -35,14 +35,16 @@ use crate::schema::types::{ColumnDescriptor, SchemaDescriptor, Type};
 mod complex;
 mod extension;
 mod primitive;
+pub mod virtual_type;
 
 use super::PARQUET_FIELD_ID_META_KEY;
 use crate::arrow::ProjectionMask;
 use crate::arrow::schema::extension::{
-    has_extension_type, logical_type_for_fixed_size_binary, logical_type_for_string,
-    logical_type_for_struct, try_add_extension_type,
+    has_extension_type, logical_type_for_binary, logical_type_for_binary_view,
+    logical_type_for_fixed_size_binary, logical_type_for_string, logical_type_for_struct,
+    try_add_extension_type,
 };
-pub(crate) use complex::{ParquetField, ParquetFieldType};
+pub(crate) use complex::{ParquetField, ParquetFieldType, VirtualColumnType};
 
 /// Convert Parquet schema to Arrow schema including optional metadata
 ///
@@ -62,7 +64,7 @@ pub fn parquet_to_arrow_schema_by_columns(
     mask: ProjectionMask,
     key_value_metadata: Option<&Vec<KeyValue>>,
 ) -> Result<Schema> {
-    Ok(parquet_to_arrow_schema_and_fields(parquet_schema, mask, key_value_metadata)?.0)
+    Ok(parquet_to_arrow_schema_and_fields(parquet_schema, mask, key_value_metadata, &[])?.0)
 }
 
 /// Determines the Arrow Schema from a Parquet schema
@@ -74,6 +76,7 @@ pub(crate) fn parquet_to_arrow_schema_and_fields(
     parquet_schema: &SchemaDescriptor,
     mask: ProjectionMask,
     key_value_metadata: Option<&Vec<KeyValue>>,
+    virtual_columns: &[FieldRef],
 ) -> Result<(Schema, Option<ParquetField>)> {
     let mut metadata = parse_key_value_metadata(key_value_metadata).unwrap_or_default();
     let maybe_schema = metadata
@@ -89,7 +92,8 @@ pub(crate) fn parquet_to_arrow_schema_and_fields(
     }
 
     let hint = maybe_schema.as_ref().map(|s| s.fields());
-    let field_levels = parquet_to_arrow_field_levels(parquet_schema, mask, hint)?;
+    let field_levels =
+        parquet_to_arrow_field_levels_with_virtual(parquet_schema, mask, hint, virtual_columns)?;
     let schema = Schema::new_with_metadata(field_levels.fields, metadata);
     Ok((schema, field_levels.levels))
 }
@@ -132,18 +136,123 @@ pub fn parquet_to_arrow_field_levels(
     mask: ProjectionMask,
     hint: Option<&Fields>,
 ) -> Result<FieldLevels> {
-    match complex::convert_schema(schema, mask, hint)? {
-        Some(field) => match &field.arrow_type {
-            DataType::Struct(fields) => Ok(FieldLevels {
-                fields: fields.clone(),
-                levels: Some(field),
-            }),
-            _ => unreachable!(),
-        },
-        None => Ok(FieldLevels {
-            fields: Fields::empty(),
-            levels: None,
+    parquet_to_arrow_field_levels_with_virtual(schema, mask, hint, &[])
+}
+
+/// Convert a parquet [`SchemaDescriptor`] to [`FieldLevels`] with support for virtual columns
+///
+/// Columns not included within [`ProjectionMask`] will be ignored.
+///
+/// The optional `hint` parameter is the desired Arrow schema. See the
+/// [`arrow`] module documentation for more information.
+///
+/// [`arrow`]: crate::arrow
+///
+/// # Arguments
+/// * `schema` - The Parquet schema descriptor
+/// * `mask` - Projection mask to select which columns to include
+/// * `hint` - Optional hint for Arrow field types to use instead of defaults
+/// * `virtual_columns` - Virtual columns to append to the schema (e.g., row numbers)
+///
+/// # Notes:
+/// Where a field type in `hint` is compatible with the corresponding parquet type in `schema`, it
+/// will be used, otherwise the default arrow type for the given parquet column type will be used.
+///
+/// Virtual columns are columns that don't exist in the Parquet file but are generated during reading.
+/// They must have extension type names starting with "arrow.virtual.".
+///
+/// This is to accommodate arrow types that cannot be round-tripped through parquet natively.
+/// Depending on the parquet writer, this can lead to a mismatch between a file's parquet schema
+/// and its embedded arrow schema. The parquet `schema` must be treated as authoritative in such
+/// an event. See [#1663](https://github.com/apache/arrow-rs/issues/1663) for more information
+///
+/// Note: this is a low-level API, most users will want to make use of the higher-level
+/// [`parquet_to_arrow_schema`] for decoding metadata from a parquet file.
+pub fn parquet_to_arrow_field_levels_with_virtual(
+    schema: &SchemaDescriptor,
+    mask: ProjectionMask,
+    hint: Option<&Fields>,
+    virtual_columns: &[FieldRef],
+) -> Result<FieldLevels> {
+    // Validate that all fields are virtual columns
+    for field in virtual_columns {
+        if !virtual_type::is_virtual_column(field) {
+            return Err(ParquetError::General(format!(
+                "Field '{}' is not a virtual column. Virtual columns must have extension type names starting with 'arrow.virtual.'",
+                field.name()
+            )));
+        }
+    }
+
+    // Convert the regular schema first
+    let mut parquet_field = match complex::convert_schema(schema, mask, hint)? {
+        Some(field) => field,
+        None if virtual_columns.is_empty() => {
+            return Ok(FieldLevels {
+                fields: Fields::empty(),
+                levels: None,
+            });
+        }
+        None => {
+            // No regular fields, but we have virtual columns - create empty root struct
+            ParquetField {
+                rep_level: 0,
+                def_level: 0,
+                nullable: false,
+                arrow_type: DataType::Struct(Fields::empty()),
+                field_type: ParquetFieldType::Group {
+                    children: Vec::new(),
+                },
+            }
+        }
+    };
+
+    // Append virtual columns if any
+    if !virtual_columns.is_empty() {
+        match &mut parquet_field.field_type {
+            ParquetFieldType::Group { children } => {
+                // Get the mutable fields from the struct type
+                let DataType::Struct(ref mut fields) = parquet_field.arrow_type else {
+                    unreachable!("Root field must be a struct");
+                };
+
+                // Convert to mutable Vec to append
+                let mut fields_vec: Vec<FieldRef> = fields.iter().cloned().collect();
+
+                // Append each virtual column
+                for virtual_column in virtual_columns {
+                    // Virtual columns can only be added at the root level
+                    assert_eq!(
+                        parquet_field.rep_level, 0,
+                        "Virtual columns can only be added at rep level 0"
+                    );
+                    assert_eq!(
+                        parquet_field.def_level, 0,
+                        "Virtual columns can only be added at def level 0"
+                    );
+
+                    fields_vec.push(virtual_column.clone());
+                    let virtual_parquet_field = complex::convert_virtual_field(
+                        virtual_column,
+                        parquet_field.rep_level,
+                        parquet_field.def_level,
+                    )?;
+                    children.push(virtual_parquet_field);
+                }
+
+                // Update the fields
+                parquet_field.arrow_type = DataType::Struct(Fields::from(fields_vec));
+            }
+            _ => unreachable!("Root field must be a group"),
+        }
+    }
+
+    match &parquet_field.arrow_type {
+        DataType::Struct(fields) => Ok(FieldLevels {
+            fields: fields.clone(),
+            levels: Some(parquet_field),
         }),
+        _ => unreachable!(),
     }
 }
 
@@ -158,10 +267,12 @@ fn get_arrow_schema_from_metadata(encoded_meta: &str) -> Result<Schema> {
                 bytes.as_slice()
             };
             match arrow_ipc::root_as_message(slice) {
-                Ok(message) => message
-                    .header_as_schema()
-                    .map(arrow_ipc::convert::fb_to_schema)
-                    .ok_or_else(|| arrow_err!("the message is not Arrow Schema")),
+                Ok(message) => {
+                    let schema = message
+                        .header_as_schema()
+                        .ok_or_else(|| arrow_err!("the message is not Arrow Schema"))?;
+                    arrow_ipc::convert::try_fb_to_schema(schema).map_err(Into::into)
+                }
                 Err(err) => {
                     // The flatbuffers implementation returns an error on verification error.
                     Err(arrow_err!(
@@ -202,6 +313,15 @@ pub fn encode_arrow_schema(schema: &Schema) -> String {
     BASE64_STANDARD.encode(&len_prefix_schema)
 }
 
+fn flatten_ree_field(field: &Field) -> Field {
+    match field.data_type() {
+        DataType::RunEndEncoded(_, value_field) => field
+            .clone()
+            .with_data_type(value_field.data_type().clone()),
+        _ => field.clone(),
+    }
+}
+
 /// Mutates writer metadata by storing the encoded Arrow schema hint in
 /// [`ARROW_SCHEMA_META_KEY`].
 ///
@@ -209,6 +329,22 @@ pub fn encode_arrow_schema(schema: &Schema) -> String {
 ///
 /// [`ARROW_SCHEMA_META_KEY`]: crate::arrow::ARROW_SCHEMA_META_KEY
 pub fn add_encoded_arrow_schema_to_metadata(schema: &Schema, props: &mut WriterProperties) {
+    let has_ree = schema
+        .fields()
+        .iter()
+        .any(|f| matches!(f.data_type(), DataType::RunEndEncoded(_, _)));
+    let flat_schema;
+    let schema = if has_ree {
+        let flat_fields: Vec<Field> = schema
+            .fields()
+            .iter()
+            .map(|f| flatten_ree_field(f))
+            .collect();
+        flat_schema = Schema::new_with_metadata(flat_fields, schema.metadata().clone());
+        &flat_schema
+    } else {
+        schema
+    };
     let encoded = encode_arrow_schema(schema);
 
     let schema_kv = KeyValue {
@@ -286,7 +422,7 @@ pub struct ArrowSchemaConverter<'a> {
     schema_root: &'a str,
     /// Should we coerce Arrow types to compatible Parquet types?
     ///
-    /// See docs on [Self::with_coerce_types]`
+    /// See docs on [`Self::with_coerce_types`]
     coerce_types: bool,
 }
 
@@ -447,18 +583,12 @@ fn arrow_to_parquet_type(field: &Field, coerce_types: bool) -> Result<Type> {
             .with_id(id)
             .build(),
         DataType::Int8 => Type::primitive_type_builder(name, PhysicalType::INT32)
-            .with_logical_type(Some(LogicalType::Integer {
-                bit_width: 8,
-                is_signed: true,
-            }))
+            .with_logical_type(Some(LogicalType::integer(8, true)))
             .with_repetition(repetition)
             .with_id(id)
             .build(),
         DataType::Int16 => Type::primitive_type_builder(name, PhysicalType::INT32)
-            .with_logical_type(Some(LogicalType::Integer {
-                bit_width: 16,
-                is_signed: true,
-            }))
+            .with_logical_type(Some(LogicalType::integer(16, true)))
             .with_repetition(repetition)
             .with_id(id)
             .build(),
@@ -471,34 +601,22 @@ fn arrow_to_parquet_type(field: &Field, coerce_types: bool) -> Result<Type> {
             .with_id(id)
             .build(),
         DataType::UInt8 => Type::primitive_type_builder(name, PhysicalType::INT32)
-            .with_logical_type(Some(LogicalType::Integer {
-                bit_width: 8,
-                is_signed: false,
-            }))
+            .with_logical_type(Some(LogicalType::integer(8, false)))
             .with_repetition(repetition)
             .with_id(id)
             .build(),
         DataType::UInt16 => Type::primitive_type_builder(name, PhysicalType::INT32)
-            .with_logical_type(Some(LogicalType::Integer {
-                bit_width: 16,
-                is_signed: false,
-            }))
+            .with_logical_type(Some(LogicalType::integer(16, false)))
             .with_repetition(repetition)
             .with_id(id)
             .build(),
         DataType::UInt32 => Type::primitive_type_builder(name, PhysicalType::INT32)
-            .with_logical_type(Some(LogicalType::Integer {
-                bit_width: 32,
-                is_signed: false,
-            }))
+            .with_logical_type(Some(LogicalType::integer(32, false)))
             .with_repetition(repetition)
             .with_id(id)
             .build(),
         DataType::UInt64 => Type::primitive_type_builder(name, PhysicalType::INT64)
-            .with_logical_type(Some(LogicalType::Integer {
-                bit_width: 64,
-                is_signed: false,
-            }))
+            .with_logical_type(Some(LogicalType::integer(64, false)))
             .with_repetition(repetition)
             .with_id(id)
             .build(),
@@ -525,16 +643,16 @@ fn arrow_to_parquet_type(field: &Field, coerce_types: bool) -> Result<Type> {
         }
         DataType::Timestamp(time_unit, tz) => {
             Type::primitive_type_builder(name, PhysicalType::INT64)
-                .with_logical_type(Some(LogicalType::Timestamp {
+                .with_logical_type(Some(LogicalType::timestamp(
                     // If timezone set, values are normalized to UTC timezone
-                    is_adjusted_to_u_t_c: matches!(tz, Some(z) if !z.as_ref().is_empty()),
-                    unit: match time_unit {
+                    matches!(tz, Some(z) if !z.as_ref().is_empty()),
+                    match time_unit {
                         TimeUnit::Second => unreachable!(),
                         TimeUnit::Millisecond => ParquetTimeUnit::MILLIS,
                         TimeUnit::Microsecond => ParquetTimeUnit::MICROS,
                         TimeUnit::Nanosecond => ParquetTimeUnit::NANOS,
                     },
-                }))
+                )))
                 .with_repetition(repetition)
                 .with_id(id)
                 .build()
@@ -566,25 +684,25 @@ fn arrow_to_parquet_type(field: &Field, coerce_types: bool) -> Result<Type> {
                 .build()
         }
         DataType::Time32(unit) => Type::primitive_type_builder(name, PhysicalType::INT32)
-            .with_logical_type(Some(LogicalType::Time {
-                is_adjusted_to_u_t_c: field.metadata().contains_key("adjusted_to_utc"),
-                unit: match unit {
+            .with_logical_type(Some(LogicalType::time(
+                field.metadata().contains_key("adjusted_to_utc"),
+                match unit {
                     TimeUnit::Millisecond => ParquetTimeUnit::MILLIS,
                     u => unreachable!("Invalid unit for Time32: {:?}", u),
                 },
-            }))
+            )))
             .with_repetition(repetition)
             .with_id(id)
             .build(),
         DataType::Time64(unit) => Type::primitive_type_builder(name, PhysicalType::INT64)
-            .with_logical_type(Some(LogicalType::Time {
-                is_adjusted_to_u_t_c: field.metadata().contains_key("adjusted_to_utc"),
-                unit: match unit {
+            .with_logical_type(Some(LogicalType::time(
+                field.metadata().contains_key("adjusted_to_utc"),
+                match unit {
                     TimeUnit::Microsecond => ParquetTimeUnit::MICROS,
                     TimeUnit::Nanosecond => ParquetTimeUnit::NANOS,
                     u => unreachable!("Invalid unit for Time64: {:?}", u),
                 },
-            }))
+            )))
             .with_repetition(repetition)
             .with_id(id)
             .build(),
@@ -604,6 +722,7 @@ fn arrow_to_parquet_type(field: &Field, coerce_types: bool) -> Result<Type> {
             Type::primitive_type_builder(name, PhysicalType::BYTE_ARRAY)
                 .with_repetition(repetition)
                 .with_id(id)
+                .with_logical_type(logical_type_for_binary(field))
                 .build()
         }
         DataType::FixedSizeBinary(length) => {
@@ -617,6 +736,7 @@ fn arrow_to_parquet_type(field: &Field, coerce_types: bool) -> Result<Type> {
         DataType::BinaryView => Type::primitive_type_builder(name, PhysicalType::BYTE_ARRAY)
             .with_repetition(repetition)
             .with_id(id)
+            .with_logical_type(logical_type_for_binary_view(field))
             .build(),
         DataType::Decimal32(precision, scale)
         | DataType::Decimal64(precision, scale)
@@ -624,7 +744,7 @@ fn arrow_to_parquet_type(field: &Field, coerce_types: bool) -> Result<Type> {
         | DataType::Decimal256(precision, scale) => {
             // Decimal precision determines the Parquet physical type to use.
             // Following the: https://github.com/apache/parquet-format/blob/master/LogicalTypes.md#decimal
-            let (physical_type, length) = if *precision > 1 && *precision <= 9 {
+            let (physical_type, length) = if *precision >= 1 && *precision <= 9 {
                 (PhysicalType::INT32, -1)
             } else if *precision <= 18 {
                 (PhysicalType::INT64, -1)
@@ -638,10 +758,7 @@ fn arrow_to_parquet_type(field: &Field, coerce_types: bool) -> Result<Type> {
                 .with_repetition(repetition)
                 .with_id(id)
                 .with_length(length)
-                .with_logical_type(Some(LogicalType::Decimal {
-                    scale: *scale as i32,
-                    precision: *precision as i32,
-                }))
+                .with_logical_type(Some(LogicalType::decimal(*scale as i32, *precision as i32)))
                 .with_precision(*precision as i32)
                 .with_scale(*scale as i32)
                 .build()
@@ -658,7 +775,11 @@ fn arrow_to_parquet_type(field: &Field, coerce_types: bool) -> Result<Type> {
             .with_repetition(repetition)
             .with_id(id)
             .build(),
-        DataType::List(f) | DataType::FixedSizeList(f, _) | DataType::LargeList(f) => {
+        DataType::List(f)
+        | DataType::FixedSizeList(f, _)
+        | DataType::LargeList(f)
+        | DataType::ListView(f)
+        | DataType::LargeListView(f) => {
             let field_ref = if coerce_types && f.name() != PARQUET_LIST_ELEMENT_NAME {
                 // Ensure proper naming per the Parquet specification
                 let ff = f.as_ref().clone().with_name(PARQUET_LIST_ELEMENT_NAME);
@@ -678,9 +799,6 @@ fn arrow_to_parquet_type(field: &Field, coerce_types: bool) -> Result<Type> {
                 .with_repetition(repetition)
                 .with_id(id)
                 .build()
-        }
-        DataType::ListView(_) | DataType::LargeListView(_) => {
-            unimplemented!("ListView/LargeListView not implemented")
         }
         DataType::Struct(fields) => {
             if fields.is_empty() {
@@ -742,9 +860,12 @@ fn arrow_to_parquet_type(field: &Field, coerce_types: bool) -> Result<Type> {
             let dict_field = field.clone().with_data_type(value.as_ref().clone());
             arrow_to_parquet_type(&dict_field, coerce_types)
         }
-        DataType::RunEndEncoded(_, _) => Err(arrow_err!(
-            "Converting RunEndEncodedType to parquet not supported",
-        )),
+        DataType::RunEndEncoded(_, value_field) => {
+            let ree_value_field = field
+                .clone()
+                .with_data_type(value_field.data_type().clone());
+            arrow_to_parquet_type(&ree_value_field, coerce_types)
+        }
     }
 }
 
@@ -854,6 +975,41 @@ mod tests {
             Field::new("decimal7", DataType::Decimal256(39, 2), false),
         ]);
         assert_eq!(&arrow_fields, converted_arrow_schema.fields());
+    }
+
+    #[test]
+    fn test_decimal_precision_physical_types() {
+        let cases = [
+            (1, PhysicalType::INT32, None),
+            (9, PhysicalType::INT32, None),
+            (10, PhysicalType::INT64, None),
+            (18, PhysicalType::INT64, None),
+            (19, PhysicalType::FIXED_LEN_BYTE_ARRAY, Some(9)),
+            (38, PhysicalType::FIXED_LEN_BYTE_ARRAY, Some(16)),
+        ];
+
+        for (precision, expected_type, expected_length) in cases {
+            let arrow_schema = Schema::new(vec![Field::new(
+                "decimal",
+                DataType::Decimal128(precision, 0),
+                false,
+            )]);
+            let parquet_schema = ArrowSchemaConverter::new().convert(&arrow_schema).unwrap();
+            let column = parquet_schema.column(0);
+
+            assert_eq!(
+                column.physical_type(),
+                expected_type,
+                "precision {precision}"
+            );
+            if let Some(expected_length) = expected_length {
+                assert_eq!(
+                    column.type_length(),
+                    expected_length,
+                    "precision {precision}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1612,9 +1768,9 @@ mod tests {
             ),
             Field::new_map(
                 "my_map",
-                "entries",
-                Field::new("keys", DataType::Utf8, false),
-                Field::new("values", DataType::Int32, true),
+                "my_entries",
+                Field::new("my_keys", DataType::Utf8, false),
+                Field::new("my_values", DataType::Int32, true),
                 false,
                 true,
             ),
@@ -1657,9 +1813,9 @@ mod tests {
                 }
             }
             OPTIONAL GROUP my_map (MAP) {
-                REPEATED GROUP entries {
-                    REQUIRED BINARY keys (STRING);
-                    OPTIONAL INT32 values;
+                REPEATED GROUP my_entries {
+                    REQUIRED BINARY my_keys (STRING);
+                    OPTIONAL INT32 my_values;
                 }
             }
         }
@@ -1761,7 +1917,7 @@ mod tests {
             )
             .with_metadata(HashMap::from_iter(vec![(
                 "adjusted_to_utc".to_string(),
-                "".to_string(),
+                String::new(),
             )])),
             Field::new("time_micro", DataType::Time64(TimeUnit::Microsecond), true),
             Field::new(
@@ -1771,7 +1927,7 @@ mod tests {
             )
             .with_metadata(HashMap::from_iter(vec![(
                 "adjusted_to_utc".to_string(),
-                "".to_string(),
+                String::new(),
             )])),
             Field::new(
                 "ts_milli",
@@ -1840,7 +1996,7 @@ mod tests {
                 // This is because the Arrow conversion always sets logical type,
                 // even if there wasn't originally one.
                 // This is not an issue, but is an inconvenience for this test.
-                match a.logical_type() {
+                match a.logical_type_ref() {
                     Some(_) => {
                         assert_eq!(a, b)
                     }
@@ -1849,7 +2005,7 @@ mod tests {
                         assert_eq!(a.physical_type(), b.physical_type());
                         assert_eq!(a.converted_type(), b.converted_type());
                     }
-                };
+                }
             });
     }
 
@@ -1982,7 +2138,7 @@ mod tests {
                 // Field::new("c28", DataType::Duration(TimeUnit::Millisecond), false),
                 // Field::new("c29", DataType::Duration(TimeUnit::Microsecond), false),
                 // Field::new("c30", DataType::Duration(TimeUnit::Nanosecond), false),
-                #[allow(deprecated)]
+                #[expect(deprecated)]
                 Field::new_dict(
                     "c31",
                     DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
@@ -2151,10 +2307,7 @@ mod tests {
 
     #[test]
     fn test_arrow_schema_roundtrip_lists() -> Result<()> {
-        let metadata: HashMap<String, String> = [("Key".to_string(), "Value".to_string())]
-            .iter()
-            .cloned()
-            .collect();
+        let metadata = HashMap::from([("Key".to_string(), "Value".to_string())]);
 
         let schema = Schema::new_with_metadata(
             vec![
@@ -2216,8 +2369,8 @@ mod tests {
         let parquet_schema = ArrowSchemaConverter::new().convert(&arrow_schema)?;
 
         assert_eq!(
-            parquet_schema.column(0).logical_type(),
-            Some(LogicalType::Uuid)
+            parquet_schema.column(0).logical_type_ref(),
+            Some(&LogicalType::Uuid)
         );
 
         let arrow_schema = parquet_to_arrow_schema(&parquet_schema, None)?;
@@ -2237,8 +2390,8 @@ mod tests {
         let parquet_schema = ArrowSchemaConverter::new().convert(&arrow_schema)?;
 
         assert_eq!(
-            parquet_schema.column(0).logical_type(),
-            Some(LogicalType::Json)
+            parquet_schema.column(0).logical_type_ref(),
+            Some(&LogicalType::Json)
         );
 
         let arrow_schema = parquet_to_arrow_schema(&parquet_schema, None)?;
@@ -2248,5 +2401,33 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn test_parquet_to_arrow_field_levels_with_virtual_rejects_non_virtual() {
+        let message_type = "
+        message test_schema {
+            REQUIRED INT32 id;
+        }
+        ";
+        let parquet_schema = Arc::new(parse_message_type(message_type).unwrap());
+        let descriptor = SchemaDescriptor::new(parquet_schema);
+
+        // Try to pass a regular field (not a virtual column)
+        let regular_field = Arc::new(Field::new("regular_column", DataType::Int64, false));
+        let result = parquet_to_arrow_field_levels_with_virtual(
+            &descriptor,
+            ProjectionMask::all(),
+            None,
+            &[regular_field],
+        );
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("is not a virtual column")
+        );
     }
 }

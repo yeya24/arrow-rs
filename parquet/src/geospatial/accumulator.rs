@@ -33,8 +33,8 @@ pub fn try_new_geo_stats_accumulator(
     descr: &ColumnDescPtr,
 ) -> Option<Box<dyn GeoStatsAccumulator>> {
     if !matches!(
-        descr.logical_type(),
-        Some(LogicalType::Geometry { .. }) | Some(LogicalType::Geography { .. })
+        descr.logical_type_ref(),
+        Some(LogicalType::Geometry { .. } | LogicalType::Geography { .. })
     ) {
         return None;
     }
@@ -116,9 +116,16 @@ pub trait GeoStatsAccumulator: Send {
 pub struct DefaultGeoStatsAccumulatorFactory {}
 
 impl GeoStatsAccumulatorFactory for DefaultGeoStatsAccumulatorFactory {
+    #[cfg_attr(
+        feature = "geospatial",
+        expect(
+            clippy::used_underscore_binding,
+            reason = "`_descr` is only read when the `geospatial` feature is on"
+        )
+    )]
     fn new_accumulator(&self, _descr: &ColumnDescPtr) -> Box<dyn GeoStatsAccumulator> {
         #[cfg(feature = "geospatial")]
-        if let Some(crate::basic::LogicalType::Geometry { .. }) = _descr.logical_type() {
+        if let Some(crate::basic::LogicalType::Geometry { .. }) = _descr.logical_type_ref() {
             Box::new(ParquetGeoStatsAccumulator::default())
         } else {
             Box::new(VoidGeoStatsAccumulator::default())
@@ -253,7 +260,7 @@ mod test {
 
         // Check that we have a working accumulator for Geometry
         let parquet_type = Type::primitive_type_builder("geom", crate::basic::Type::BYTE_ARRAY)
-            .with_logical_type(Some(LogicalType::Geometry { crs: None }))
+            .with_logical_type(Some(LogicalType::geometry(None)))
             .build()
             .unwrap();
         let column_descr =
@@ -271,10 +278,7 @@ mod test {
 
         // Check that we have a void accumulator for Geography
         let parquet_type = Type::primitive_type_builder("geom", crate::basic::Type::BYTE_ARRAY)
-            .with_logical_type(Some(LogicalType::Geography {
-                crs: None,
-                algorithm: None,
-            }))
+            .with_logical_type(Some(LogicalType::geography(None, None)))
             .build()
             .unwrap();
         let column_descr =
@@ -284,7 +288,7 @@ mod test {
         assert!(!accumulator.is_valid());
         assert!(accumulator.finish().is_none());
 
-        // Check that we return None if the type is not geometry or goegraphy
+        // Check that we return None if the type is not geometry or geography
         let parquet_type = Type::primitive_type_builder("geom", crate::basic::Type::BYTE_ARRAY)
             .build()
             .unwrap();
@@ -338,7 +342,7 @@ mod test {
         // and does not compute subsequent statistics
         assert!(accumulator.is_valid());
         accumulator.update_wkb(&wkb_point_xy(41.0, 42.0));
-        accumulator.update_wkb("these bytes are not WKB".as_bytes());
+        accumulator.update_wkb(b"these bytes are not WKB");
         assert!(!accumulator.is_valid());
         assert!(accumulator.finish().is_none());
 

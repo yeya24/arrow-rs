@@ -165,7 +165,7 @@ use super::ByteArrayType;
 pub struct GenericByteViewArray<T: ByteViewType + ?Sized> {
     data_type: DataType,
     views: ScalarBuffer<u128>,
-    buffers: Vec<Buffer>,
+    buffers: Arc<[Buffer]>,
     phantom: PhantomData<T>,
     nulls: Option<NullBuffer>,
 }
@@ -188,7 +188,10 @@ impl<T: ByteViewType + ?Sized> GenericByteViewArray<T> {
     /// # Panics
     ///
     /// Panics if [`GenericByteViewArray::try_new`] returns an error
-    pub fn new(views: ScalarBuffer<u128>, buffers: Vec<Buffer>, nulls: Option<NullBuffer>) -> Self {
+    pub fn new<U>(views: ScalarBuffer<u128>, buffers: U, nulls: Option<NullBuffer>) -> Self
+    where
+        U: Into<Arc<[Buffer]>>,
+    {
         Self::try_new(views, buffers, nulls).unwrap()
     }
 
@@ -198,22 +201,27 @@ impl<T: ByteViewType + ?Sized> GenericByteViewArray<T> {
     ///
     /// * `views.len() != nulls.len()`
     /// * [ByteViewType::validate] fails
-    pub fn try_new(
+    pub fn try_new<U>(
         views: ScalarBuffer<u128>,
-        buffers: Vec<Buffer>,
+        buffers: U,
         nulls: Option<NullBuffer>,
-    ) -> Result<Self, ArrowError> {
+    ) -> Result<Self, ArrowError>
+    where
+        U: Into<Arc<[Buffer]>>,
+    {
+        let buffers: Arc<[Buffer]> = buffers.into();
+
         T::validate(&views, &buffers)?;
 
-        if let Some(n) = nulls.as_ref() {
-            if n.len() != views.len() {
-                return Err(ArrowError::InvalidArgumentError(format!(
-                    "Incorrect length of null buffer for {}ViewArray, expected {} got {}",
-                    T::PREFIX,
-                    views.len(),
-                    n.len(),
-                )));
-            }
+        if let Some(n) = nulls.as_ref()
+            && n.len() != views.len()
+        {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Incorrect length of null buffer for {}ViewArray, expected {} got {}",
+                T::PREFIX,
+                views.len(),
+                n.len(),
+            )));
         }
 
         Ok(Self {
@@ -232,7 +240,7 @@ impl<T: ByteViewType + ?Sized> GenericByteViewArray<T> {
     /// Safe if [`Self::try_new`] would not error
     pub unsafe fn new_unchecked(
         views: ScalarBuffer<u128>,
-        buffers: Vec<Buffer>,
+        buffers: Arc<[Buffer]>,
         nulls: Option<NullBuffer>,
     ) -> Self {
         if cfg!(feature = "force_validate") {
@@ -253,7 +261,7 @@ impl<T: ByteViewType + ?Sized> GenericByteViewArray<T> {
         Self {
             data_type: T::DATA_TYPE,
             views: vec![0; len].into(),
-            buffers: vec![],
+            buffers: vec![].into(),
             nulls: Some(NullBuffer::new_null(len)),
             phantom: Default::default(),
         }
@@ -279,7 +287,7 @@ impl<T: ByteViewType + ?Sized> GenericByteViewArray<T> {
     }
 
     /// Deconstruct this array into its constituent parts
-    pub fn into_parts(self) -> (ScalarBuffer<u128>, Vec<Buffer>, Option<NullBuffer>) {
+    pub fn into_parts(self) -> (ScalarBuffer<u128>, Arc<[Buffer]>, Option<NullBuffer>) {
         (self.views, self.buffers, self.nulls)
     }
 
@@ -289,9 +297,13 @@ impl<T: ByteViewType + ?Sized> GenericByteViewArray<T> {
         &self.views
     }
 
-    /// Returns the buffers storing string data
+    /// Returns the shared collection of buffers storing non-inline string or binary data.
+    ///
+    /// The returned `Arc` can be cloned to share the buffers with another array without
+    /// allocating a new collection or cloning the individual buffers. To consume this
+    /// array and take ownership of its buffers, use [`Self::into_parts`].
     #[inline]
-    pub fn data_buffers(&self) -> &[Buffer] {
+    pub fn data_buffers(&self) -> &Arc<[Buffer]> {
         &self.buffers
     }
 
@@ -346,7 +358,12 @@ impl<T: ByteViewType + ?Sized> GenericByteViewArray<T> {
     pub unsafe fn inline_value(view: &u128, len: usize) -> &[u8] {
         debug_assert!(len <= MAX_INLINE_VIEW_LEN as usize);
         unsafe {
-            std::slice::from_raw_parts((view as *const u128 as *const u8).wrapping_add(4), len)
+            std::slice::from_raw_parts(
+                std::ptr::from_ref::<u128>(view)
+                    .cast::<u8>()
+                    .wrapping_add(4),
+                len,
+            )
         }
     }
 
@@ -427,7 +444,30 @@ impl<T: ByteViewType + ?Sized> GenericByteViewArray<T> {
         })
     }
 
+    /// Return an iterator over the length of each array element, including null values.
+    ///
+    /// Null values length would equal to the underlying bytes length and NOT 0
+    ///
+    /// Example of getting 0 for null values
+    /// ```rust
+    /// # use arrow_array::StringViewArray;
+    /// # use arrow_array::Array;
+    /// use arrow_data::ByteView;
+    ///
+    /// fn lengths_with_zero_for_nulls(view: &StringViewArray) -> impl Iterator<Item = u32> {
+    ///     view.lengths()
+    ///         .enumerate()
+    ///         .map(|(index, length)| if view.is_null(index) { 0 } else { length })
+    /// }
+    /// ```
+    pub fn lengths(&self) -> impl ExactSizeIterator<Item = u32> + Clone {
+        self.views().iter().map(|v| *v as u32)
+    }
+
     /// Returns a zero-copy slice of this array with the indicated offset and length.
+    ///
+    /// # Panics
+    /// Panics if `offset + length > self.len()`
     pub fn slice(&self, offset: usize, length: usize) -> Self {
         Self {
             data_type: T::DATA_TYPE,
@@ -482,6 +522,19 @@ impl<T: ByteViewType + ?Sized> GenericByteViewArray<T> {
     /// Note: this function does not attempt to canonicalize / deduplicate values. For this
     /// feature see  [`GenericByteViewBuilder::with_deduplicate_strings`].
     pub fn gc(&self) -> Self {
+        // A single Arrow data buffer is addressed by a `u32` offset, so no
+        // output buffer may exceed `i32::MAX` bytes. Above that the data is
+        // split across multiple buffers (the "slow path").
+        self.gc_with_max_buffer_size(i32::MAX as usize)
+    }
+
+    /// Like [`Self::gc`], but with a configurable maximum output buffer size.
+    ///
+    /// `gc` always uses `i32::MAX` (the largest a single Arrow buffer can be).
+    /// This method exists so the multi-buffer split path — which `gc` only
+    /// reaches once a column references more than 2 GiB of non-inline data —
+    /// can be exercised in tests with a small threshold and tiny inputs.
+    fn gc_with_max_buffer_size(&self, max_buffer_size: usize) -> Self {
         // 1) Read basic properties once
         let len = self.len(); // number of elements
         let nulls = self.nulls().cloned(); // reuse & clone existing null bitmap
@@ -491,7 +544,7 @@ impl<T: ByteViewType + ?Sized> GenericByteViewArray<T> {
             return unsafe {
                 GenericByteViewArray::new_unchecked(
                     self.views().clone(),
-                    vec![], // empty data blocks
+                    Arc::from([]), // empty data blocks
                     nulls,
                 )
             };
@@ -506,27 +559,106 @@ impl<T: ByteViewType + ?Sized> GenericByteViewArray<T> {
             return unsafe {
                 GenericByteViewArray::new_unchecked(
                     self.views().clone(),
-                    vec![], // empty data blocks
+                    Arc::from([]), // empty data blocks
                     nulls,
                 )
             };
         }
 
-        // 3) Allocate exactly capacity for all non-inline data
-        let mut data_buf = Vec::with_capacity(total_large);
+        let (views_buf, data_blocks) = if total_large <= max_buffer_size {
+            // fast path, the entire data fits in a single buffer
+            // 3) Allocate exactly capacity for all non-inline data
+            let mut data_buf = Vec::with_capacity(total_large);
 
-        // 4) Iterate over views and process each inline/non-inline view
-        let views_buf: Vec<u128> = (0..len)
-            .map(|i| unsafe { self.copy_view_to_buffer(i, &mut data_buf) })
-            .collect();
+            // 4) Iterate over views and process each inline/non-inline view
+            let views_buf: Vec<u128> = (0..len)
+                .map(|i| unsafe { self.copy_view_to_buffer(i, 0, &mut data_buf) })
+                .collect();
+            let data_block = Buffer::from_vec(data_buf);
+            let data_blocks = vec![data_block];
+            (views_buf, data_blocks)
+        } else {
+            // slow path: the non-inline data does not fit in a single buffer
+            // (a buffer offset is a `u32`, so no buffer may exceed `i32::MAX`),
+            // so it must be split across several buffers.
 
-        // 5) Wrap up buffers
-        let data_block = Buffer::from_vec(data_buf);
+            // A contiguous run of views destined for one output buffer.
+            struct GcCopyGroup {
+                total_buffer_bytes: usize,
+                total_len: usize,
+            }
+
+            // First pass: partition the views into contiguous groups, each of
+            // which fits within one output buffer. `total_len` counts *all*
+            // views in the group, not just the non-inline ones — this is
+            // essential for correctness, as gc must preserve the row count.
+            // Inline views reference no buffer and are copied unchanged, but
+            // they still belong to a group and must be accounted for. Recording
+            // each group's exact byte size lets the second pass size every
+            // buffer precisely, with no over-reservation or trailing waste.
+            let mut groups: Vec<GcCopyGroup> = Vec::new();
+            // Bytes accumulated for the current group. A view length is a `u32`
+            // and a single value may be larger than `max_buffer_size`, so the
+            // running sum is kept in `u64` to stay within the addressable
+            // buffer-offset space without wrapping.
+            let mut current_length: u64 = 0;
+            let mut current_elements = 0;
+
+            for view in self.views() {
+                let view_len = *view as u32;
+                if view_len > MAX_INLINE_VIEW_LEN {
+                    // Seal the current group before adding this view would push
+                    // its buffer past `max_buffer_size`.
+                    if current_length + view_len as u64 > max_buffer_size as u64 {
+                        groups.push(GcCopyGroup {
+                            total_buffer_bytes: current_length as usize,
+                            total_len: current_elements,
+                        });
+                        current_length = 0;
+                        current_elements = 0;
+                    }
+                    current_length += view_len as u64;
+                }
+                current_elements += 1;
+            }
+            if current_elements != 0 {
+                groups.push(GcCopyGroup {
+                    total_buffer_bytes: current_length as usize,
+                    total_len: current_elements,
+                });
+            }
+            debug_assert!(i32::try_from(groups.len()).is_ok());
+
+            // Second pass: copy each group into an exactly-sized buffer.
+            let mut views_buf = Vec::with_capacity(len);
+            let mut data_blocks = Vec::with_capacity(groups.len());
+            let mut current_view_idx = 0;
+
+            for (group_idx, group) in groups.iter().enumerate() {
+                let mut data_buf = Vec::with_capacity(group.total_buffer_bytes);
+
+                // Directly push views to avoid an intermediate Vec allocation.
+                let new_views =
+                    (current_view_idx..current_view_idx + group.total_len).map(|view_idx| {
+                        // SAFETY: `view_idx` came from iterating a valid range
+                        // within `len`, and every view refers to valid data.
+                        unsafe {
+                            self.copy_view_to_buffer(view_idx, group_idx as i32, &mut data_buf)
+                        }
+                    });
+                views_buf.extend(new_views);
+
+                data_blocks.push(Buffer::from_vec(data_buf));
+                current_view_idx += group.total_len;
+            }
+            (views_buf, data_blocks)
+        };
+
+        // 5) Wrap up views buffer
         let views_scalar = ScalarBuffer::from(views_buf);
-        let data_blocks = vec![data_block];
 
         // SAFETY: views_scalar, data_blocks, and nulls are correctly aligned and sized
-        unsafe { GenericByteViewArray::new_unchecked(views_scalar, data_blocks, nulls) }
+        unsafe { GenericByteViewArray::new_unchecked(views_scalar, data_blocks.into(), nulls) }
     }
 
     /// Copy the i‑th view into `data_buf` if it refers to an out‑of‑line buffer.
@@ -538,10 +670,15 @@ impl<T: ByteViewType + ?Sized> GenericByteViewArray<T> {
     ///   inside one of `self.buffers`.
     /// - `data_buf` must be ready to have additional bytes appended.
     /// - After this call, the returned view will have its
-    ///   `buffer_index` reset to `0` and its `offset` updated so that it points
+    ///   `buffer_index` reset to `buffer_idx` and its `offset` updated so that it points
     ///   into the bytes just appended at the end of `data_buf`.
     #[inline(always)]
-    unsafe fn copy_view_to_buffer(&self, i: usize, data_buf: &mut Vec<u8>) -> u128 {
+    unsafe fn copy_view_to_buffer(
+        &self,
+        i: usize,
+        buffer_idx: i32,
+        data_buf: &mut Vec<u8>,
+    ) -> u128 {
         // SAFETY: `i < self.len()` ensures this is in‑bounds.
         let raw_view = unsafe { *self.views().get_unchecked(i) };
         let mut bv = ByteView::from(raw_view);
@@ -561,9 +698,40 @@ impl<T: ByteViewType + ?Sized> GenericByteViewArray<T> {
             let new_offset = data_buf.len() as u32;
             data_buf.extend_from_slice(slice);
 
-            bv.buffer_index = 0;
+            bv.buffer_index = buffer_idx as u32;
             bv.offset = new_offset;
             bv.into()
+        }
+    }
+
+    /// Returns the total number of bytes of all non-null values in this array.
+    ///
+    /// Unlike [`Self::total_buffer_bytes_used`], this method includes inlined strings
+    /// (those with length ≤ [`MAX_INLINE_VIEW_LEN`]), making it suitable as a
+    /// capacity hint when pre-allocating output buffers.
+    ///
+    /// Null values are excluded from the sum.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arrow_array::StringViewArray;
+    /// let array = StringViewArray::from_iter(vec![
+    ///     Some("hello"),   // 5 bytes, inlined
+    ///     None,            // excluded
+    ///     Some("large payload over 12 bytes"),  // 27 bytes, non-inlined
+    /// ]);
+    /// assert_eq!(array.total_bytes_len(), 5 + 27);
+    /// ```
+    pub fn total_bytes_len(&self) -> usize {
+        match self.nulls() {
+            None => self.views().iter().map(|v| (*v as u32) as usize).sum(),
+            Some(nulls) => self
+                .views()
+                .iter()
+                .zip(nulls.iter())
+                .map(|(v, is_valid)| if is_valid { (*v as u32) as usize } else { 0 })
+                .sum(),
         }
     }
 
@@ -690,99 +858,35 @@ impl<T: ByteViewType + ?Sized> GenericByteViewArray<T> {
     /// key("bar\0") = 0x0000000000000000000062617200000004
     /// ⇒ key("bar") < key("bar\0")
     /// ```
+    /// - `raw` is treated as a 128-bit integer with its bits laid out as follows:
+    ///   - bits 0–31: length (little-endian)
+    ///   - bits 32–127: data (little-endian)
+    ///
     /// # Inlining and Endianness
     ///
-    /// - We start by calling `.to_le_bytes()` on the `raw` `u128`, because Rust’s native in‑memory
-    ///   representation is little‑endian on x86/ARM.
-    /// - We extract the low 32 bits numerically (`raw as u32`)—this step is endianness‑free.
-    /// - We copy the 12 bytes of inline data (original order) into `buf[0..12]`.
-    /// - We serialize `length` as big‑endian into `buf[12..16]`.
-    /// - Finally, `u128::from_be_bytes(buf)` treats `buf[0]` as the most significant byte
-    ///   and `buf[15]` as the least significant, producing a `u128` whose integer value
-    ///   directly encodes “inline data then length” in big‑endian form.
-    ///
-    /// This ensures that a simple `u128` comparison is equivalent to the desired
-    /// lexicographical comparison of the inline bytes followed by length.
+    /// This function uses platform-independent bitwise operations to construct a 128-bit key:
+    /// - `raw.swap_bytes() << 32` effectively clears the length bits and shifts the 12-byte inline data
+    ///   into the high 96 bits in Big-Endian order. This ensures the first byte of the string
+    ///   is the most significant byte of the resulting `u128`.
+    /// - `raw as u32` extracts the length as a numeric integer, which is then placed in the low 32 bits.
     #[inline(always)]
     pub fn inline_key_fast(raw: u128) -> u128 {
-        // 1. Decompose `raw` into little‑endian bytes:
-        //    - raw_bytes[0..4]  = length in LE
-        //    - raw_bytes[4..16] = inline string data
-        let raw_bytes = raw.to_le_bytes();
-
-        // 2. Numerically truncate to get the low 32‑bit length (endianness‑free).
-        let length = raw as u32;
-
-        // 3. Build a 16‑byte buffer in big‑endian order:
-        //    - buf[0..12]  = inline string bytes (in original order)
-        //    - buf[12..16] = length.to_be_bytes() (BE)
-        let mut buf = [0u8; 16];
-        buf[0..12].copy_from_slice(&raw_bytes[4..16]); // inline data
-
-        // Why convert length to big-endian for comparison?
-        //
-        // Rust (on most platforms) stores integers in little-endian format,
-        // meaning the least significant byte is at the lowest memory address.
-        // For example, an u32 value like 0x22345677 is stored in memory as:
-        //
-        //   [0x77, 0x56, 0x34, 0x22]  // little-endian layout
-        //    ^     ^     ^     ^
-        //  LSB   ↑↑↑           MSB
-        //
-        // This layout is efficient for arithmetic but *not* suitable for
-        // lexicographic (dictionary-style) comparison of byte arrays.
-        //
-        // To compare values by byte order—e.g., for sorted keys or binary trees—
-        // we must convert them to **big-endian**, where:
-        //
-        //   - The most significant byte (MSB) comes first (index 0)
-        //   - The least significant byte (LSB) comes last (index N-1)
-        //
-        // In big-endian, the same u32 = 0x22345677 would be represented as:
-        //
-        //   [0x22, 0x34, 0x56, 0x77]
-        //
-        // This ordering aligns with natural string/byte sorting, so calling
-        // `.to_be_bytes()` allows us to construct
-        // keys where standard numeric comparison (e.g., `<`, `>`) behaves
-        // like lexicographic byte comparison.
-        buf[12..16].copy_from_slice(&length.to_be_bytes()); // length in BE
-
-        // 4. Deserialize the buffer as a big‑endian u128:
-        //    buf[0] is MSB, buf[15] is LSB.
-        // Details:
-        // Note on endianness and layout:
-        //
-        // Although `buf[0]` is stored at the lowest memory address,
-        // calling `u128::from_be_bytes(buf)` interprets it as the **most significant byte (MSB)**,
-        // and `buf[15]` as the **least significant byte (LSB)**.
-        //
-        // This is the core principle of **big-endian decoding**:
-        //   - Byte at index 0 maps to bits 127..120 (highest)
-        //   - Byte at index 1 maps to bits 119..112
-        //   - ...
-        //   - Byte at index 15 maps to bits 7..0 (lowest)
-        //
-        // So even though memory layout goes from low to high (left to right),
-        // big-endian treats the **first byte** as highest in value.
-        //
-        // This guarantees that comparing two `u128` keys is equivalent to lexicographically
-        // comparing the original inline bytes, followed by length.
-        u128::from_be_bytes(buf)
+        (raw.swap_bytes() << 32) | (raw as u32 as u128)
     }
 }
 
 impl<T: ByteViewType + ?Sized> Debug for GenericByteViewArray<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "{}ViewArray\n[\n", T::PREFIX)?;
-        print_long_array(self, f, |array, index, f| {
-            std::fmt::Debug::fmt(&array.value(index), f)
+        print_long_array(self, f, &mut |index, f| {
+            std::fmt::Debug::fmt(&self.value(index), f)
         })?;
         write!(f, "]")
     }
 }
 
-impl<T: ByteViewType + ?Sized> Array for GenericByteViewArray<T> {
+/// SAFETY: Correctly implements the contract of Arrow Arrays
+unsafe impl<T: ByteViewType + ?Sized> Array for GenericByteViewArray<T> {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -813,8 +917,21 @@ impl<T: ByteViewType + ?Sized> Array for GenericByteViewArray<T> {
 
     fn shrink_to_fit(&mut self) {
         self.views.shrink_to_fit();
-        self.buffers.iter_mut().for_each(|b| b.shrink_to_fit());
-        self.buffers.shrink_to_fit();
+
+        // The goal of `shrink_to_fit` is to minimize the space used by any of
+        // its allocations. The use of `Arc::get_mut` over `Arc::make_mut` is
+        // because if the reference count is greater than 1, `Arc::make_mut`
+        // will first clone its contents. So, any large allocations will first
+        // be cloned before being shrunk, leaving the pre-cloned allocations
+        // intact, before adding the extra (used) space of the new clones.
+        if let Some(buffers) = Arc::get_mut(&mut self.buffers) {
+            buffers.iter_mut().for_each(|b| b.shrink_to_fit());
+        }
+
+        // With the assumption that this is a best-effort function, no attempt
+        // is made to shrink `self.buffers`, which it can't because it's type
+        // does not expose a `shrink_to_fit` method.
+
         if let Some(nulls) = &mut self.nulls {
             nulls.shrink_to_fit();
         }
@@ -845,6 +962,17 @@ impl<T: ByteViewType + ?Sized> Array for GenericByteViewArray<T> {
     fn get_array_memory_size(&self) -> usize {
         std::mem::size_of::<Self>() + self.get_buffer_memory_size()
     }
+
+    #[cfg(feature = "pool")]
+    fn claim(&self, pool: &dyn arrow_buffer::MemoryPool) {
+        self.views.claim(pool);
+        for buffer in self.buffers.iter() {
+            buffer.claim(pool);
+        }
+        if let Some(nulls) = &self.nulls {
+            nulls.claim(pool);
+        }
+    }
 }
 
 impl<'a, T: ByteViewType + ?Sized> ArrayAccessor for &'a GenericByteViewArray<T> {
@@ -869,15 +997,22 @@ impl<'a, T: ByteViewType + ?Sized> IntoIterator for &'a GenericByteViewArray<T> 
 }
 
 impl<T: ByteViewType + ?Sized> From<ArrayData> for GenericByteViewArray<T> {
-    fn from(value: ArrayData) -> Self {
-        let views = value.buffers()[0].clone();
-        let views = ScalarBuffer::new(views, value.offset(), value.len());
-        let buffers = value.buffers()[1..].to_vec();
+    fn from(data: ArrayData) -> Self {
+        let (data_type, len, nulls, offset, buffers, _child_data) = data.into_parts();
+        assert_eq!(
+            data_type,
+            T::DATA_TYPE,
+            "Mismatched data type, expected {}, got {data_type}",
+            T::DATA_TYPE
+        );
+        let mut buffers = buffers.into_iter();
+        // first buffer is views, remaining are data buffers
+        let views = ScalarBuffer::new(buffers.next().unwrap(), offset, len);
         Self {
-            data_type: T::DATA_TYPE,
+            data_type,
             views,
-            buffers,
-            nulls: value.nulls().cloned(),
+            buffers: Arc::from_iter(buffers),
+            nulls,
             phantom: Default::default(),
         }
     }
@@ -902,10 +1037,7 @@ where
     fn from(byte_array: &GenericByteArray<FROM>) -> Self {
         let offsets = byte_array.offsets();
 
-        let can_reuse_buffer = match offsets.last() {
-            Some(offset) => offset.as_usize() < u32::MAX as usize,
-            None => true,
-        };
+        let can_reuse_buffer = offsets.last().as_usize() < u32::MAX as usize;
 
         if can_reuse_buffer {
             // build views directly pointing to the existing buffer
@@ -940,12 +1072,15 @@ where
 }
 
 impl<T: ByteViewType + ?Sized> From<GenericByteViewArray<T>> for ArrayData {
-    fn from(mut array: GenericByteViewArray<T>) -> Self {
+    fn from(array: GenericByteViewArray<T>) -> Self {
         let len = array.len();
-        array.buffers.insert(0, array.views.into_inner());
+
+        let mut buffers = array.buffers.to_vec();
+        buffers.insert(0, array.views.into_inner());
+
         let builder = ArrayDataBuilder::new(T::DATA_TYPE)
             .len(len)
-            .buffers(array.buffers)
+            .buffers(buffers)
             .nulls(array.nulls);
 
         unsafe { builder.build_unchecked() }
@@ -1082,10 +1217,12 @@ mod tests {
     use crate::{
         Array, BinaryViewArray, GenericBinaryArray, GenericByteViewArray, StringViewArray,
     };
-    use arrow_buffer::{Buffer, ScalarBuffer};
-    use arrow_data::{ByteView, MAX_INLINE_VIEW_LEN};
+    use arrow_buffer::{Buffer, NullBuffer, ScalarBuffer};
+    use arrow_data::{ArrayDataBuilder, ByteView, MAX_INLINE_VIEW_LEN};
+    use arrow_schema::DataType;
     use rand::prelude::StdRng;
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
+    use std::str::from_utf8;
 
     const BLOCK_SIZE: u32 = 8;
 
@@ -1379,7 +1516,7 @@ mod tests {
             } else {
                 // random length between 0 and twice the inline limit
                 let len = rng.random_range(0..(MAX_INLINE_VIEW_LEN * 2));
-                let s: String = "A".repeat(len as usize);
+                let s = "A".repeat(len as usize);
                 builder.append_option(Some(&s));
                 original.push(Some(s));
             }
@@ -1402,6 +1539,155 @@ mod tests {
                 assert_eq!(got, *expect, "Value mismatch in mixed slice after gc");
             });
         }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // Takes too long
+    fn test_gc_huge_array() {
+        // Construct multiple 128 MiB BinaryView entries so total > 4 GiB
+        let block_len: usize = 128 * 1024 * 1024; // 128 MiB per view
+        let num_views: usize = 36;
+
+        // Create a single 128 MiB data block with a simple byte pattern
+        let buffer = Buffer::from_vec(vec![0xAB; block_len]);
+        let buffer2 = Buffer::from_vec(vec![0xFF; block_len]);
+
+        // Append this block and then add many views pointing to it
+        let mut builder = BinaryViewBuilder::new();
+        let block_id = builder.append_block(buffer);
+        for _ in 0..num_views / 2 {
+            builder
+                .try_append_view(block_id, 0, block_len as u32)
+                .expect("append view into 128MiB block");
+        }
+        let block_id2 = builder.append_block(buffer2);
+        for _ in 0..num_views / 2 {
+            builder
+                .try_append_view(block_id2, 0, block_len as u32)
+                .expect("append view into 128MiB block");
+        }
+
+        let array = builder.finish();
+        let total = array.total_buffer_bytes_used();
+        assert!(
+            total > u32::MAX as usize,
+            "Expected total non-inline bytes to exceed 4 GiB, got {total}"
+        );
+
+        // Run gc and verify correctness
+        let gced = array.gc();
+        assert_eq!(gced.len(), num_views, "Length mismatch after gc");
+        assert_eq!(gced.null_count(), 0, "Null count mismatch after gc");
+        assert_ne!(
+            gced.data_buffers().len(),
+            1,
+            "gc with huge buffer should not consolidate data into a single buffer"
+        );
+
+        // Element-wise equality check across the entire array
+        array.iter().zip(gced.iter()).for_each(|(orig, got)| {
+            assert_eq!(orig, got, "Value mismatch after gc on huge array");
+        });
+    }
+
+    #[test]
+    fn test_gc_slow_path_preserves_inline_views() {
+        // Regression test for a bug in the multi-buffer "slow path" of `gc()`,
+        // which `gc` only reaches once a view column references more than
+        // `i32::MAX` (~2.1 GiB) of non-inline data. That path grouped and copied
+        // only the *non-inline* views and dropped every inline (short) view,
+        // returning an array shorter than its input. GC is a pure size
+        // optimisation and must never change the row count.
+        //
+        // Rather than allocate gigabytes to hit the real threshold, drive the
+        // same code via `gc_with_max_buffer_size` with a tiny cap so a handful
+        // of bytes forces the buffer split. Inline, large, and null views are
+        // interspersed so the split lands between and around inline entries.
+        let long = "this is definitely longer than twelve bytes"; // non-inline
+        let test_data = [
+            Some("short"),      // inline
+            Some(long),         // large
+            Some("s"),          // inline
+            Some(long),         // large
+            None,               // null
+            Some(long),         // large
+            Some("also short"), // inline
+            Some(long),         // large
+            Some("tail"),       // inline
+        ];
+        let array: StringViewArray = test_data.into_iter().collect();
+
+        // Cap each output buffer at ~1.5 large values so the copy is forced to
+        // split across several buffers, exercising the slow path with no
+        // multi-GiB allocation.
+        let max_buffer_size = long.len() + long.len() / 2;
+        let gced = array.gc_with_max_buffer_size(max_buffer_size);
+
+        // The core invariant: gc preserves the row count.
+        assert_eq!(gced.len(), array.len(), "gc changed the row count");
+        // The split must actually have happened, otherwise we'd be exercising
+        // the fast path and could not catch the inline-dropping regression.
+        assert!(
+            gced.data_buffers().len() > 1,
+            "expected output split across multiple buffers, got {}",
+            gced.data_buffers().len()
+        );
+        // No output buffer may exceed the cap.
+        for buf in gced.data_buffers().iter() {
+            assert!(buf.len() <= max_buffer_size, "buffer exceeded max size");
+        }
+        // Every value (inline, large, and null) is unchanged and in order.
+        array
+            .iter()
+            .zip(gced.iter())
+            .enumerate()
+            .for_each(|(i, (a, b))| {
+                assert_eq!(a, b, "value mismatch at index {i} after gc");
+            });
+        // The result round-trips through full validation.
+        gced.to_data().validate_full().unwrap();
+    }
+
+    #[test]
+    fn test_gc_slow_path_value_larger_than_buffer() {
+        // A single non-inline value can be larger than one output buffer (a view
+        // length is a `u32`, so a value may exceed `max_buffer_size`). Such a
+        // value cannot be split, so it occupies a buffer of its own; gc must
+        // still preserve every row and produce a valid array.
+        //
+        // The real threshold needs a multi-GiB value, so drive the same logic
+        // with a `max_buffer_size` smaller than the value length.
+        let big = "x".repeat(64); // non-inline, larger than the cap below
+        let test_data = [
+            Some("short"),      // inline
+            Some(big.as_str()), // larger than max_buffer_size
+            None,               // null
+            Some("tail"),       // inline
+            Some(big.as_str()), // larger than max_buffer_size
+        ];
+        let array: StringViewArray = test_data.into_iter().collect();
+
+        let max_buffer_size = 16; // smaller than a single `big` value
+        let gced = array.gc_with_max_buffer_size(max_buffer_size);
+
+        // Row count is preserved.
+        assert_eq!(gced.len(), array.len(), "gc changed the row count");
+        // Each oversized value lands in its own buffer, so the copy splits.
+        assert!(
+            gced.data_buffers().len() > 1,
+            "expected output split across multiple buffers, got {}",
+            gced.data_buffers().len()
+        );
+        // Every value is unchanged and in order.
+        array
+            .iter()
+            .zip(gced.iter())
+            .enumerate()
+            .for_each(|(i, (a, b))| {
+                assert_eq!(a, b, "value mismatch at index {i} after gc");
+            });
+        // The result round-trips through full validation.
+        gced.to_data().validate_full().unwrap();
     }
 
     #[test]
@@ -1528,5 +1814,197 @@ mod tests {
                 "Key compare failed: key({v1:?})=0x{key1:032x} !< key({v2:?})=0x{key2:032x}",
             );
         }
+    }
+
+    #[test]
+    fn empty_array_should_return_empty_lengths_iterator() {
+        let empty = GenericByteViewArray::<BinaryViewType>::from(Vec::<&[u8]>::new());
+
+        let mut lengths_iter = empty.lengths();
+        assert_eq!(lengths_iter.len(), 0);
+        assert_eq!(lengths_iter.next(), None);
+    }
+
+    #[test]
+    fn array_lengths_should_return_correct_length_for_both_inlined_and_non_inlined() {
+        let cases = GenericByteViewArray::<BinaryViewType>::from(vec![
+            // Not inlined as longer than 12 bytes
+            b"Supercalifragilisticexpialidocious" as &[u8],
+            // Inlined as shorter than 12 bytes
+            b"Hello",
+            // Empty value
+            b"",
+            // Exactly 12 bytes
+            b"abcdefghijkl",
+        ]);
+
+        let mut lengths_iter = cases.lengths();
+
+        assert_eq!(lengths_iter.len(), cases.len());
+
+        let cases_iter = cases.iter();
+
+        for case in cases_iter {
+            let case_value = case.unwrap();
+            let length = lengths_iter.next().expect("Should have a length");
+
+            assert_eq!(case_value.len(), length as usize);
+        }
+
+        assert_eq!(lengths_iter.next(), None, "Should not have more lengths");
+    }
+
+    #[test]
+    fn array_lengths_should_return_the_underlying_length_for_null_values() {
+        let cases = GenericByteViewArray::<BinaryViewType>::from(vec![
+            // Not inlined as longer than 12 bytes
+            b"Supercalifragilisticexpialidocious" as &[u8],
+            // Inlined as shorter than 12 bytes
+            b"Hello",
+            // Empty value
+            b"",
+            // Exactly 12 bytes
+            b"abcdefghijkl",
+        ]);
+
+        let (views, buffer, _) = cases.clone().into_parts();
+
+        // Keeping the values but just adding nulls on top
+        let cases_with_all_nulls = GenericByteViewArray::<BinaryViewType>::new(
+            views,
+            buffer,
+            Some(NullBuffer::new_null(cases.len())),
+        );
+
+        let lengths_iter = cases.lengths();
+        let mut all_nulls_lengths_iter = cases_with_all_nulls.lengths();
+
+        assert_eq!(lengths_iter.len(), all_nulls_lengths_iter.len());
+
+        for expected_length in lengths_iter {
+            let actual_length = all_nulls_lengths_iter.next().expect("Should have a length");
+
+            assert_eq!(expected_length, actual_length);
+        }
+
+        assert_eq!(
+            all_nulls_lengths_iter.next(),
+            None,
+            "Should not have more lengths"
+        );
+    }
+
+    #[test]
+    fn array_lengths_on_sliced_should_only_return_lengths_for_sliced_data() {
+        let array = GenericByteViewArray::<BinaryViewType>::from(vec![
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaa" as &[u8],
+            b"Hello",
+            b"something great",
+            b"is",
+            b"coming soon!",
+            b"when you find what it is",
+            b"let me know",
+            b"cause",
+            b"I",
+            b"have no idea",
+            b"what it",
+            b"is",
+        ]);
+
+        let sliced_array = array.slice(2, array.len() - 3);
+
+        let mut lengths_iter = sliced_array.lengths();
+
+        assert_eq!(lengths_iter.len(), sliced_array.len());
+
+        let values_iter = sliced_array.iter();
+
+        for value in values_iter {
+            let value = value.unwrap();
+            let length = lengths_iter.next().expect("Should have a length");
+
+            assert_eq!(value.len(), length as usize);
+        }
+
+        assert_eq!(lengths_iter.next(), None, "Should not have more lengths");
+    }
+
+    #[should_panic(expected = "Mismatched data type, expected Utf8View, got BinaryView")]
+    #[test]
+    fn invalid_casting_from_array_data() {
+        // Should not be able to cast to StringViewArray due to invalid UTF-8
+        let array_data = binary_view_array_with_invalid_utf8_data().into_data();
+        let _ = StringViewArray::from(array_data);
+    }
+
+    #[should_panic(expected = "invalid utf-8 sequence")]
+    #[test]
+    fn invalid_array_data() {
+        let (views, buffers, nulls) = binary_view_array_with_invalid_utf8_data().into_parts();
+
+        // manually try and add invalid array data with Utf8View data type
+        let mut builder = ArrayDataBuilder::new(DataType::Utf8View)
+            .add_buffer(views.into_inner())
+            .len(3);
+        for buffer in buffers.iter() {
+            builder = builder.add_buffer(buffer.clone())
+        }
+        builder = builder.nulls(nulls);
+
+        let data = builder.build().unwrap(); // should fail validation
+        let _arr = StringViewArray::from(data);
+    }
+
+    /// Returns a BinaryViewArray with one invalid UTF-8 value
+    fn binary_view_array_with_invalid_utf8_data() -> BinaryViewArray {
+        let array = GenericByteViewArray::<BinaryViewType>::from(vec![
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaa" as &[u8],
+            &[
+                0xf0, 0x80, 0x80, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00,
+            ],
+            b"good",
+        ]);
+        assert!(from_utf8(array.value(0)).is_ok());
+        assert!(from_utf8(array.value(1)).is_err()); // value 1 is invalid utf8
+        assert!(from_utf8(array.value(2)).is_ok());
+        array
+    }
+
+    #[test]
+    fn test_total_bytes_len() {
+        // inlined: "hello"=5, "world"=5, "lulu"=4 → 14
+        // non-inlined: "large payload over 12 bytes"=27
+        // null: should not count
+        let mut builder = StringViewBuilder::new();
+        builder.append_value("hello");
+        builder.append_value("world");
+        builder.append_value("lulu");
+        builder.append_null();
+        builder.append_value("large payload over 12 bytes");
+        let array = builder.finish();
+        assert_eq!(array.total_bytes_len(), 5 + 5 + 4 + 27);
+    }
+
+    #[test]
+    fn test_total_bytes_len_empty() {
+        let array = StringViewArray::from_iter::<Vec<Option<&str>>>(vec![]);
+        assert_eq!(array.total_bytes_len(), 0);
+    }
+
+    #[test]
+    fn test_total_bytes_len_all_nulls() {
+        let array = StringViewArray::new_null(5);
+        assert_eq!(array.total_bytes_len(), 0);
+    }
+
+    #[test]
+    fn test_total_bytes_len_binary_view() {
+        let array = BinaryViewArray::from_iter(vec![
+            Some(b"hi".as_ref()),
+            None,
+            Some(b"large payload over 12 bytes".as_ref()),
+        ]);
+        assert_eq!(array.total_bytes_len(), 2 + 27);
     }
 }

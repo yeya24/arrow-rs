@@ -17,39 +17,42 @@
 
 [package]
 name = "parquet-variant-compute"
-# This package is still in development and thus the version does
-# not follow the versions of the rest of the crates in this repo.
-version = "0.2.0"
+version = { workspace = true }
 license = { workspace = true }
 description = "Apache Parquet Variant Batch Processing"
-homepage = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
 keywords = ["arrow", "parquet", "variant"]
 edition = { workspace = true }
 rust-version = { workspace = true }
 
-
 [dependencies]
-arrow = { workspace = true , features = ["canonical_extension_types"]}
+arrow = { workspace = true, features = ["canonical_extension_types"] }
 arrow-schema = { workspace = true }
 half = { version = "2.1", default-features = false }
 indexmap = "2.10.0"
 parquet-variant = { workspace = true }
 parquet-variant-json = { workspace = true }
 chrono = { workspace = true }
-uuid = { version = "1.18.0", features = ["v4"]}
+uuid = { version = "1.18.0", features = ["v4"] }
+num-traits = { version = "0.2.19", default-features = false }
+
+# uuid requires the `js` feature to run on wasm
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+uuid = { version = "1.18.0", features = ["v4", "js"] }
 
 [lib]
 name = "parquet_variant_compute"
 bench = false
 
 [dev-dependencies]
-rand = "0.9.1"
-criterion = { version = "0.6", default-features = false }
-arrow = { workspace = true, features = ["test_utils"] }
-
+rand = "0.10.1"
+criterion = { workspace = true, default-features = false }
+serde_json = "1.0"
 
 [[bench]]
 name = "variant_kernels"
 harness = false
+
+[lints]
+workspace = true

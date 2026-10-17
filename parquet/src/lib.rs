@@ -55,36 +55,64 @@
 //! ## Reading and Writing Arrow (`arrow` feature)
 //!
 //! The [`arrow`] module supports reading and writing Parquet data to/from
-//! Arrow `RecordBatch`es. Using Arrow is simple and performant, and allows workloads
+//! Arrow [`RecordBatch`]es. Using Arrow is simple and performant, and allows workloads
 //! to leverage the wide range of data transforms provided by the [arrow] crate, and by the
 //! ecosystem of [Arrow] compatible systems.
 //!
 //! Most users will use [`ArrowWriter`] for writing and [`ParquetRecordBatchReaderBuilder`] for
-//! reading.
+//! reading from synchronous IO sources such as files or in-memory buffers.
 //!
-//! Lower level APIs include [`ArrowColumnWriter`] for writing using multiple
-//! threads, and [`RowFilter`] to apply filters during decode.
+//! Lower level APIs include
+//! * [`ParquetPushDecoder`] for file grained control over interleaving of IO and CPU.
+//! * [`ArrowColumnWriter`] for writing using multiple threads,
+//! * [`RowFilter`] to apply filters during decode
+//!
+//! ### EXPERIMENTAL: Content-Defined Chunking
+//!
+//! [`ArrowWriter`] supports content-defined chunking (CDC), which creates data page
+//! boundaries based on content rather than fixed sizes. CDC enables efficient
+//! deduplication in content-addressable storage (CAS) systems: when the same data
+//! appears in successive file versions, it will produce identical byte sequences that
+//! CAS backends can deduplicate.
+//!
+//! Enable CDC via [`WriterProperties`]:
+//!
+//! ```rust
+//! # use parquet::file::properties::{WriterProperties, CdcOptions};
+//! let props = WriterProperties::builder()
+//!     .set_content_defined_chunking(Some(CdcOptions::default()))
+//!     .build();
+//! ```
+//!
+//! See [`CdcOptions`] for chunk size and normalization parameters.
+//!
+//! [`WriterProperties`]: file::properties::WriterProperties
+//! [`CdcOptions`]: file::properties::CdcOptions
 //!
 //! [`ArrowWriter`]: arrow::arrow_writer::ArrowWriter
 //! [`ParquetRecordBatchReaderBuilder`]: arrow::arrow_reader::ParquetRecordBatchReaderBuilder
+//! [`ParquetPushDecoder`]: arrow::push_decoder::ParquetPushDecoder
 //! [`ArrowColumnWriter`]: arrow::arrow_writer::ArrowColumnWriter
 //! [`RowFilter`]: arrow::arrow_reader::RowFilter
 //!
-//! ## `async` Reading and Writing Arrow (`async` feature)
+//! ## `async` Reading and Writing Arrow (`arrow` feature + `async` feature)
 //!
 //! The [`async_reader`] and [`async_writer`] modules provide async APIs to
-//! read and write `RecordBatch`es  asynchronously.
+//! read and write [`RecordBatch`]es  asynchronously.
 //!
 //! Most users will use [`AsyncArrowWriter`] for writing and [`ParquetRecordBatchStreamBuilder`]
-//! for reading. When the `object_store` feature is enabled, [`ParquetObjectReader`]
-//! provides efficient integration with object storage services such as S3 via the [object_store]
-//! crate, automatically optimizing IO based on any predicates or projections provided.
+//! for reading, automatically optimizing IO based on any predicates or projections provided.
+//! Object storage services such as S3 can be integrated by implementing
+//! [`AsyncFileReader`] on top of a client such as the [object_store] crate,
+//! or by passing a writer implementing [`AsyncWrite`] (such as
+//! `object_store::buffered::BufWriter`) to [`AsyncArrowWriter`].
 //!
 //! [`async_reader`]: arrow::async_reader
 //! [`async_writer`]: arrow::async_writer
 //! [`AsyncArrowWriter`]: arrow::async_writer::AsyncArrowWriter
+//! [`AsyncFileReader`]: arrow::async_reader::AsyncFileReader
+//! [`AsyncWrite`]: https://docs.rs/tokio/latest/tokio/io/trait.AsyncWrite.html
 //! [`ParquetRecordBatchStreamBuilder`]: arrow::async_reader::ParquetRecordBatchStreamBuilder
-//! [`ParquetObjectReader`]: arrow::async_reader::ParquetObjectReader
 //!
 //! ## Variant Logical Type (`variant_experimental` feature)
 //!
@@ -104,10 +132,18 @@
 //!
 //! [arrow]: https://docs.rs/arrow/latest/arrow/index.html
 //! [Arrow]: https://arrow.apache.org/
+//! [`RecordBatch`]: https://docs.rs/arrow/latest/arrow/array/struct.RecordBatch.html
 //! [CSV]: https://en.wikipedia.org/wiki/Comma-separated_values
 //! [Dremel]: https://research.google/pubs/pub36632/
 //! [Logical Types]: https://github.com/apache/parquet-format/blob/master/LogicalTypes.md
 //! [object_store]: https://docs.rs/object_store/latest/object_store/
+//!
+//! # Platform Support
+//!
+//! Only little-endian platforms are officially supported and tested in CI.
+//! Big-endian platforms are not tested in CI and may not work correctly.
+//! Fixes for big-endian platforms are welcome and handled on a best-effort basis,
+//! but compatibility is not guaranteed.
 
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/apache/parquet-format/25f05e73d8cd7f5c83532ce51cb4f4de8ba5f2a2/logo/parquet-logos_1.svg",
@@ -115,52 +151,17 @@
 )]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
-/// Defines a an item with an experimental public API
-///
-/// The module will not be documented, and will only be public if the
-/// experimental feature flag is enabled
-///
-/// Experimental components have no stability guarantees
-#[cfg(feature = "experimental")]
-macro_rules! experimental {
-    ($(#[$meta:meta])* $vis:vis mod $module:ident) => {
-        #[doc(hidden)]
-        $(#[$meta])*
-        pub mod $module;
-    }
-}
-
-#[cfg(not(feature = "experimental"))]
-macro_rules! experimental {
-    ($(#[$meta:meta])* $vis:vis mod $module:ident) => {
-        $(#[$meta])*
-        $vis mod $module;
-    }
-}
-
 #[cfg(all(
     feature = "flate2",
-    not(any(feature = "flate2-zlib-rs", feature = "flate2-rust_backened"))
+    not(any(feature = "flate2-zlib-rs", feature = "flate2-rust_backend"))
 ))]
 compile_error!(
-    "When enabling `flate2` you must enable one of the features: `flate2-zlib-rs` or `flate2-rust_backened`."
+    "When enabling `flate2` you must enable one of the features: `flate2-zlib-rs` or `flate2-rust_backend`."
 );
 
 #[macro_use]
 pub mod errors;
 pub mod basic;
-
-/// Automatically generated code from the Parquet thrift definition.
-///
-/// This module code generated from [parquet.thrift]. See [crate::file] for
-/// more information on reading Parquet encoded data.
-///
-/// [parquet.thrift]: https://github.com/apache/parquet-format/blob/master/src/main/thrift/parquet.thrift
-// see parquet/CONTRIBUTING.md for instructions on regenerating
-// Don't try clippy and format auto generated code
-#[allow(clippy::all, missing_docs)]
-#[rustfmt::skip]
-pub mod format;
 
 #[macro_use]
 pub mod data_type;
@@ -172,19 +173,36 @@ use std::ops::Range;
 #[doc(hidden)]
 pub use self::encodings::{decoding, encoding};
 
-experimental!(#[macro_use] mod util);
+// Keep these module declarations explicit: rustfmt does not discover modules declared by macros.
+// See https://github.com/rust-lang/rustfmt/issues/3253
+#[cfg(feature = "experimental")]
+#[doc(hidden)]
+#[macro_use]
+pub mod util;
+#[cfg(not(feature = "experimental"))]
+#[macro_use]
+mod util;
 
 pub use util::utf8;
 
 #[cfg(feature = "arrow")]
 pub mod arrow;
-pub mod column;
-experimental!(mod compression);
-experimental!(mod encodings);
 pub mod bloom_filter;
+pub mod column;
+#[cfg(feature = "experimental")]
+#[doc(hidden)]
+pub mod compression;
+#[cfg(not(feature = "experimental"))]
+mod compression;
+#[cfg(feature = "experimental")]
+#[doc(hidden)]
+pub mod encodings;
+#[cfg(not(feature = "experimental"))]
+mod encodings;
 
 #[cfg(feature = "encryption")]
-experimental!(pub mod encryption);
+#[cfg_attr(feature = "experimental", doc(hidden))]
+pub mod encryption;
 
 pub mod file;
 pub mod record;
@@ -192,7 +210,7 @@ pub mod schema;
 
 mod parquet_macros;
 mod parquet_thrift;
-pub mod thrift;
+
 /// What data is needed to read the next item from a decoder.
 ///
 /// This is used to communicate between the decoder and the caller
@@ -200,7 +218,7 @@ pub mod thrift;
 #[derive(Debug)]
 pub enum DecodeResult<T: Debug> {
     /// The ranges of data necessary to proceed
-    // TODO: distinguish between minimim needed to make progress and what could be used?
+    // TODO: distinguish between minimum needed to make progress and what could be used?
     NeedsData(Vec<Range<u64>>),
     /// The decoder produced an output item
     Data(T),
@@ -208,6 +226,7 @@ pub enum DecodeResult<T: Debug> {
     Finished,
 }
 
+#[cfg_attr(feature = "experimental", doc(hidden))]
+pub mod geospatial;
 #[cfg(feature = "variant_experimental")]
 pub mod variant;
-experimental!(pub mod geospatial);

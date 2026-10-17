@@ -18,10 +18,15 @@
 use crate::arith::derive_arith;
 use crate::bigint::div::div_rem;
 use num_bigint::BigInt;
-use num_traits::{FromPrimitive, ToPrimitive, cast::AsPrimitive};
+use num_traits::{
+    Bounded, CheckedAdd, CheckedDiv, CheckedMul, CheckedNeg, CheckedRem, CheckedShl, CheckedShr,
+    CheckedSub, ConstOne, ConstZero, FromPrimitive, MulAdd, MulAddAssign, Num, One, SaturatingAdd,
+    SaturatingMul, SaturatingSub, Signed, ToPrimitive, WrappingAdd, WrappingMul, WrappingNeg,
+    WrappingShl, WrappingShr, WrappingSub, Zero, cast::AsPrimitive,
+};
 use std::cmp::Ordering;
 use std::num::ParseIntError;
-use std::ops::{BitAnd, BitOr, BitXor, Neg, Shl, Shr};
+use std::ops::{BitAnd, BitOr, BitXor, Neg, Not, Shl, Shr};
 use std::str::FromStr;
 
 mod div;
@@ -52,7 +57,6 @@ enum DivRemError {
 }
 
 /// A signed 256-bit integer
-#[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Default, Eq, PartialEq, Hash)]
 #[repr(C)]
 pub struct i256 {
@@ -68,7 +72,24 @@ impl std::fmt::Debug for i256 {
 
 impl std::fmt::Display for i256 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", BigInt::from_signed_bytes_le(&self.to_le_bytes()))
+        if let Some(v) = Self::to_i128(*self) {
+            return write!(f, "{v}");
+        }
+
+        // The magnitude has up to 77 digits, so it splits into at most three
+        // chunks of 38 digits that each fit an i128. It is taken as unsigned
+        // limbs, which also holds the magnitude of i256::MIN.
+        let chunk = Self::from_i128(10_i128.pow(38)).as_digits();
+        let (high, low) = div_rem(&self.wrapping_abs().as_digits(), &chunk);
+        let (top, mid) = div_rem(&high, &chunk);
+        let [top, mid, low] = [top, mid, low].map(|digits| Self::from_digits(digits).as_i128());
+
+        let sign = if self.is_negative() { "-" } else { "" };
+        if top != 0 {
+            write!(f, "{sign}{top}{mid:038}{low:038}")
+        } else {
+            write!(f, "{sign}{mid}{low:038}")
+        }
     }
 }
 
@@ -123,6 +144,12 @@ impl From<i32> for i256 {
 impl From<i64> for i256 {
     fn from(value: i64) -> Self {
         Self::from_i128(value.into())
+    }
+}
+
+impl From<i128> for i256 {
+    fn from(value: i128) -> Self {
+        Self::from_i128(value)
     }
 }
 
@@ -230,10 +257,8 @@ impl i256 {
     /// Create an optional i256 from the provided `f64`. Returning `None`
     /// if overflow occurred
     pub fn from_f64(v: f64) -> Option<Self> {
-        BigInt::from_f64(v).and_then(|i| {
-            let (integer, overflow) = i256::from_bigint_with_overflow(i);
-            if overflow { None } else { Some(integer) }
-        })
+        let (integer, overflow) = i256::from_bigint_with_overflow(BigInt::from_f64(v)?);
+        if overflow { None } else { Some(integer) }
     }
 
     /// Create an i256 from the provided low u128 and high i128
@@ -249,18 +274,22 @@ impl i256 {
 
     /// Converts this `i256` into an `i128` returning `None` if this would result
     /// in truncation/overflow
-    pub fn to_i128(self) -> Option<i128> {
+    pub const fn to_i128(self) -> Option<i128> {
         let as_i128 = self.low as i128;
 
         let high_negative = self.high < 0;
         let low_negative = as_i128 < 0;
         let high_valid = self.high == -1 || self.high == 0;
 
-        (high_negative == low_negative && high_valid).then_some(self.low as i128)
+        if (high_negative == low_negative) && high_valid {
+            Some(self.low as i128)
+        } else {
+            None
+        }
     }
 
     /// Wraps this `i256` into an `i128`
-    pub fn as_i128(self) -> i128 {
+    pub const fn as_i128(self) -> i128 {
         self.low as i128
     }
 
@@ -315,7 +344,7 @@ impl i256 {
 
     /// Computes the absolute value of this i256
     #[inline]
-    pub fn wrapping_abs(self) -> Self {
+    pub const fn wrapping_abs(self) -> Self {
         // -1 if negative, otherwise 0
         let sa = self.high >> 127;
         let sa = Self::from_parts(sa as u128, sa);
@@ -326,25 +355,33 @@ impl i256 {
 
     /// Computes the absolute value of this i256 returning `None` if `Self == Self::MIN`
     #[inline]
-    pub fn checked_abs(self) -> Option<Self> {
-        (self != Self::MIN).then(|| self.wrapping_abs())
+    pub const fn checked_abs(self) -> Option<Self> {
+        if !self.is_eq(Self::MIN) {
+            Some(self.wrapping_abs())
+        } else {
+            None
+        }
     }
 
     /// Negates this i256
     #[inline]
-    pub fn wrapping_neg(self) -> Self {
+    pub const fn wrapping_neg(self) -> Self {
         Self::from_parts(!self.low, !self.high).wrapping_add(i256::ONE)
     }
 
     /// Negates this i256 returning `None` if `Self == Self::MIN`
     #[inline]
-    pub fn checked_neg(self) -> Option<Self> {
-        (self != Self::MIN).then(|| self.wrapping_neg())
+    pub const fn checked_neg(self) -> Option<Self> {
+        if !self.is_eq(Self::MIN) {
+            Some(self.wrapping_neg())
+        } else {
+            None
+        }
     }
 
     /// Performs wrapping addition
     #[inline]
-    pub fn wrapping_add(self, other: Self) -> Self {
+    pub const fn wrapping_add(self, other: Self) -> Self {
         let (low, carry) = self.low.overflowing_add(other.low);
         let high = self.high.wrapping_add(other.high).wrapping_add(carry as _);
         Self { low, high }
@@ -352,14 +389,15 @@ impl i256 {
 
     /// Performs checked addition
     #[inline]
-    pub fn checked_add(self, other: Self) -> Option<Self> {
-        let r = self.wrapping_add(other);
-        ((other.is_negative() && r < self) || (!other.is_negative() && r >= self)).then_some(r)
+    pub const fn checked_add(self, other: Self) -> Option<Self> {
+        let (r, overflow) = self.overflowing_add(other);
+
+        if overflow { None } else { Some(r) }
     }
 
     /// Performs wrapping subtraction
     #[inline]
-    pub fn wrapping_sub(self, other: Self) -> Self {
+    pub const fn wrapping_sub(self, other: Self) -> Self {
         let (low, carry) = self.low.overflowing_sub(other.low);
         let high = self.high.wrapping_sub(other.high).wrapping_sub(carry as _);
         Self { low, high }
@@ -367,14 +405,15 @@ impl i256 {
 
     /// Performs checked subtraction
     #[inline]
-    pub fn checked_sub(self, other: Self) -> Option<Self> {
-        let r = self.wrapping_sub(other);
-        ((other.is_negative() && r > self) || (!other.is_negative() && r <= self)).then_some(r)
+    pub const fn checked_sub(self, other: Self) -> Option<Self> {
+        let (r, overflow) = self.overflowing_sub(other);
+
+        if overflow { None } else { Some(r) }
     }
 
     /// Performs wrapping multiplication
     #[inline]
-    pub fn wrapping_mul(self, other: Self) -> Self {
+    pub const fn wrapping_mul(self, other: Self) -> Self {
         let (low, high) = mulx(self.low, other.low);
 
         // Compute the high multiples, only impacting the high 128-bits
@@ -387,10 +426,15 @@ impl i256 {
         }
     }
 
+    /// Const helper to check equality of two `i256` instances
+    const fn is_eq(&self, other: Self) -> bool {
+        (self.high == other.high) && (self.low == other.low)
+    }
+
     /// Performs checked multiplication
     #[inline]
-    pub fn checked_mul(self, other: Self) -> Option<Self> {
-        if self == i256::ZERO || other == i256::ZERO {
+    pub const fn checked_mul(self, other: Self) -> Option<Self> {
+        if self.is_eq(Self::ZERO) || other.is_eq(Self::ZERO) {
             return Some(i256::ZERO);
         }
 
@@ -412,18 +456,30 @@ impl i256 {
         let (low, high) = mulx(l_abs.low, r_abs.low);
 
         // Compute the high multiples, only impacting the high 128-bits
-        let hl = (l_abs.high as u128).checked_mul(r_abs.low)?;
-        let lh = l_abs.low.checked_mul(r_abs.high as u128)?;
+        let Some(hl) = (l_abs.high as u128).checked_mul(r_abs.low) else {
+            return None;
+        };
+        let Some(lh) = l_abs.low.checked_mul(r_abs.high as u128) else {
+            return None;
+        };
 
-        let high = high.checked_add(hl)?.checked_add(lh)?;
+        let Some(high) = high.checked_add(hl) else {
+            return None;
+        };
+        let Some(high) = high.checked_add(lh) else {
+            return None;
+        };
 
         // Reverse absolute value, if necessary
         let (low, c) = (low ^ out_sa).overflowing_sub(out_sa);
         let high = (high ^ out_sa).wrapping_sub(out_sa).wrapping_sub(c as u128) as i128;
 
         // Check for overflow in final conversion
-        (high.is_negative() == (self.is_negative() ^ other.is_negative()))
-            .then_some(Self { low, high })
+        if high.is_negative() == (self.is_negative() ^ other.is_negative()) {
+            Some(Self { low, high })
+        } else {
+            None
+        }
     }
 
     /// Division operation, returns (quotient, remainder).
@@ -440,9 +496,16 @@ impl i256 {
         let a = self.wrapping_abs();
         let b = other.wrapping_abs();
 
-        let (div, rem) = div_rem(&a.as_digits(), &b.as_digits());
-        let div = Self::from_digits(div);
-        let rem = Self::from_digits(rem);
+        let (div, rem) = if a.high == 0 && b.high == 0 {
+            // Magnitudes below 2^128 don't need the long division
+            (
+                Self::from_parts(a.low / b.low, 0),
+                Self::from_parts(a.low % b.low, 0),
+            )
+        } else {
+            let (div, rem) = div_rem(&a.as_digits(), &b.as_digits());
+            (Self::from_digits(div), Self::from_digits(rem))
+        };
 
         Ok((
             if self.is_negative() == other.is_negative() {
@@ -477,13 +540,15 @@ impl i256 {
     }
 
     /// Performs wrapping division
+    ///
+    /// Use [`Self::wrapping_div_rem`] if you also need the remainder.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `other` is zero
     #[inline]
     pub fn wrapping_div(self, other: Self) -> Self {
-        match self.div_rem(other) {
-            Ok((v, _)) => v,
-            Err(DivRemError::DivideByZero) => panic!("attempt to divide by zero"),
-            Err(_) => Self::MIN,
-        }
+        self.wrapping_div_rem(other).0
     }
 
     /// Performs checked division
@@ -493,13 +558,15 @@ impl i256 {
     }
 
     /// Performs wrapping remainder
+    ///
+    /// Use [`Self::wrapping_div_rem`] if you also need the quotient.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `other` is zero
     #[inline]
     pub fn wrapping_rem(self, other: Self) -> Self {
-        match self.div_rem(other) {
-            Ok((_, v)) => v,
-            Err(DivRemError::DivideByZero) => panic!("attempt to divide by zero"),
-            Err(_) => Self::ZERO,
-        }
+        self.wrapping_div_rem(other).1
     }
 
     /// Performs checked remainder
@@ -508,9 +575,64 @@ impl i256 {
         self.div_rem(other).map(|(_, v)| v).ok()
     }
 
+    /// Performs wrapping division and remainder, returning `(quotient, remainder)`
+    ///
+    /// This computes both results with one division, while calling
+    /// [`Self::wrapping_div`] and [`Self::wrapping_rem`] divides twice.
+    ///
+    /// The quotient is truncated toward zero, and the remainder has the sign of
+    /// `self`. `i256::MIN / -1` wraps to `(i256::MIN, 0)`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `other` is zero
+    ///
+    /// # Example
+    /// ```
+    /// # use arrow_buffer::i256;
+    /// let (q, r) = i256::from_i128(-7).wrapping_div_rem(i256::from_i128(2));
+    /// assert_eq!((q, r), (i256::from_i128(-3), i256::from_i128(-1)));
+    ///
+    /// let (q, r) = i256::MIN.wrapping_div_rem(i256::MINUS_ONE);
+    /// assert_eq!((q, r), (i256::MIN, i256::ZERO));
+    /// ```
+    #[inline]
+    pub fn wrapping_div_rem(self, other: Self) -> (Self, Self) {
+        match self.div_rem(other) {
+            Ok(v) => v,
+            Err(DivRemError::DivideByZero) => panic!("attempt to divide by zero"),
+            Err(DivRemError::DivideOverflow) => (Self::MIN, Self::ZERO),
+        }
+    }
+
+    /// Performs checked division and remainder, returning `(quotient, remainder)`
+    ///
+    /// This computes both results with one division, while calling
+    /// [`Self::checked_div`] and [`Self::checked_rem`] divides twice.
+    ///
+    /// The quotient is truncated toward zero, and the remainder has the sign of
+    /// `self`.
+    ///
+    /// Returns `None` if `other` is zero or the quotient overflows, which happens
+    /// only for `i256::MIN / -1`
+    ///
+    /// # Example
+    /// ```
+    /// # use arrow_buffer::i256;
+    /// let qr = i256::from_i128(-7).checked_div_rem(i256::from_i128(2));
+    /// assert_eq!(qr, Some((i256::from_i128(-3), i256::from_i128(-1))));
+    ///
+    /// assert_eq!(i256::ONE.checked_div_rem(i256::ZERO), None);
+    /// assert_eq!(i256::MIN.checked_div_rem(i256::MINUS_ONE), None);
+    /// ```
+    #[inline]
+    pub fn checked_div_rem(self, other: Self) -> Option<(Self, Self)> {
+        self.div_rem(other).ok()
+    }
+
     /// Performs checked exponentiation
     #[inline]
-    pub fn checked_pow(self, mut exp: u32) -> Option<Self> {
+    pub const fn checked_pow(self, mut exp: u32) -> Option<Self> {
         if exp == 0 {
             return Some(i256::from_i128(1));
         }
@@ -520,10 +642,16 @@ impl i256 {
 
         while exp > 1 {
             if (exp & 1) == 1 {
-                acc = acc.checked_mul(base)?;
+                let Some(next) = acc.checked_mul(base) else {
+                    return None;
+                };
+                acc = next;
             }
             exp /= 2;
-            base = base.checked_mul(base)?;
+            let Some(next) = base.checked_mul(base) else {
+                return None;
+            };
+            base = next;
         }
         // since exp!=0, finally the exp must be 1.
         // Deal with the final bit of the exponent separately, since
@@ -534,7 +662,7 @@ impl i256 {
 
     /// Performs wrapping exponentiation
     #[inline]
-    pub fn wrapping_pow(self, mut exp: u32) -> Self {
+    pub const fn wrapping_pow(self, mut exp: u32) -> Self {
         if exp == 0 {
             return i256::from_i128(1);
         }
@@ -583,10 +711,19 @@ impl i256 {
         self.high.is_positive() || self.high == 0 && self.low != 0
     }
 
-    fn leading_zeros(&self) -> u32 {
+    /// Returns the number of leading zeros in the binary representation of this [`i256`].
+    pub const fn leading_zeros(&self) -> u32 {
         match self.high {
             0 => u128::BITS + self.low.leading_zeros(),
             _ => self.high.leading_zeros(),
+        }
+    }
+
+    /// Returns the number of trailing zeros in the binary representation of this [`i256`].
+    pub const fn trailing_zeros(&self) -> u32 {
+        match self.low {
+            0 => u128::BITS + self.high.trailing_zeros(),
+            _ => self.low.trailing_zeros(),
         }
     }
 
@@ -598,8 +735,171 @@ impl i256 {
     fn i256_to_f64(input: i256) -> f64 {
         let k = i256::redundant_leading_sign_bits_i256(input);
         let n = input << k; // left-justify (no redundant sign bits)
-        let n = (n.high >> 64) as i64; // throw away the lower 192 bits
+        // If the retained bits land exactly on a midpoint, set the low bit so
+        // non-zero discarded bits push it just past and it rounds to nearest.
+        let sticky = n.low != 0 || (n.high as u64) != 0;
+        let n = ((n.high >> 64) as i64) | i64::from(sticky);
         (n as f64) * f64::powi(2.0, 192 - (k as i32)) // convert to f64 and scale it, as we left-shift k bit previous, so we need to scale it by 2^(192-k)
+    }
+
+    /// Computes the `base` logarithm of the number `self`
+    /// Returns `None` if `self` is less than or equal to zero, or if `base` is less than 2.
+    #[inline]
+    pub fn checked_ilog(self, base: i256) -> Option<u32> {
+        if base == Self::from(10) {
+            // Faster implementation for base 10
+            return self.checked_ilog10();
+        }
+
+        if self <= Self::ZERO {
+            return None;
+        }
+        if base <= Self::ONE {
+            return None;
+        }
+        if self < base {
+            return Some(0);
+        }
+
+        let mut val = 1;
+        let mut base_exp = base;
+
+        let boundary = self.checked_div(base)?;
+        while base_exp <= boundary {
+            val += 1;
+            base_exp = base_exp.checked_mul(base)?;
+        }
+        Some(val)
+    }
+
+    /// Computes the `base` logarithm of the number `self`
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self` is less than or equal to zero, or if `base` is less than 2.
+    #[inline]
+    pub fn ilog(self, base: i256) -> u32 {
+        self.checked_ilog(base)
+            .unwrap_or_else(|| panic!("ilog overflow with {self} and base {base}"))
+    }
+
+    /// Computes the decimal logarithm of the number `self`
+    /// Returns `None` if `self` is less than or equal to zero.
+    #[inline]
+    pub fn checked_ilog10(self) -> Option<u32> {
+        if self <= Self::ZERO {
+            return None;
+        }
+        if self < Self::from(10) {
+            return Some(0);
+        }
+
+        /// `10^32`
+        const POW10_32: i256 = i256::from_i128(100_000_000_000_000_000_000_000_000_000_000);
+
+        /// `10^64`
+        const POW10_64: i256 = i256::from_parts(
+            146_510_663_073_550_942_663_504_491_129_887_260_672,
+            29_387_358_770_557_187_699_218_413,
+        );
+
+        // Layered approach to calculate logarithm using i128 log operations only
+        // Consult int_log10.rs stdlib implementiation for u128
+        if self >= POW10_64 {
+            let value = self.checked_div(POW10_64)?;
+            // self is between 10^64 and 10^77 (~i256::MAX).
+            // `value` is 14 digits max (10^77 / 10^64 = 10^13),
+            // so it fits to `low` u128
+            debug_assert_eq!(value.high, 0);
+            Some(64 + value.low.checked_ilog10()?)
+        } else if self >= POW10_32 {
+            let value = self.checked_div(POW10_32)?;
+            // self is between 10^32 and 10^64.
+            // `value` is 33 digits max (10^64/10^32=10^32)
+            // so it fits to `low` 128-bit value
+            debug_assert_eq!(value.high, 0);
+            Some(32 + value.low.checked_ilog10()?)
+        } else {
+            // self fits within u128 (high == 0 and self > 0).
+            self.low.checked_ilog10()
+        }
+    }
+
+    /// Computes the decimal logarithm of the number `self`
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self` is less than or equal to zero.
+    #[inline]
+    pub fn ilog10(self) -> u32 {
+        self.checked_ilog10()
+            .unwrap_or_else(|| panic!("ilog10 overflow with {self}"))
+    }
+
+    /// Computes the binary logarithm of the number `self`
+    /// Returns `None` if `self` is less than or equal to zero.
+    #[inline]
+    pub fn checked_ilog2(self) -> Option<u32> {
+        self.checked_ilog(i256::from(2))
+    }
+
+    /// Computes the base 2 logarithm of the number, rounded down.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self` is less than or equal to zero
+    #[inline]
+    pub fn ilog2(self) -> u32 {
+        self.checked_ilog2()
+            .unwrap_or_else(|| panic!("ilog2 overflow with {self}"))
+    }
+
+    /// Calculates `self + rhs`.
+    ///
+    /// Returns the wrapping sum and a boolean indicating whether arithmetic overflow occurred.
+    /// The returned sum wraps around the bounds of [`i256`] when overflow occurs.
+    #[inline]
+    pub const fn overflowing_add(self, rhs: Self) -> (Self, bool) {
+        // Add the low limbs and capture the carry into the high limb.
+        let (low, carry) = self.low.overflowing_add(rhs.low);
+
+        // Treat the high limbs as raw two's-complement bit patterns.
+        let high = (self.high as u128)
+            .wrapping_add(rhs.high as u128)
+            .wrapping_add(carry as u128) as i128;
+
+        let result = Self { low, high };
+
+        // Signed overflow occurs when:
+        // - both operands have the same sign, and
+        // - the result has the opposite sign.
+        let overflow = (self.high < 0) == (rhs.high < 0) && (high < 0) != (self.high < 0);
+
+        (result, overflow)
+    }
+
+    /// Calculates `self - rhs`.
+    ///
+    /// Returns the wrapping difference and a boolean indicating whether arithmetic overflow
+    /// occurred. The returned difference wraps around the bounds of [`i256`] when overflow occurs.
+    #[inline]
+    pub const fn overflowing_sub(self, rhs: Self) -> (Self, bool) {
+        // Subtract the low limbs and determine whether we borrowed.
+        let (low, borrow) = self.low.overflowing_sub(rhs.low);
+
+        // Subtract the high limbs as raw bit patterns, including the borrow.
+        let high = (self.high as u128)
+            .wrapping_sub(rhs.high as u128)
+            .wrapping_sub(borrow as u128) as i128;
+
+        let result = Self { low, high };
+
+        // Signed overflow occurs when:
+        // - operands have opposite signs, and
+        // - the result's sign differs from the left operand's sign.
+        let overflow = (self.high < 0) != (rhs.high < 0) && (high < 0) != (self.high < 0);
+
+        (result, overflow)
     }
 }
 
@@ -623,8 +923,10 @@ const fn split_array<const N: usize, const M: usize>(vals: [u8; N]) -> ([u8; M],
 ///
 /// This mirrors the x86 mulx instruction but for 128-bit types
 #[inline]
-fn mulx(a: u128, b: u128) -> (u128, u128) {
-    let split = |a: u128| (a & (u64::MAX as u128), a >> 64);
+const fn mulx(a: u128, b: u128) -> (u128, u128) {
+    const fn split(a: u128) -> (u128, u128) {
+        (a & (u64::MAX as u128), a >> 64)
+    }
 
     const MASK: u128 = u64::MAX as _;
 
@@ -794,6 +1096,55 @@ impl Shr<u8> for i256 {
     }
 }
 
+impl WrappingShl for i256 {
+    #[inline]
+    fn wrapping_shl(&self, rhs: u32) -> i256 {
+        // Limit shift to 256 (max valid shift for i256)
+        (*self).shl(rhs as u8)
+    }
+}
+
+impl WrappingShr for i256 {
+    #[inline]
+    fn wrapping_shr(&self, rhs: u32) -> i256 {
+        // Limit shift to 256 (max valid shift for i256)
+        (*self).shr(rhs as u8)
+    }
+}
+
+// Define Shl<T> and Shr<T> for specified integer types using
+// an existing Shl<u8> and Shr<u8> implementation
+macro_rules! define_standard_shift {
+    // Handle multiple types
+    ($trait_name:ident, $method:ident, [$($t:ty),+]) => {
+        $(define_standard_shift!($trait_name, $method, $t);)+
+    };
+    // Handle single type
+    ($trait_name:ident, $method:ident, $t:ty) => {
+        impl $trait_name<$t> for i256 {
+            type Output = i256;
+
+            #[inline]
+            fn $method(self, rhs: $t) -> Self::Output {
+                let rhs = u8::try_from(rhs).expect("rhs overflow for shift");
+                // Other possible overflows are handled by Shl<u8> implementation
+                self.$method(rhs)
+            }
+        }
+    };
+}
+
+define_standard_shift!(
+    Shl,
+    shl,
+    [u16, u32, u64, u128, usize, i16, i32, i64, i128, isize]
+);
+define_standard_shift!(
+    Shr,
+    shr,
+    [u16, u32, u64, u128, usize, i16, i32, i64, i128, isize]
+);
+
 macro_rules! define_as_primitive {
     ($native_ty:ty) => {
         impl AsPrimitive<i256> for $native_ty {
@@ -815,25 +1166,7 @@ define_as_primitive!(u64);
 
 impl ToPrimitive for i256 {
     fn to_i64(&self) -> Option<i64> {
-        let as_i128 = self.low as i128;
-
-        let high_negative = self.high < 0;
-        let low_negative = as_i128 < 0;
-        let high_valid = self.high == -1 || self.high == 0;
-
-        if high_negative == low_negative && high_valid {
-            let (low_bytes, high_bytes) = split_array(u128::to_le_bytes(self.low));
-            let high = i64::from_le_bytes(high_bytes);
-            let low = i64::from_le_bytes(low_bytes);
-
-            let high_negative = high < 0;
-            let low_negative = low < 0;
-            let high_valid = self.high == -1 || self.high == 0;
-
-            (high_negative == low_negative && high_valid).then_some(low)
-        } else {
-            None
-        }
+        i64::try_from(i256::to_i128(*self)?).ok()
     }
 
     fn to_f64(&self) -> Option<f64> {
@@ -846,25 +1179,232 @@ impl ToPrimitive for i256 {
     }
 
     fn to_u64(&self) -> Option<u64> {
-        let as_i128 = self.low as i128;
+        u64::try_from(i256::to_i128(*self)?).ok()
+    }
+}
 
-        let high_negative = self.high < 0;
-        let low_negative = as_i128 < 0;
-        let high_valid = self.high == -1 || self.high == 0;
+// num_traits checked implementations
 
-        if high_negative == low_negative && high_valid {
-            self.low.to_u64()
+impl CheckedNeg for i256 {
+    fn checked_neg(&self) -> Option<Self> {
+        (*self).checked_neg()
+    }
+}
+
+impl CheckedAdd for i256 {
+    fn checked_add(&self, v: &i256) -> Option<Self> {
+        (*self).checked_add(*v)
+    }
+}
+
+impl CheckedSub for i256 {
+    fn checked_sub(&self, v: &i256) -> Option<Self> {
+        (*self).checked_sub(*v)
+    }
+}
+
+impl CheckedDiv for i256 {
+    fn checked_div(&self, v: &i256) -> Option<Self> {
+        (*self).checked_div(*v)
+    }
+}
+
+impl CheckedMul for i256 {
+    #[inline]
+    fn checked_mul(&self, v: &i256) -> Option<Self> {
+        (*self).checked_mul(*v)
+    }
+}
+
+impl CheckedRem for i256 {
+    fn checked_rem(&self, v: &i256) -> Option<Self> {
+        (*self).checked_rem(*v)
+    }
+}
+
+impl CheckedShl for i256 {
+    fn checked_shl(&self, rhs: u32) -> Option<Self> {
+        let rhs = u8::try_from(rhs).ok()?;
+        Some(self.shl(rhs))
+    }
+}
+
+impl CheckedShr for i256 {
+    fn checked_shr(&self, rhs: u32) -> Option<Self> {
+        let rhs = u8::try_from(rhs).ok()?;
+        Some(self.shr(rhs))
+    }
+}
+
+// num_traits wrapping implementations
+
+impl WrappingAdd for i256 {
+    fn wrapping_add(&self, v: &Self) -> Self {
+        (*self).wrapping_add(*v)
+    }
+}
+
+impl WrappingSub for i256 {
+    fn wrapping_sub(&self, v: &Self) -> Self {
+        (*self).wrapping_sub(*v)
+    }
+}
+
+impl WrappingMul for i256 {
+    fn wrapping_mul(&self, v: &Self) -> Self {
+        (*self).wrapping_mul(*v)
+    }
+}
+
+impl WrappingNeg for i256 {
+    fn wrapping_neg(&self) -> Self {
+        (*self).wrapping_neg()
+    }
+}
+
+// num_traits saturating implementations
+
+impl SaturatingAdd for i256 {
+    fn saturating_add(&self, v: &Self) -> Self {
+        self.checked_add(v).unwrap_or_else(|| {
+            if v.is_negative() {
+                i256::MIN
+            } else {
+                i256::MAX
+            }
+        })
+    }
+}
+
+impl SaturatingSub for i256 {
+    fn saturating_sub(&self, v: &Self) -> Self {
+        self.checked_sub(v).unwrap_or_else(|| {
+            if v.is_negative() {
+                i256::MAX
+            } else {
+                i256::MIN
+            }
+        })
+    }
+}
+
+impl SaturatingMul for i256 {
+    fn saturating_mul(&self, v: &Self) -> Self {
+        self.checked_mul(v).unwrap_or_else(|| {
+            if v.is_negative() == self.is_negative() {
+                i256::MAX
+            } else {
+                i256::MIN
+            }
+        })
+    }
+}
+
+impl MulAdd for i256 {
+    type Output = i256;
+
+    fn mul_add(self, a: Self, b: Self) -> Self::Output {
+        (self * a) + b
+    }
+}
+
+impl MulAddAssign for i256 {
+    fn mul_add_assign(&mut self, a: Self, b: Self) {
+        *self = self.mul_add(a, b)
+    }
+}
+
+impl Zero for i256 {
+    fn zero() -> Self {
+        i256::ZERO
+    }
+
+    fn is_zero(&self) -> bool {
+        *self == i256::ZERO
+    }
+}
+
+impl ConstZero for i256 {
+    const ZERO: Self = i256::ZERO;
+}
+
+impl One for i256 {
+    fn one() -> Self {
+        i256::ONE
+    }
+
+    fn is_one(&self) -> bool {
+        *self == i256::ONE
+    }
+}
+
+impl ConstOne for i256 {
+    const ONE: Self = i256::ONE;
+}
+
+impl Num for i256 {
+    type FromStrRadixErr = ParseI256Error;
+
+    fn from_str_radix(str: &str, radix: u32) -> Result<Self, Self::FromStrRadixErr> {
+        if radix == 10 {
+            str.parse()
         } else {
-            None
+            // Parsing from non-10 baseseeÎ is not supported
+            Err(ParseI256Error {})
         }
     }
 }
 
-#[cfg(all(test, not(miri)))] // llvm.x86.subborrow.64 not supported by MIRI
+impl Signed for i256 {
+    fn abs(&self) -> Self {
+        self.wrapping_abs()
+    }
+
+    fn abs_sub(&self, other: &Self) -> Self {
+        if self > other {
+            self.wrapping_sub(other)
+        } else {
+            i256::ZERO
+        }
+    }
+
+    fn signum(&self) -> Self {
+        (*self).signum()
+    }
+
+    fn is_positive(&self) -> bool {
+        (*self).is_positive()
+    }
+
+    fn is_negative(&self) -> bool {
+        (*self).is_negative()
+    }
+}
+
+impl Bounded for i256 {
+    fn min_value() -> Self {
+        i256::MIN
+    }
+
+    fn max_value() -> Self {
+        i256::MAX
+    }
+}
+
+impl Not for i256 {
+    type Output = i256;
+
+    #[inline]
+    fn not(self) -> Self::Output {
+        Self::from_parts(!self.low, !self.high)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use num_traits::Signed;
-    use rand::{Rng, rng};
+    use rand::{RngExt, SeedableRng, rng, rngs::StdRng};
 
     #[test]
     fn test_signed_cmp() {
@@ -935,6 +1475,7 @@ mod tests {
         let actual = il.wrapping_add(ir);
         let (expected, overflow) = i256::from_bigint_with_overflow(bl.clone() + br.clone());
         assert_eq!(actual, expected);
+        assert_eq!(il.overflowing_add(ir), (expected, overflow));
 
         let checked = il.checked_add(ir);
         match overflow {
@@ -946,6 +1487,7 @@ mod tests {
         let actual = il.wrapping_sub(ir);
         let (expected, overflow) = i256::from_bigint_with_overflow(bl.clone() - br.clone());
         assert_eq!(actual.to_string(), expected.to_string());
+        assert_eq!(il.overflowing_sub(ir), (expected, overflow));
 
         let checked = il.checked_sub(ir);
         match overflow {
@@ -971,45 +1513,11 @@ mod tests {
             ),
         }
 
-        // Division
-        if ir != i256::ZERO {
-            let actual = il.wrapping_div(ir);
-            let expected = bl.clone() / br.clone();
-            let checked = il.checked_div(ir);
-
-            if ir == i256::MINUS_ONE && il == i256::MIN {
-                // BigInt produces an integer over i256::MAX
-                assert_eq!(actual, i256::MIN);
-                assert!(checked.is_none());
-            } else {
-                assert_eq!(actual.to_string(), expected.to_string());
-                assert_eq!(checked.unwrap().to_string(), expected.to_string());
-            }
-        } else {
-            // `wrapping_div` panics on division by zero
-            assert!(il.checked_div(ir).is_none());
-        }
-
-        // Remainder
-        if ir != i256::ZERO {
-            let actual = il.wrapping_rem(ir);
-            let expected = bl.clone() % br.clone();
-            let checked = il.checked_rem(ir);
-
-            assert_eq!(actual.to_string(), expected.to_string(), "{il} % {ir}");
-
-            if ir == i256::MINUS_ONE && il == i256::MIN {
-                assert!(checked.is_none());
-            } else {
-                assert_eq!(checked.unwrap().to_string(), expected.to_string());
-            }
-        } else {
-            // `wrapping_rem` panics on division by zero
-            assert!(il.checked_rem(ir).is_none());
-        }
+        // Division and remainder
+        test_div_rem(il, ir);
 
         // Exponentiation
-        for exp in vec![0, 1, 2, 3, 8, 100].into_iter() {
+        for exp in [0, 1, 2, 3, 8, 100] {
             let actual = il.wrapping_pow(exp);
             let (expected, overflow) = i256::from_bigint_with_overflow(bl.clone().pow(exp));
             assert_eq!(actual.to_string(), expected.to_string());
@@ -1046,18 +1554,65 @@ mod tests {
             let (expected, _) = i256::from_bigint_with_overflow(bl.clone() << shift);
             assert_eq!(actual.to_string(), expected.to_string());
 
+            let wrapping_actual = <i256 as WrappingShl>::wrapping_shl(&il, shift as u32);
+            assert_eq!(wrapping_actual.to_string(), expected.to_string());
+
             let actual = il >> shift;
             let (expected, _) = i256::from_bigint_with_overflow(bl.clone() >> shift);
             assert_eq!(actual.to_string(), expected.to_string());
+
+            let wrapping_actual = <i256 as WrappingShr>::wrapping_shr(&il, shift as u32);
+            assert_eq!(wrapping_actual.to_string(), expected.to_string());
+
+            // Check wrapping of the shift argument
+            let wrapping_actual = <i256 as WrappingShr>::wrapping_shr(&il, 512 + shift as u32);
+            assert_eq!(wrapping_actual.to_string(), expected.to_string());
         }
     }
 
     #[test]
+    fn test_overflowing_add() {
+        const POSITIVE_OVERFLOW: (i256, bool) = i256::MAX.overflowing_add(i256::ONE);
+        const NEGATIVE_OVERFLOW: (i256, bool) = i256::MIN.overflowing_add(i256::MINUS_ONE);
+
+        assert_eq!(POSITIVE_OVERFLOW, (i256::MIN, true));
+        assert_eq!(NEGATIVE_OVERFLOW, (i256::MAX, true));
+        assert_eq!(
+            i256::from_parts(u128::MAX, 0).overflowing_add(i256::ONE),
+            (i256::from_parts(0, 1), false)
+        );
+        assert_eq!(
+            i256::ONE.overflowing_add(i256::from_i128(2)),
+            (i256::from_i128(3), false)
+        );
+    }
+
+    #[test]
+    fn test_overflowing_sub() {
+        const NEGATIVE_OVERFLOW: (i256, bool) = i256::MIN.overflowing_sub(i256::ONE);
+        const POSITIVE_OVERFLOW: (i256, bool) = i256::MAX.overflowing_sub(i256::MINUS_ONE);
+
+        assert_eq!(NEGATIVE_OVERFLOW, (i256::MAX, true));
+        assert_eq!(POSITIVE_OVERFLOW, (i256::MIN, true));
+        assert_eq!(
+            i256::from_parts(0, 1).overflowing_sub(i256::ONE),
+            (i256::from_parts(u128::MAX, 0), false)
+        );
+        assert_eq!(
+            i256::from_i128(3).overflowing_sub(i256::from_i128(2)),
+            (i256::ONE, false)
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // Takes too long
     fn test_i256() {
         let candidates = [
             i256::ZERO,
             i256::ONE,
             i256::MINUS_ONE,
+            ConstZero::ZERO,
+            ConstOne::ONE,
             i256::from_i128(2),
             i256::from_i128(-2),
             i256::from_parts(u128::MAX, 1),
@@ -1091,6 +1646,79 @@ mod tests {
         }
     }
 
+    fn test_div_rem(n: i256, d: i256) {
+        if d == i256::ZERO {
+            // The wrapping methods panic on division by zero
+            assert_eq!(n.checked_div(d), None);
+            assert_eq!(n.checked_rem(d), None);
+            assert_eq!(n.checked_div_rem(d), None);
+            return;
+        }
+
+        let bn = BigInt::from_signed_bytes_le(&n.to_le_bytes());
+        let bd = BigInt::from_signed_bytes_le(&d.to_le_bytes());
+
+        // BigInt produces an integer over i256::MAX for i256::MIN / -1
+        let (q, overflow) = i256::from_bigint_with_overflow(bn.clone() / bd.clone());
+        let (r, _) = i256::from_bigint_with_overflow(bn % bd);
+
+        assert_eq!(n.wrapping_div(d), q, "{n} / {d}");
+        assert_eq!(n.wrapping_rem(d), r, "{n} % {d}");
+        assert_eq!(n.wrapping_div_rem(d), (q, r), "{n} / {d}");
+        assert_eq!(n.checked_div(d), (!overflow).then_some(q), "{n} / {d}");
+        assert_eq!(n.checked_rem(d), (!overflow).then_some(r), "{n} % {d}");
+        assert_eq!(
+            n.checked_div_rem(d),
+            (!overflow).then_some((q, r)),
+            "{n} / {d}"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // Takes too long
+    fn test_div_rem_powers_of_ten() {
+        let dividends = [
+            i256::ZERO,
+            i256::ONE,
+            i256::MIN,
+            i256::MAX,
+            i256::from_i128(i128::MIN),
+            i256::from_i128(i128::MAX),
+            i256::from_i128(u64::MAX as i128),
+            i256::from_i128(1 << 64),
+            i256::from_i128((1 << 64) + 1),
+            i256::from_parts(u128::MAX, 0),
+            i256::from_parts(0, 1),
+            i256::from_parts(1, 1),
+        ];
+
+        // 10^76 is the largest power of ten that fits in an i256
+        for k in 0..=76 {
+            let p = i256::from_i128(10).wrapping_pow(k);
+            for d in [p - i256::ONE, p, p + i256::ONE] {
+                for n in dividends
+                    .into_iter()
+                    .chain([p - i256::ONE, p, p + i256::ONE])
+                {
+                    for (n, d) in [
+                        (n, d),
+                        (n.wrapping_neg(), d),
+                        (n, -d),
+                        (n.wrapping_neg(), -d),
+                    ] {
+                        test_div_rem(n, d);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "attempt to divide by zero")]
+    fn test_wrapping_div_rem_zero_panics() {
+        let _ = i256::ONE.wrapping_div_rem(i256::ZERO);
+    }
+
     #[test]
     fn test_signed_ops() {
         // signum
@@ -1113,20 +1741,26 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
+    #[cfg_attr(miri, ignore)] // Takes too long
     fn test_i256_fuzz() {
         let mut rng = rng();
 
         for _ in 0..1000 {
             let mut l = [0_u8; 32];
-            let len = rng.random_range(0..32);
+            let len = rng.random_range(0..=32);
             l.iter_mut().take(len).for_each(|x| *x = rng.random());
 
             let mut r = [0_u8; 32];
-            let len = rng.random_range(0..32);
+            let len = rng.random_range(0..=32);
             r.iter_mut().take(len).for_each(|x| *x = rng.random());
 
-            test_ops(i256::from_le_bytes(l), i256::from_le_bytes(r))
+            // Random bytes almost never produce a negative value of small magnitude
+            let l = i256::from_le_bytes(l);
+            let r = i256::from_le_bytes(r);
+            let l = if rng.random() { l.wrapping_neg() } else { l };
+            let r = if rng.random() { r.wrapping_neg() } else { r };
+
+            test_ops(l, r)
         }
     }
 
@@ -1161,6 +1795,32 @@ mod tests {
         assert!(a.to_u64().is_none());
 
         let a = i256::from_i128(i64::MIN as i128 - 1);
+        assert!(a.to_i64().is_none());
+        assert!(a.to_u64().is_none());
+
+        // values whose two 64-bit halves agree in sign but exceed i64/u64
+        // https://github.com/apache/arrow-rs/issues/10855
+        let a = i256::from_i128((1i128 << 64) + 5);
+        assert!(a.to_i64().is_none());
+        assert!(a.to_u64().is_none());
+        assert!(a.to_i32().is_none());
+        assert!(a.to_i8().is_none());
+
+        let a = i256::from_i128(-((1i128 << 64) + 5));
+        assert!(a.to_i64().is_none());
+        assert!(a.to_u64().is_none());
+        assert!(a.to_i32().is_none());
+        assert!(a.to_i8().is_none());
+
+        let a = i256::from_i128(u64::MAX as i128);
+        assert!(a.to_i64().is_none());
+        assert_eq!(a.to_u64().unwrap(), u64::MAX);
+
+        let a = i256::from_parts(5, 1);
+        assert!(a.to_i64().is_none());
+        assert!(a.to_u64().is_none());
+
+        let a = i256::from_parts(u64::MAX as u128 + 5, 0);
         assert!(a.to_i64().is_none());
         assert!(a.to_u64().is_none());
     }
@@ -1205,6 +1865,41 @@ mod tests {
     }
 
     #[test]
+    fn test_display_matches_bigint() {
+        let ten_pow_38 = i256::from_i128(10_i128.pow(38));
+        let mut cases = vec![
+            i256::ZERO,
+            i256::ONE,
+            i256::MINUS_ONE,
+            i256::from_i128(i128::MAX),
+            i256::from_i128(i128::MIN),
+            i256::from_i128(i128::MAX).wrapping_add(i256::ONE),
+            i256::from_i128(i128::MIN).wrapping_sub(i256::ONE),
+            ten_pow_38,
+            ten_pow_38.wrapping_sub(i256::ONE),
+            ten_pow_38.wrapping_neg(),
+            ten_pow_38.wrapping_mul(ten_pow_38),
+            ten_pow_38.wrapping_mul(ten_pow_38).wrapping_neg(),
+            ten_pow_38.wrapping_mul(ten_pow_38).wrapping_add(i256::ONE),
+            i256::MAX,
+            i256::MIN,
+            i256::MIN.wrapping_add(i256::ONE),
+        ];
+        // Every digit count, with and without zeros in the lower chunks
+        let mut value = i256::ONE;
+        while value != i256::ZERO {
+            cases.push(value);
+            cases.push(value.wrapping_sub(i256::ONE));
+            cases.push(value.wrapping_neg());
+            value = value.wrapping_mul(i256::from_i128(10));
+        }
+        for case in cases {
+            let expected = BigInt::from_signed_bytes_le(&case.to_le_bytes()).to_string();
+            assert_eq!(case.to_string(), expected);
+        }
+    }
+
+    #[test]
     fn test_from_string() {
         let cases = [
             (
@@ -1236,7 +1931,7 @@ mod tests {
         }
     }
 
-    #[allow(clippy::op_ref)]
+    #[expect(clippy::op_ref)]
     fn test_reference_op(il: i256, ir: i256) {
         let r1 = il + ir;
         let r2 = &il + ir;
@@ -1290,12 +1985,62 @@ mod tests {
     }
 
     #[test]
+    fn test_i256_to_f64_midpoint_rounding() {
+        // Regression test for #11314: the value is one above the binary64 midpoint.
+        let integer = (1_i128 << 63) + 1024 + 1;
+        assert_eq!(
+            i256::from_i128(integer).to_f64().unwrap().to_bits(),
+            (integer as f64).to_bits()
+        );
+
+        let two = i256::from(2);
+        // Binary64 has a 53-bit significand: inside [2^e, 2^(e+1)) adjacent values
+        // are 2^(e-52) apart, so the exact tie is 2^(e-53) above 2^e. Ties are where
+        // #11314 rounded the wrong way. Start at 53 (below that the midpoint is not
+        // an integer) and stop at 254 (2^255 overflows i256).
+        for exponent in 53..=254 {
+            let midpoint = two.wrapping_pow(exponent) + two.wrapping_pow(exponent - 53);
+            for delta in -2_i64..=2 {
+                for value in [
+                    midpoint + i256::from(delta),
+                    -(midpoint + i256::from(delta)),
+                ] {
+                    let expected: f64 = value.to_string().parse().unwrap();
+                    assert_eq!(
+                        value.to_f64().unwrap().to_bits(),
+                        expected.to_bits(),
+                        "i256 {value} should round to nearest"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_i256_to_f64_fuzz() {
+        // `to_string().parse::<f64>()` is a correctly rounded decimal-to-binary oracle.
+        for value in [i256::MIN, i256::MAX, i256::MINUS_ONE, i256::ZERO, i256::ONE] {
+            let expected: f64 = value.to_string().parse().unwrap();
+            assert_eq!(value.to_f64().unwrap().to_bits(), expected.to_bits());
+        }
+
+        let mut rng = StdRng::seed_from_u64(42);
+        for _ in 0..1_000 {
+            let low = u128::from(rng.random::<u64>()) | (u128::from(rng.random::<u64>()) << 64);
+            let high = u128::from(rng.random::<u64>()) | (u128::from(rng.random::<u64>()) << 64);
+            let value = i256::from_parts(low, high as i128);
+            let expected: f64 = value.to_string().parse().unwrap();
+            assert_eq!(value.to_f64().unwrap().to_bits(), expected.to_bits());
+        }
+    }
+
+    #[test]
     fn test_decimal256_to_f64_typical_values() {
         let v = i256::from_i128(42_i128);
         assert_eq!(v.to_f64().unwrap(), 42.0);
 
         let v = i256::from_i128(-123456789012345678i128);
-        assert_eq!(v.to_f64().unwrap(), -123456789012345678.0);
+        assert_eq!(v.to_f64().unwrap(), -123_456_789_012_345_680.0);
 
         let v = i256::from_string("0").unwrap();
         assert_eq!(v.to_f64().unwrap(), 0.0);
@@ -1326,5 +2071,290 @@ mod tests {
         let big_neg = i256::from_f64(-(max_f * 2.0)).unwrap_or(i256::MIN);
         let out = big_neg.to_f64().unwrap();
         assert!(out.is_finite() && out.is_sign_negative());
+    }
+
+    #[test]
+    fn test_num_traits() {
+        let value = i256::from_i128(-5);
+        assert_eq!(
+            <i256 as CheckedNeg>::checked_neg(&value),
+            Some(i256::from(5))
+        );
+
+        assert_eq!(
+            <i256 as CheckedAdd>::checked_add(&value, &value),
+            Some(i256::from(-10))
+        );
+
+        assert_eq!(
+            <i256 as CheckedSub>::checked_sub(&value, &value),
+            Some(i256::from(0))
+        );
+
+        assert_eq!(
+            <i256 as CheckedMul>::checked_mul(&value, &value),
+            Some(i256::from(25))
+        );
+
+        assert_eq!(
+            <i256 as CheckedDiv>::checked_div(&value, &value),
+            Some(i256::from(1))
+        );
+
+        assert_eq!(
+            <i256 as CheckedRem>::checked_rem(&value, &value),
+            Some(i256::from(0))
+        );
+
+        assert_eq!(
+            <i256 as WrappingAdd>::wrapping_add(&value, &value),
+            i256::from(-10)
+        );
+
+        assert_eq!(
+            <i256 as WrappingSub>::wrapping_sub(&value, &value),
+            i256::from(0)
+        );
+
+        assert_eq!(
+            <i256 as WrappingMul>::wrapping_mul(&value, &value),
+            i256::from(25)
+        );
+
+        assert_eq!(<i256 as WrappingNeg>::wrapping_neg(&value), i256::from(5));
+
+        // A single check for wrapping behavior, rely on trait implementation for others
+        let result = <i256 as WrappingAdd>::wrapping_add(&i256::MAX, &i256::ONE);
+        assert_eq!(result, i256::MIN);
+
+        // Saturating operations
+        assert_eq!(i256::MAX.saturating_add(&i256::ONE), i256::MAX);
+        assert_eq!(i256::MIN.saturating_sub(&i256::ONE), i256::MIN);
+        assert_eq!(i256::MIN.saturating_add(&i256::MINUS_ONE), i256::MIN);
+        assert_eq!(i256::MAX.saturating_sub(&i256::MINUS_ONE), i256::MAX);
+        assert_eq!(i256::MAX.saturating_mul(&i256::MAX), i256::MAX);
+        assert_eq!(i256::MAX.saturating_mul(&i256::MIN), i256::MIN);
+        assert_eq!(i256::MIN.saturating_mul(&i256::MAX), i256::MIN);
+        assert_eq!(i256::MIN.saturating_mul(&i256::MIN), i256::MAX);
+        assert_eq!(i256::MIN.saturating_mul(&i256::ONE), i256::MIN);
+        assert_eq!(i256::MIN.saturating_mul(&i256::MINUS_ONE), i256::MAX);
+        assert_eq!(
+            i256::from(20).saturating_add(&i256::from(5)),
+            i256::from(25)
+        );
+        assert_eq!(
+            i256::from(20).saturating_sub(&i256::from(5)),
+            i256::from(15)
+        );
+        assert_eq!(
+            i256::from(20).saturating_mul(&i256::from(5)),
+            i256::from(100)
+        );
+
+        // Mul-add
+        assert_eq!(
+            i256::from(20).mul_add(i256::from(5), i256::from(10)),
+            i256::from(110)
+        );
+
+        let mut mul_add_value = i256::from(20);
+        mul_add_value.mul_add_assign(i256::from(5), i256::from(10));
+        assert_eq!(mul_add_value, i256::from(110));
+
+        let value = i256::from(-5);
+        assert_eq!(<i256 as Signed>::abs(&value), i256::from(5));
+
+        assert_eq!(<i256 as One>::one(), i256::from(1));
+        assert_eq!(<i256 as Zero>::zero(), i256::from(0));
+
+        assert_eq!(<i256 as Bounded>::min_value(), i256::MIN);
+        assert_eq!(<i256 as Bounded>::max_value(), i256::MAX);
+
+        // Bitwise not
+        assert_eq!(!i256::ZERO, i256::MINUS_ONE);
+        assert_eq!(!i256::MINUS_ONE, i256::ZERO);
+        assert_eq!(!i256::ONE, i256::from_parts(u128::MAX - 1, -1));
+    }
+
+    #[should_panic(expected = "rhs overflow for shift")]
+    #[test]
+    fn test_shl_panic_on_arg_overflow() {
+        let value = i256::from(123);
+        let rhs = std::hint::black_box(500);
+        let _ = value << rhs;
+    }
+
+    #[test]
+    fn test_numtraits_from_str_radix() {
+        assert_eq!(
+            i256::from_str_radix("123456789", 10).expect("parsed"),
+            i256::from(123456789)
+        );
+        assert_eq!(
+            i256::from_str_radix("0", 10).expect("parsed"),
+            i256::from(0)
+        );
+        assert!(i256::from_str_radix("abc", 10).is_err());
+        assert!(i256::from_str_radix("0", 16).is_err());
+    }
+
+    #[test]
+    fn test_leading_zeros() {
+        // Without high part
+        assert_eq!(i256::from(0).leading_zeros(), 256);
+        assert_eq!(i256::from(1).leading_zeros(), 256 - 1);
+        assert_eq!(i256::from(16).leading_zeros(), 256 - 5);
+        assert_eq!(i256::from(17).leading_zeros(), 256 - 5);
+
+        // With high part
+        assert_eq!(i256::from_parts(2, 16).leading_zeros(), 128 - 5);
+        assert_eq!(i256::from_parts(2, i128::MAX).leading_zeros(), 1);
+
+        assert_eq!(i256::MAX.leading_zeros(), 1);
+        assert_eq!(i256::from(-1).leading_zeros(), 0);
+    }
+
+    #[test]
+    fn test_trailing_zeros() {
+        // Without high part
+        assert_eq!(i256::from(0).trailing_zeros(), 256);
+        assert_eq!(i256::from(2).trailing_zeros(), 1);
+        assert_eq!(i256::from(16).trailing_zeros(), 4);
+        assert_eq!(i256::from(17).trailing_zeros(), 0);
+        // With high part
+        assert_eq!(i256::from_parts(0, i128::MAX).trailing_zeros(), 128);
+        assert_eq!(i256::from_parts(0, 16).trailing_zeros(), 128 + 4);
+        assert_eq!(i256::from_parts(2, i128::MAX).trailing_zeros(), 1);
+
+        assert_eq!(i256::MAX.trailing_zeros(), 0);
+        assert_eq!(i256::from(-1).trailing_zeros(), 0);
+    }
+
+    #[test]
+    fn test_ilog() {
+        let value = i256::from(128);
+
+        // log2
+        assert_eq!(value.ilog(i256::from(2)), 7);
+        assert_eq!(value.ilog2(), 7);
+
+        // log10
+        assert_eq!(value.ilog(i256::from(10)), 2);
+        assert_eq!(value.ilog10(), 2);
+
+        // negative base
+        assert_eq!(value.checked_ilog(i256::from(-2)), None);
+        assert_eq!(value.checked_ilog(i256::from(-10)), None);
+        assert_eq!(value.checked_ilog(i256::from(0)), None);
+        assert_eq!(value.checked_ilog(i256::from(1)), None);
+
+        // negative self
+        let neg_value = i256::from(-128);
+        assert_eq!(neg_value.checked_ilog(i256::from(2)), None);
+        assert_eq!(neg_value.checked_ilog(i256::from(10)), None);
+        assert_eq!(neg_value.checked_ilog10(), None);
+        assert_eq!(neg_value.checked_ilog2(), None);
+
+        // zero self
+        assert_eq!(i256::ZERO.checked_ilog(i256::from(2)), None);
+        assert_eq!(i256::ZERO.checked_ilog(i256::from(10)), None);
+        assert_eq!(i256::ZERO.checked_ilog10(), None);
+        assert_eq!(i256::ZERO.checked_ilog2(), None);
+
+        // self == base, matches std: `n.ilog(n) == 1`
+        assert_eq!(i256::from(2).checked_ilog(i256::from(2)), Some(1));
+        assert_eq!(i256::from(3).checked_ilog(i256::from(3)), Some(1));
+        assert_eq!(i256::from(5).checked_ilog(i256::from(5)), Some(1));
+        assert_eq!(i256::from(1000).checked_ilog(i256::from(1000)), Some(1));
+        assert_eq!(i256::from(2).checked_ilog2(), Some(1));
+        assert_eq!(i256::from(2).ilog2(), 1);
+        // base 10 goes through the checked_ilog10 fast path
+        assert_eq!(i256::from(10).checked_ilog(i256::from(10)), Some(1));
+
+        // self < base is 0
+        assert_eq!(i256::from(3).checked_ilog(i256::from(5)), Some(0));
+
+        // cross-check small results (0 and 1) against u128::ilog
+        for base in [2i64, 3, 5, 7, 1000] {
+            for v in 1i64..64 {
+                let want = (v as u128).ilog(base as u128);
+                assert_eq!(
+                    i256::from(v).checked_ilog(i256::from(base)),
+                    Some(want),
+                    "checked_ilog({v}, {base})"
+                );
+            }
+        }
+
+        let value = i256::from_parts(100000000, 1234);
+        assert_eq!(value.checked_ilog(i256::from(10)), Some(41));
+        assert_eq!(value.checked_ilog10(), Some(41));
+
+        // Large i256 values
+        let large = i256::from_parts(100000000, i128::MAX);
+        // log2 of 2 powered to approximately 255 should be 254
+        assert_eq!(large.checked_ilog(i256::from(2)), Some(254));
+
+        // log10(large)=76
+        assert_eq!(large.checked_ilog(i256::from(10)), Some(76));
+        assert_eq!(large.checked_ilog10(), Some(76));
+
+        // log5(large)
+        assert_eq!(large.checked_ilog(i256::from(5)), Some(109));
+
+        // Maximum representable value is 2^254
+        assert!(i256::from(2).checked_pow(255).is_none());
+        let value = i256::from(2).checked_pow(254).expect("construct");
+        assert_eq!(value.checked_ilog(i256::from(2)), Some(254));
+
+        // Logarithm of a maximum representable value is 254
+        assert_eq!(i256::MAX.checked_ilog(i256::from(2)), Some(254));
+    }
+
+    #[test]
+    fn test_ilog10() {
+        // Edge cases
+        assert_eq!(i256::ZERO.checked_ilog10(), None);
+        assert_eq!(i256::MINUS_ONE.checked_ilog10(), None);
+        assert_eq!(i256::MAX.checked_ilog10(), Some(76));
+        assert_eq!(i256::from(10).checked_ilog10(), Some(1));
+
+        // small values
+        assert_eq!(i256::from(1).checked_ilog10(), Some(0));
+        assert_eq!(i256::from(9).checked_ilog10(), Some(0));
+
+        // case with high == 0
+        assert_eq!(i256::from(100).checked_ilog10(), Some(2));
+        // case with high == 0 and full low
+        assert_eq!(i256::from_parts(u128::MAX, 0).checked_ilog10(), Some(38));
+
+        // case with high > 0
+        assert_eq!(i256::from_parts(0, 1).checked_ilog10(), Some(38));
+
+        // case with non-null high and low, slow branch
+        let pow50 = i256::from(10).checked_pow(50).unwrap();
+        assert_eq!(pow50.checked_ilog10(), Some(50));
+
+        // case with non-null high and low, fast branch
+        let pow64 = i256::from(10).checked_pow(64).unwrap();
+        assert_eq!(pow64.checked_ilog10(), Some(64));
+    }
+
+    #[test]
+    #[should_panic(expected = "ilog10 overflow")]
+    fn test_ilog10_zero_panics() {
+        let _ = i256::ZERO.ilog10();
+    }
+
+    #[test]
+    #[should_panic(expected = "ilog overflow")]
+    fn test_ilog_zero_panics() {
+        let _ = i256::ZERO.ilog(i256::from(5));
+    }
+
+    #[test]
+    #[should_panic(expected = "ilog2 overflow")]
+    fn test_ilog2_zero_panics() {
+        let _ = i256::ZERO.ilog2();
     }
 }

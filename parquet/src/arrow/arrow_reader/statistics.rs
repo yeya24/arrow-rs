@@ -22,15 +22,20 @@
 use crate::arrow::buffer::bit_util::sign_extend_be;
 use crate::arrow::parquet_column;
 use crate::basic::Type as PhysicalType;
-use crate::data_type::{ByteArray, FixedLenByteArray};
 use crate::errors::{ParquetError, Result};
-use crate::file::metadata::{ParquetColumnIndex, ParquetOffsetIndex, RowGroupMetaData};
-use crate::file::page_index::column_index::{ColumnIndexIterators, ColumnIndexMetaData};
+use crate::file::metadata::RowGroupMetaData;
+use crate::file::metadata::page_index::PageIndexProvider;
+use crate::file::page_index::column_index::ColumnIndexMetaData;
 use crate::file::statistics::Statistics as ParquetStatistics;
 use crate::schema::types::SchemaDescriptor;
 use arrow_array::builder::{
-    BinaryViewBuilder, BooleanBuilder, FixedSizeBinaryBuilder, LargeStringBuilder, StringBuilder,
-    StringViewBuilder,
+    BinaryBuilder, BinaryViewBuilder, BooleanBuilder, Date32Builder, Date64Builder,
+    Decimal32Builder, Decimal64Builder, FixedSizeBinaryBuilder, Float16Builder, Float32Builder,
+    Float64Builder, Int8Builder, Int16Builder, Int32Builder, Int64Builder, LargeBinaryBuilder,
+    LargeStringBuilder, StringBuilder, StringViewBuilder, Time32MillisecondBuilder,
+    Time32SecondBuilder, Time64MicrosecondBuilder, Time64NanosecondBuilder,
+    TimestampMicrosecondBuilder, TimestampMillisecondBuilder, TimestampNanosecondBuilder,
+    TimestampSecondBuilder, UInt8Builder, UInt16Builder, UInt32Builder, UInt64Builder,
 };
 use arrow_array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array,
@@ -38,12 +43,11 @@ use arrow_array::{
     Int16Array, Int32Array, Int64Array, LargeBinaryArray, Time32MillisecondArray,
     Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array, new_empty_array, new_null_array,
+    UInt16Array, UInt32Array, UInt64Array, new_null_array,
 };
-use arrow_buffer::i256;
+use arrow_buffer::{NullBufferBuilder, i256};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use half::f16;
-use paste::paste;
 use std::sync::Arc;
 
 // Convert the bytes array to i32.
@@ -95,7 +99,7 @@ pub(crate) fn from_bytes_to_f16(b: &[u8]) -> Option<f16> {
 macro_rules! make_stats_iterator {
     ($iterator_type:ident, $func:ident, $parquet_statistics_type:path, $stat_value_type:ty) => {
         /// Maps an iterator of `ParquetStatistics` into an iterator of
-        /// `&$stat_value_type``
+        /// `&$stat_value_type`
         ///
         /// Yielded elements:
         /// * Some(stats) if valid
@@ -227,7 +231,7 @@ make_stats_iterator!(
     [u8]
 );
 
-/// Special iterator adapter for extracting i128 values from from an iterator of
+/// Special iterator adapter for extracting i128 values from an iterator of
 /// `ParquetStatistics`
 ///
 /// Handles checking if the statistics are present and valid with the correct type.
@@ -352,73 +356,125 @@ make_decimal_stats_iterator!(
     from_bytes_to_i256
 );
 
-/// Special macro to combine the statistics iterators for min and max using the [`mod@paste`] macro.
+/// Special macro to combine the statistics iterators for min and max.
 /// This is used to avoid repeating the same code for min and max statistics extractions
 ///
 /// Parameters:
-/// stat_type_prefix: The prefix of the statistics iterator type (e.g. `Min` or `Max`)
 /// data_type: The data type of the statistics (e.g. `DataType::Int32`)
 /// iterator: The iterator of [`ParquetStatistics`] to extract the statistics from.
 macro_rules! get_statistics {
-    ($stat_type_prefix: ident, $data_type: ident, $iterator: ident, $physical_type: ident) => {
-        paste! {
+    (Min, $data_type: ident, $iterator: ident, $physical_type: ident) => {
+        get_statistics!(
+            $data_type,
+            $iterator,
+            $physical_type,
+            MinBooleanStatsIterator,
+            MinInt32StatsIterator,
+            MinInt64StatsIterator,
+            MinFloatStatsIterator,
+            MinDoubleStatsIterator,
+            MinByteArrayStatsIterator,
+            MinFixedLenByteArrayStatsIterator,
+            MinDecimal32StatsIterator,
+            MinDecimal64StatsIterator,
+            MinDecimal128StatsIterator,
+            MinDecimal256StatsIterator,
+            min_statistics
+        )
+    };
+    (Max, $data_type: ident, $iterator: ident, $physical_type: ident) => {
+        get_statistics!(
+            $data_type,
+            $iterator,
+            $physical_type,
+            MaxBooleanStatsIterator,
+            MaxInt32StatsIterator,
+            MaxInt64StatsIterator,
+            MaxFloatStatsIterator,
+            MaxDoubleStatsIterator,
+            MaxByteArrayStatsIterator,
+            MaxFixedLenByteArrayStatsIterator,
+            MaxDecimal32StatsIterator,
+            MaxDecimal64StatsIterator,
+            MaxDecimal128StatsIterator,
+            MaxDecimal256StatsIterator,
+            max_statistics
+        )
+    };
+    (
+        $data_type: ident,
+        $iterator: ident,
+        $physical_type: ident,
+        $boolean_iter: ident,
+        $int32_iter: ident,
+        $int64_iter: ident,
+        $float_iter: ident,
+        $double_iter: ident,
+        $byte_array_iter: ident,
+        $fixed_len_byte_array_iter: ident,
+        $decimal32_iter: ident,
+        $decimal64_iter: ident,
+        $decimal128_iter: ident,
+        $decimal256_iter: ident,
+        $dictionary_statistics: ident
+    ) => {
         match $data_type {
             DataType::Boolean => Ok(Arc::new(BooleanArray::from_iter(
-                [<$stat_type_prefix BooleanStatsIterator>]::new($iterator).map(|x| x.copied()),
+                $boolean_iter::new($iterator).map(|x| x.copied()),
             ))),
             DataType::Int8 => Ok(Arc::new(Int8Array::from_iter(
-                [<$stat_type_prefix Int32StatsIterator>]::new($iterator).map(|x| {
+                $int32_iter::new($iterator).map(|x| {
                     x.and_then(|x| i8::try_from(*x).ok())
                 }),
             ))),
             DataType::Int16 => Ok(Arc::new(Int16Array::from_iter(
-                [<$stat_type_prefix Int32StatsIterator>]::new($iterator).map(|x| {
+                $int32_iter::new($iterator).map(|x| {
                     x.and_then(|x| i16::try_from(*x).ok())
                 }),
             ))),
             DataType::Int32 => Ok(Arc::new(Int32Array::from_iter(
-                [<$stat_type_prefix Int32StatsIterator>]::new($iterator).map(|x| x.copied()),
+                $int32_iter::new($iterator).map(|x| x.copied()),
             ))),
             DataType::Int64 => Ok(Arc::new(Int64Array::from_iter(
-                [<$stat_type_prefix Int64StatsIterator>]::new($iterator).map(|x| x.copied()),
+                $int64_iter::new($iterator).map(|x| x.copied()),
             ))),
             DataType::UInt8 => Ok(Arc::new(UInt8Array::from_iter(
-                [<$stat_type_prefix Int32StatsIterator>]::new($iterator).map(|x| {
+                $int32_iter::new($iterator).map(|x| {
                     x.and_then(|x| u8::try_from(*x).ok())
                 }),
             ))),
             DataType::UInt16 => Ok(Arc::new(UInt16Array::from_iter(
-                [<$stat_type_prefix Int32StatsIterator>]::new($iterator).map(|x| {
+                $int32_iter::new($iterator).map(|x| {
                     x.and_then(|x| u16::try_from(*x).ok())
                 }),
             ))),
             DataType::UInt32 => Ok(Arc::new(UInt32Array::from_iter(
-                [<$stat_type_prefix Int32StatsIterator>]::new($iterator).map(|x| x.map(|x| *x as u32)),
+                $int32_iter::new($iterator).map(|x| x.map(|x| *x as u32)),
             ))),
             DataType::UInt64 => Ok(Arc::new(UInt64Array::from_iter(
-                [<$stat_type_prefix Int64StatsIterator>]::new($iterator).map(|x| x.map(|x| *x as u64)),
+                $int64_iter::new($iterator).map(|x| x.map(|x| *x as u64)),
             ))),
             DataType::Float16 => Ok(Arc::new(Float16Array::from_iter(
-                [<$stat_type_prefix FixedLenByteArrayStatsIterator>]::new($iterator).map(|x| x.and_then(|x| {
+                $fixed_len_byte_array_iter::new($iterator).map(|x| x.and_then(|x| {
                     from_bytes_to_f16(x)
                 })),
             ))),
             DataType::Float32 => Ok(Arc::new(Float32Array::from_iter(
-                [<$stat_type_prefix FloatStatsIterator>]::new($iterator).map(|x| x.copied()),
+                $float_iter::new($iterator).map(|x| x.copied()),
             ))),
             DataType::Float64 => Ok(Arc::new(Float64Array::from_iter(
-                [<$stat_type_prefix DoubleStatsIterator>]::new($iterator).map(|x| x.copied()),
+                $double_iter::new($iterator).map(|x| x.copied()),
             ))),
             DataType::Date32 => Ok(Arc::new(Date32Array::from_iter(
-                [<$stat_type_prefix Int32StatsIterator>]::new($iterator).map(|x| x.copied()),
+                $int32_iter::new($iterator).map(|x| x.copied()),
             ))),
             DataType::Date64 if $physical_type == Some(PhysicalType::INT32) => Ok(Arc::new(Date64Array::from_iter(
-                [<$stat_type_prefix Int32StatsIterator>]::new($iterator)
+                $int32_iter::new($iterator)
                     .map(|x| x.map(|x| i64::from(*x) * 24 * 60 * 60 * 1000))))),
             DataType::Date64 if $physical_type == Some(PhysicalType::INT64) => Ok(Arc::new(Date64Array::from_iter(
-                [<$stat_type_prefix Int64StatsIterator>]::new($iterator).map(|x| x.copied()),))),
+                $int64_iter::new($iterator).map(|x| x.copied()),))),
             DataType::Timestamp(unit, timezone) =>{
-                let iter = [<$stat_type_prefix Int64StatsIterator>]::new($iterator).map(|x| x.copied());
+                let iter = $int64_iter::new($iterator).map(|x| x.copied());
                 Ok(match unit {
                     TimeUnit::Second => Arc::new(TimestampSecondArray::from_iter(iter).with_timezone_opt(timezone.clone())),
                     TimeUnit::Millisecond => Arc::new(TimestampMillisecondArray::from_iter(iter).with_timezone_opt(timezone.clone())),
@@ -429,10 +485,10 @@ macro_rules! get_statistics {
             DataType::Time32(unit) => {
                 Ok(match unit {
                     TimeUnit::Second =>  Arc::new(Time32SecondArray::from_iter(
-                        [<$stat_type_prefix Int32StatsIterator>]::new($iterator).map(|x| x.copied()),
+                        $int32_iter::new($iterator).map(|x| x.copied()),
                     )),
                     TimeUnit::Millisecond => Arc::new(Time32MillisecondArray::from_iter(
-                        [<$stat_type_prefix Int32StatsIterator>]::new($iterator).map(|x| x.copied()),
+                        $int32_iter::new($iterator).map(|x| x.copied()),
                     )),
                     _ => {
                         let len = $iterator.count();
@@ -444,10 +500,10 @@ macro_rules! get_statistics {
             DataType::Time64(unit) => {
                 Ok(match unit {
                     TimeUnit::Microsecond =>  Arc::new(Time64MicrosecondArray::from_iter(
-                        [<$stat_type_prefix Int64StatsIterator>]::new($iterator).map(|x| x.copied()),
+                        $int64_iter::new($iterator).map(|x| x.copied()),
                     )),
                     TimeUnit::Nanosecond => Arc::new(Time64NanosecondArray::from_iter(
-                        [<$stat_type_prefix Int64StatsIterator>]::new($iterator).map(|x| x.copied()),
+                        $int64_iter::new($iterator).map(|x| x.copied()),
                     )),
                     _ => {
                         let len = $iterator.count();
@@ -457,13 +513,13 @@ macro_rules! get_statistics {
                 })
             },
             DataType::Binary => Ok(Arc::new(BinaryArray::from_iter(
-                [<$stat_type_prefix ByteArrayStatsIterator>]::new($iterator)
+                $byte_array_iter::new($iterator)
             ))),
             DataType::LargeBinary => Ok(Arc::new(LargeBinaryArray::from_iter(
-                [<$stat_type_prefix ByteArrayStatsIterator>]::new($iterator)
+                $byte_array_iter::new($iterator)
             ))),
             DataType::Utf8 => {
-                let iterator = [<$stat_type_prefix ByteArrayStatsIterator>]::new($iterator);
+                let iterator = $byte_array_iter::new($iterator);
                 let mut builder = StringBuilder::new();
                 for x in iterator {
                     let Some(x) = x else {
@@ -481,7 +537,7 @@ macro_rules! get_statistics {
                 Ok(Arc::new(builder.finish()))
             },
             DataType::LargeUtf8 => {
-                let iterator = [<$stat_type_prefix ByteArrayStatsIterator>]::new($iterator);
+                let iterator = $byte_array_iter::new($iterator);
                 let mut builder = LargeStringBuilder::new();
                 for x in iterator {
                     let Some(x) = x else {
@@ -499,7 +555,7 @@ macro_rules! get_statistics {
                 Ok(Arc::new(builder.finish()))
             },
             DataType::FixedSizeBinary(size) => {
-                let iterator = [<$stat_type_prefix FixedLenByteArrayStatsIterator>]::new($iterator);
+                let iterator = $fixed_len_byte_array_iter::new($iterator);
                 let mut builder = FixedSizeBinaryBuilder::new(*size);
                 for x in iterator {
                     let Some(x) = x else {
@@ -519,33 +575,33 @@ macro_rules! get_statistics {
             },
             DataType::Decimal32(precision, scale) => {
                 let arr = Decimal32Array::from_iter(
-                    [<$stat_type_prefix Decimal32StatsIterator>]::new($iterator)
+                    $decimal32_iter::new($iterator)
                 ).with_precision_and_scale(*precision, *scale)?;
                 Ok(Arc::new(arr))
             },
             DataType::Decimal64(precision, scale) => {
                 let arr = Decimal64Array::from_iter(
-                    [<$stat_type_prefix Decimal64StatsIterator>]::new($iterator)
+                    $decimal64_iter::new($iterator)
                 ).with_precision_and_scale(*precision, *scale)?;
                 Ok(Arc::new(arr))
             },
             DataType::Decimal128(precision, scale) => {
                 let arr = Decimal128Array::from_iter(
-                    [<$stat_type_prefix Decimal128StatsIterator>]::new($iterator)
+                    $decimal128_iter::new($iterator)
                 ).with_precision_and_scale(*precision, *scale)?;
                 Ok(Arc::new(arr))
             },
             DataType::Decimal256(precision, scale) => {
                 let arr = Decimal256Array::from_iter(
-                    [<$stat_type_prefix Decimal256StatsIterator>]::new($iterator)
+                    $decimal256_iter::new($iterator)
                 ).with_precision_and_scale(*precision, *scale)?;
                 Ok(Arc::new(arr))
             },
             DataType::Dictionary(_, value_type) => {
-                [<$stat_type_prefix:lower _ statistics>](value_type, $iterator, $physical_type)
+                $dictionary_statistics(value_type, $iterator, $physical_type)
             },
             DataType::Utf8View => {
-                let iterator = [<$stat_type_prefix ByteArrayStatsIterator>]::new($iterator);
+                let iterator = $byte_array_iter::new($iterator);
                 let mut builder = StringViewBuilder::new();
                 for x in iterator {
                     let Some(x) = x else {
@@ -563,7 +619,7 @@ macro_rules! get_statistics {
                 Ok(Arc::new(builder.finish()))
             },
             DataType::BinaryView => {
-                let iterator = [<$stat_type_prefix ByteArrayStatsIterator>]::new($iterator);
+                let iterator = $byte_array_iter::new($iterator);
                 let mut builder = BinaryViewBuilder::new();
                 for x in iterator {
                     let Some(x) = x else {
@@ -593,476 +649,667 @@ macro_rules! get_statistics {
                 // don't know how to extract statistics, so return a null array
                 Ok(new_null_array($data_type, len))
             }
-        }}}
-}
-
-macro_rules! make_data_page_stats_iterator {
-    ($iterator_type: ident, $func: ident, $stat_value_type: ty) => {
-        struct $iterator_type<'a, I>
-        where
-            I: Iterator<Item = (usize, &'a ColumnIndexMetaData)>,
-        {
-            iter: I,
-        }
-
-        impl<'a, I> $iterator_type<'a, I>
-        where
-            I: Iterator<Item = (usize, &'a ColumnIndexMetaData)>,
-        {
-            fn new(iter: I) -> Self {
-                Self { iter }
-            }
-        }
-
-        impl<'a, I> Iterator for $iterator_type<'a, I>
-        where
-            I: Iterator<Item = (usize, &'a ColumnIndexMetaData)>,
-        {
-            type Item = Vec<Option<$stat_value_type>>;
-
-            fn next(&mut self) -> Option<Self::Item> {
-                let next = self.iter.next();
-                match next {
-                    Some((len, index)) => match index {
-                        // No matching `Index` found;
-                        // thus no statistics that can be extracted.
-                        // We return vec![None; len] to effectively
-                        // create an arrow null-array with the length
-                        // corresponding to the number of entries in
-                        // `ParquetOffsetIndex` per row group per column.
-                        ColumnIndexMetaData::NONE => Some(vec![None; len]),
-                        _ => Some(<$stat_value_type>::$func(&index).collect::<Vec<_>>()),
-                    },
-                    _ => None,
-                }
-            }
-
-            fn size_hint(&self) -> (usize, Option<usize>) {
-                self.iter.size_hint()
-            }
         }
     };
 }
-
-make_data_page_stats_iterator!(MinBooleanDataPageStatsIterator, min_values_iter, bool);
-make_data_page_stats_iterator!(MaxBooleanDataPageStatsIterator, max_values_iter, bool);
-make_data_page_stats_iterator!(MinInt32DataPageStatsIterator, min_values_iter, i32);
-make_data_page_stats_iterator!(MaxInt32DataPageStatsIterator, max_values_iter, i32);
-make_data_page_stats_iterator!(MinInt64DataPageStatsIterator, min_values_iter, i64);
-make_data_page_stats_iterator!(MaxInt64DataPageStatsIterator, max_values_iter, i64);
-make_data_page_stats_iterator!(
-    MinFloat16DataPageStatsIterator,
-    min_values_iter,
-    FixedLenByteArray
-);
-make_data_page_stats_iterator!(
-    MaxFloat16DataPageStatsIterator,
-    max_values_iter,
-    FixedLenByteArray
-);
-make_data_page_stats_iterator!(MinFloat32DataPageStatsIterator, min_values_iter, f32);
-make_data_page_stats_iterator!(MaxFloat32DataPageStatsIterator, max_values_iter, f32);
-make_data_page_stats_iterator!(MinFloat64DataPageStatsIterator, min_values_iter, f64);
-make_data_page_stats_iterator!(MaxFloat64DataPageStatsIterator, max_values_iter, f64);
-make_data_page_stats_iterator!(
-    MinByteArrayDataPageStatsIterator,
-    min_values_iter,
-    ByteArray
-);
-make_data_page_stats_iterator!(
-    MaxByteArrayDataPageStatsIterator,
-    max_values_iter,
-    ByteArray
-);
-make_data_page_stats_iterator!(
-    MaxFixedLenByteArrayDataPageStatsIterator,
-    max_values_iter,
-    FixedLenByteArray
-);
-
-make_data_page_stats_iterator!(
-    MinFixedLenByteArrayDataPageStatsIterator,
-    min_values_iter,
-    FixedLenByteArray
-);
-
-macro_rules! get_decimal_page_stats_iterator {
-    ($iterator_type: ident, $func: ident, $stat_value_type: ident, $convert_func: ident) => {
-        struct $iterator_type<'a, I>
-        where
-            I: Iterator<Item = (usize, &'a ColumnIndexMetaData)>,
-        {
-            iter: I,
-        }
-
-        impl<'a, I> $iterator_type<'a, I>
-        where
-            I: Iterator<Item = (usize, &'a ColumnIndexMetaData)>,
-        {
-            fn new(iter: I) -> Self {
-                Self { iter }
-            }
-        }
-
-        impl<'a, I> Iterator for $iterator_type<'a, I>
-        where
-            I: Iterator<Item = (usize, &'a ColumnIndexMetaData)>,
-        {
-            type Item = Vec<Option<$stat_value_type>>;
-
-            // Some(native_index.$func().map(|v| v.map($conv)).collect::<Vec<_>>())
-            fn next(&mut self) -> Option<Self::Item> {
-                let next = self.iter.next();
-                match next {
-                    Some((len, index)) => match index {
-                        ColumnIndexMetaData::INT32(native_index) => Some(
-                            native_index
-                                .$func()
-                                .map(|x| x.map(|x| $stat_value_type::from(*x)))
-                                .collect::<Vec<_>>(),
-                        ),
-                        ColumnIndexMetaData::INT64(native_index) => Some(
-                            native_index
-                                .$func()
-                                .map(|x| x.map(|x| $stat_value_type::try_from(*x).unwrap()))
-                                .collect::<Vec<_>>(),
-                        ),
-                        ColumnIndexMetaData::BYTE_ARRAY(native_index) => Some(
-                            native_index
-                                .$func()
-                                .map(|x| x.map(|x| $convert_func(x)))
-                                .collect::<Vec<_>>(),
-                        ),
-                        ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(native_index) => Some(
-                            native_index
-                                .$func()
-                                .map(|x| x.map(|x| $convert_func(x)))
-                                .collect::<Vec<_>>(),
-                        ),
-                        _ => Some(vec![None; len]),
-                    },
-                    _ => None,
-                }
-            }
-
-            fn size_hint(&self) -> (usize, Option<usize>) {
-                self.iter.size_hint()
-            }
-        }
-    };
-}
-
-get_decimal_page_stats_iterator!(
-    MinDecimal32DataPageStatsIterator,
-    min_values_iter,
-    i32,
-    from_bytes_to_i32
-);
-
-get_decimal_page_stats_iterator!(
-    MaxDecimal32DataPageStatsIterator,
-    max_values_iter,
-    i32,
-    from_bytes_to_i32
-);
-
-get_decimal_page_stats_iterator!(
-    MinDecimal64DataPageStatsIterator,
-    min_values_iter,
-    i64,
-    from_bytes_to_i64
-);
-
-get_decimal_page_stats_iterator!(
-    MaxDecimal64DataPageStatsIterator,
-    max_values_iter,
-    i64,
-    from_bytes_to_i64
-);
-
-get_decimal_page_stats_iterator!(
-    MinDecimal128DataPageStatsIterator,
-    min_values_iter,
-    i128,
-    from_bytes_to_i128
-);
-
-get_decimal_page_stats_iterator!(
-    MaxDecimal128DataPageStatsIterator,
-    max_values_iter,
-    i128,
-    from_bytes_to_i128
-);
-
-get_decimal_page_stats_iterator!(
-    MinDecimal256DataPageStatsIterator,
-    min_values_iter,
-    i256,
-    from_bytes_to_i256
-);
-
-get_decimal_page_stats_iterator!(
-    MaxDecimal256DataPageStatsIterator,
-    max_values_iter,
-    i256,
-    from_bytes_to_i256
-);
 
 macro_rules! get_data_page_statistics {
-    ($stat_type_prefix: ident, $data_type: ident, $iterator: ident, $physical_type: ident) => {
-        paste! {
-            match $data_type {
+    (Min, $data_type: ident, $iterator: ident, $physical_type: ident) => {
+        get_data_page_statistics!(
+            $data_type,
+            $iterator,
+            $physical_type,
+            min_values_iter,
+            min_page_statistics
+        )
+    };
+    (Max, $data_type: ident, $iterator: ident, $physical_type: ident) => {
+        get_data_page_statistics!(
+            $data_type,
+            $iterator,
+            $physical_type,
+            max_values_iter,
+            max_page_statistics
+        )
+    };
+    (
+        $data_type: ident,
+        $iterator: ident,
+        $physical_type: ident,
+        $values_iter: ident,
+        $page_statistics: ident
+    ) => {{
+        let chunks: Vec<(usize, Option<&ColumnIndexMetaData>)> = $iterator.collect();
+        let capacity: usize = chunks.iter().map(|c| c.0).sum();
+        match $data_type {
                 DataType::Boolean => {
-                    let iterator = [<$stat_type_prefix BooleanDataPageStatsIterator>]::new($iterator);
-                    let mut builder = BooleanBuilder::new();
-                    for x in iterator {
-                        for x in x.into_iter() {
-                            let Some(x) = x else {
-                                builder.append_null(); // no statistics value
-                                continue;
-                            };
-                            builder.append_value(x);
+                    let mut b = BooleanBuilder::with_capacity(capacity);
+                    for (len, index) in chunks {
+                        match index {
+                            Some(ColumnIndexMetaData::BOOLEAN(index)) => {
+                                for val in index.$values_iter() {
+                                    b.append_option(val.copied());
+                                }
+                            }
+                            _ => b.append_nulls(len),
                         }
                     }
-                    Ok(Arc::new(builder.finish()))
+                    Ok(Arc::new(b.finish()))
                 },
-                DataType::UInt8 => Ok(Arc::new(
-                    UInt8Array::from_iter(
-                        [<$stat_type_prefix Int32DataPageStatsIterator>]::new($iterator)
-                            .map(|x| {
-                                x.into_iter().map(|x| {
-                                    x.and_then(|x| u8::try_from(x).ok())
-                                })
-                            })
-                            .flatten()
-                    )
-                )),
-                DataType::UInt16 => Ok(Arc::new(
-                    UInt16Array::from_iter(
-                        [<$stat_type_prefix Int32DataPageStatsIterator>]::new($iterator)
-                            .map(|x| {
-                                x.into_iter().map(|x| {
-                                    x.and_then(|x| u16::try_from(x).ok())
-                                })
-                            })
-                            .flatten()
-                    )
-                )),
-                DataType::UInt32 => Ok(Arc::new(
-                    UInt32Array::from_iter(
-                        [<$stat_type_prefix Int32DataPageStatsIterator>]::new($iterator)
-                            .map(|x| {
-                                x.into_iter().map(|x| {
-                                    x.and_then(|x| Some(x as u32))
-                                })
-                            })
-                            .flatten()
-                ))),
-                DataType::UInt64 => Ok(Arc::new(
-                    UInt64Array::from_iter(
-                        [<$stat_type_prefix Int64DataPageStatsIterator>]::new($iterator)
-                            .map(|x| {
-                                x.into_iter().map(|x| {
-                                    x.and_then(|x| Some(x as u64))
-                                })
-                            })
-                            .flatten()
-                ))),
-                DataType::Int8 => Ok(Arc::new(
-                    Int8Array::from_iter(
-                        [<$stat_type_prefix Int32DataPageStatsIterator>]::new($iterator)
-                            .map(|x| {
-                                x.into_iter().map(|x| {
-                                    x.and_then(|x| i8::try_from(x).ok())
-                                })
-                            })
-                            .flatten()
-                    )
-                )),
-                DataType::Int16 => Ok(Arc::new(
-                    Int16Array::from_iter(
-                        [<$stat_type_prefix Int32DataPageStatsIterator>]::new($iterator)
-                            .map(|x| {
-                                x.into_iter().map(|x| {
-                                    x.and_then(|x| i16::try_from(x).ok())
-                                })
-                            })
-                            .flatten()
-                    )
-                )),
-                DataType::Int32 => Ok(Arc::new(Int32Array::from_iter([<$stat_type_prefix Int32DataPageStatsIterator>]::new($iterator).flatten()))),
-                DataType::Int64 => Ok(Arc::new(Int64Array::from_iter([<$stat_type_prefix Int64DataPageStatsIterator>]::new($iterator).flatten()))),
-                DataType::Float16 => Ok(Arc::new(
-                    Float16Array::from_iter(
-                        [<$stat_type_prefix Float16DataPageStatsIterator>]::new($iterator)
-                            .map(|x| {
-                                x.into_iter().map(|x| {
-                                    x.and_then(|x| from_bytes_to_f16(x.data()))
-                                })
-                            })
-                            .flatten()
-                    )
-                )),
-                DataType::Float32 => Ok(Arc::new(Float32Array::from_iter([<$stat_type_prefix Float32DataPageStatsIterator>]::new($iterator).flatten()))),
-                DataType::Float64 => Ok(Arc::new(Float64Array::from_iter([<$stat_type_prefix Float64DataPageStatsIterator>]::new($iterator).flatten()))),
-                DataType::Binary => Ok(Arc::new(BinaryArray::from_iter([<$stat_type_prefix ByteArrayDataPageStatsIterator>]::new($iterator).flatten()))),
-                DataType::LargeBinary => Ok(Arc::new(LargeBinaryArray::from_iter([<$stat_type_prefix ByteArrayDataPageStatsIterator>]::new($iterator).flatten()))),
-                DataType::Utf8 => {
-                    let mut builder = StringBuilder::new();
-                    let iterator = [<$stat_type_prefix ByteArrayDataPageStatsIterator>]::new($iterator);
-                    for x in iterator {
-                        for x in x.into_iter() {
-                            let Some(x) = x else {
-                                builder.append_null(); // no statistics value
-                                continue;
-                            };
-
-                            let Ok(x) = std::str::from_utf8(x.data()) else {
-                                builder.append_null();
-                                continue;
-                            };
-
-                            builder.append_value(x);
+                DataType::UInt8 => {
+                    let mut b = UInt8Builder::with_capacity(capacity);
+                    for (len, index) in chunks {
+                        match index {
+                            Some(ColumnIndexMetaData::INT32(index)) => {
+                                b.extend_from_iter_option(
+                                    index.$values_iter()
+                                        .map(|val| val.and_then(|&x| u8::try_from(x).ok())),
+                                );
+                            }
+                            _ => b.append_nulls(len),
                         }
                     }
-                    Ok(Arc::new(builder.finish()))
+                    Ok(Arc::new(b.finish()))
+                },
+                DataType::UInt16 => {
+                    let mut b = UInt16Builder::with_capacity(capacity);
+                    for (len, index) in chunks {
+                        match index {
+                            Some(ColumnIndexMetaData::INT32(index)) => {
+                                b.extend_from_iter_option(
+                                     index.$values_iter()
+                                        .map(|val| val.and_then(|&x| u16::try_from(x).ok())),
+                                );
+                            }
+                            _ => b.append_nulls(len),
+                        }
+                    }
+                    Ok(Arc::new(b.finish()))
+                },
+                DataType::UInt32 => {
+                    let mut b = UInt32Builder::with_capacity(capacity);
+                    for (len, index) in chunks {
+                        match index {
+                            Some(ColumnIndexMetaData::INT32(index)) => {
+                                b.extend_from_iter_option(
+                                    index.$values_iter()
+                                        .map(|val| val.map(|&x| x as u32)),
+                                );
+                            }
+                            _ => b.append_nulls(len),
+                        }
+                    }
+                    Ok(Arc::new(b.finish()))
+                },
+                DataType::UInt64 => {
+                    let mut b = UInt64Builder::with_capacity(capacity);
+                    for (len, index) in chunks {
+                        match index {
+                            Some(ColumnIndexMetaData::INT64(index)) => {
+                                b.extend_from_iter_option(
+                                    index.$values_iter()
+                                        .map(|val| val.map(|&x| x as u64)),
+                                );
+                            }
+                            _ => b.append_nulls(len),
+                        }
+                    }
+                    Ok(Arc::new(b.finish()))
+                },
+                DataType::Int8 => {
+                    let mut b = Int8Builder::with_capacity(capacity);
+                    for (len, index) in chunks {
+                        match index {
+                            Some(ColumnIndexMetaData::INT32(index)) => {
+                                b.extend_from_iter_option(
+                                    index.$values_iter()
+                                        .map(|val| val.and_then(|&x| i8::try_from(x).ok())),
+                                );
+                            }
+                            _ => b.append_nulls(len),
+                        }
+                    }
+                    Ok(Arc::new(b.finish()))
+                },
+                DataType::Int16 => {
+                    let mut b = Int16Builder::with_capacity(capacity);
+                    for (len, index) in chunks {
+                        match index {
+                            Some(ColumnIndexMetaData::INT32(index)) => {
+                                b.extend_from_iter_option(
+                                    index.$values_iter()
+                                        .map(|val| val.and_then(|&x| i16::try_from(x).ok())),
+                                );
+                            }
+                            _ => b.append_nulls(len),
+                        }
+                    }
+                    Ok(Arc::new(b.finish()))
+                },
+                DataType::Int32 => {
+                    let mut b = Int32Builder::with_capacity(capacity);
+                    for (len, index) in chunks {
+                        match index {
+                            Some(ColumnIndexMetaData::INT32(index)) => {
+                                b.extend_from_iter_option(
+                                    index.$values_iter()
+                                        .map(|val| val.copied()),
+                                );
+                            }
+                            _ => b.append_nulls(len),
+                        }
+                    }
+                    Ok(Arc::new(b.finish()))
+                },
+                DataType::Int64 => {
+                    let mut b = Int64Builder::with_capacity(capacity);
+                    for (len, index) in chunks {
+                        match index {
+                            Some(ColumnIndexMetaData::INT64(index)) => {
+                                b.extend_from_iter_option(
+                                    index.$values_iter()
+                                        .map(|val| val.copied()),
+                                );
+                            }
+                            _ => b.append_nulls(len),
+                        }
+                    }
+                    Ok(Arc::new(b.finish()))
+                },
+                DataType::Float16 => {
+                    let mut b = Float16Builder::with_capacity(capacity);
+                    for (len, index) in chunks {
+                        match index {
+                            Some(ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(index)) => {
+                                b.extend_from_iter_option(
+                                    index.$values_iter()
+                                        .map(|val| val.and_then(|x| from_bytes_to_f16(x))),
+                                );
+                            }
+                            _ => b.append_nulls(len),
+                        }
+                    }
+                    Ok(Arc::new(b.finish()))
+                },
+                DataType::Float32 => {
+                    let mut b = Float32Builder::with_capacity(capacity);
+                    for (len, index) in chunks {
+                        match index {
+                            Some(ColumnIndexMetaData::FLOAT(index)) => {
+                                b.extend_from_iter_option(
+                                    index.$values_iter()
+                                        .map(|val| val.copied()),
+                                );
+                            }
+                            _ => b.append_nulls(len),
+                        }
+                    }
+                    Ok(Arc::new(b.finish()))
+                },
+                DataType::Float64 => {
+                    let mut b = Float64Builder::with_capacity(capacity);
+                    for (len, index) in chunks {
+                        match index {
+                            Some(ColumnIndexMetaData::DOUBLE(index)) => {
+                                b.extend_from_iter_option(
+                                    index.$values_iter()
+                                        .map(|val| val.copied()),
+                                );
+                            }
+                            _ => b.append_nulls(len),
+                        }
+                    }
+                    Ok(Arc::new(b.finish()))
+                },
+                DataType::Binary => {
+                    let mut b = BinaryBuilder::with_capacity(capacity, capacity * 10);
+                    for (len, index) in chunks {
+                        match index {
+                            Some(ColumnIndexMetaData::BYTE_ARRAY(index)) => {
+                                for val in index.$values_iter() {
+                                    b.append_option(val.map(|x| x.as_ref()));
+                                }
+                            }
+                            _ => b.append_nulls(len),
+                        }
+                    }
+                    Ok(Arc::new(b.finish()))
+                },
+                DataType::LargeBinary => {
+                    let mut b = LargeBinaryBuilder::with_capacity(capacity, capacity * 10);
+                    for (len, index) in chunks {
+                        match index {
+                            Some(ColumnIndexMetaData::BYTE_ARRAY(index)) => {
+                                for val in index.$values_iter() {
+                                    b.append_option(val.map(|x| x.as_ref()));
+                                }
+                            }
+                            _ => b.append_nulls(len),
+                        }
+                    }
+                    Ok(Arc::new(b.finish()))
+                },
+                DataType::Utf8 => {
+                    let mut b = StringBuilder::with_capacity(capacity, capacity * 10);
+                    for (len, index) in chunks {
+                        match index {
+                            Some(ColumnIndexMetaData::BYTE_ARRAY(index)) => {
+                                for val in index.$values_iter() {
+                                    match val {
+                                        Some(x) => match std::str::from_utf8(x.as_ref()) {
+                                            Ok(s) => b.append_value(s),
+                                            _ => b.append_null(),
+                                        }
+                                        None => b.append_null(),
+                                    }
+                                }
+                            }
+                            _ => b.append_nulls(len),
+                        }
+                    }
+                    Ok(Arc::new(b.finish()))
                 },
                 DataType::LargeUtf8 => {
-                    let mut builder = LargeStringBuilder::new();
-                    let iterator = [<$stat_type_prefix ByteArrayDataPageStatsIterator>]::new($iterator);
-                    for x in iterator {
-                        for x in x.into_iter() {
-                            let Some(x) = x else {
-                                builder.append_null(); // no statistics value
-                                continue;
-                            };
-
-                            let Ok(x) = std::str::from_utf8(x.data()) else {
-                                builder.append_null();
-                                continue;
-                            };
-
-                            builder.append_value(x);
+                    let mut b = LargeStringBuilder::with_capacity(capacity, capacity * 10);
+                    for (len, index) in chunks {
+                        match index {
+                            Some(ColumnIndexMetaData::BYTE_ARRAY(index)) => {
+                                for val in index.$values_iter() {
+                                    match val {
+                                        Some(x) => match std::str::from_utf8(x.as_ref()) {
+                                            Ok(s) => b.append_value(s),
+                                            _ => b.append_null(),
+                                        }
+                                        None => b.append_null(),
+                                    }
+                                }
+                            }
+                            _ => b.append_nulls(len),
                         }
                     }
-                    Ok(Arc::new(builder.finish()))
+                    Ok(Arc::new(b.finish()))
                 },
                 DataType::Dictionary(_, value_type) => {
-                    [<$stat_type_prefix:lower _ page_statistics>](value_type, $iterator, $physical_type)
+                    $page_statistics(value_type, chunks.into_iter(), $physical_type)
                 },
                 DataType::Timestamp(unit, timezone) => {
-                    let iter = [<$stat_type_prefix Int64DataPageStatsIterator>]::new($iterator).flatten();
-                    Ok(match unit {
-                        TimeUnit::Second => Arc::new(TimestampSecondArray::from_iter(iter).with_timezone_opt(timezone.clone())),
-                        TimeUnit::Millisecond => Arc::new(TimestampMillisecondArray::from_iter(iter).with_timezone_opt(timezone.clone())),
-                        TimeUnit::Microsecond => Arc::new(TimestampMicrosecondArray::from_iter(iter).with_timezone_opt(timezone.clone())),
-                        TimeUnit::Nanosecond => Arc::new(TimestampNanosecondArray::from_iter(iter).with_timezone_opt(timezone.clone())),
-                    })
-                },
-                DataType::Date32 => Ok(Arc::new(Date32Array::from_iter([<$stat_type_prefix Int32DataPageStatsIterator>]::new($iterator).flatten()))),
-                DataType::Date64 if $physical_type == Some(PhysicalType::INT32)=> Ok(
-                    Arc::new(
-                        Date64Array::from_iter([<$stat_type_prefix Int32DataPageStatsIterator>]::new($iterator)
-                            .map(|x| {
-                                x.into_iter()
-                                .map(|x| {
-                                    x.and_then(|x| i64::try_from(x).ok())
-                                })
-                                .map(|x| x.map(|x| x * 24 * 60 * 60 * 1000))
-                            }).flatten()
-                        )
-                    )
-                ),
-                DataType::Date64 if $physical_type == Some(PhysicalType::INT64) => Ok(Arc::new(Date64Array::from_iter([<$stat_type_prefix Int64DataPageStatsIterator>]::new($iterator).flatten()))),
-                DataType::Decimal32(precision, scale) => Ok(Arc::new(
-                    Decimal32Array::from_iter([<$stat_type_prefix Decimal32DataPageStatsIterator>]::new($iterator).flatten()).with_precision_and_scale(*precision, *scale)?)),
-                DataType::Decimal64(precision, scale) => Ok(Arc::new(
-                    Decimal64Array::from_iter([<$stat_type_prefix Decimal64DataPageStatsIterator>]::new($iterator).flatten()).with_precision_and_scale(*precision, *scale)?)),
-                DataType::Decimal128(precision, scale) => Ok(Arc::new(
-                    Decimal128Array::from_iter([<$stat_type_prefix Decimal128DataPageStatsIterator>]::new($iterator).flatten()).with_precision_and_scale(*precision, *scale)?)),
-                DataType::Decimal256(precision, scale) => Ok(Arc::new(
-                    Decimal256Array::from_iter([<$stat_type_prefix Decimal256DataPageStatsIterator>]::new($iterator).flatten()).with_precision_and_scale(*precision, *scale)?)),
-                DataType::Time32(unit) => {
-                    Ok(match unit {
-                        TimeUnit::Second =>  Arc::new(Time32SecondArray::from_iter(
-                            [<$stat_type_prefix Int32DataPageStatsIterator>]::new($iterator).flatten(),
-                        )),
-                        TimeUnit::Millisecond => Arc::new(Time32MillisecondArray::from_iter(
-                            [<$stat_type_prefix Int32DataPageStatsIterator>]::new($iterator).flatten(),
-                        )),
-                        _ => {
-                            // don't know how to extract statistics, so return an empty array
-                            new_empty_array(&DataType::Time32(unit.clone()))
+                    match unit {
+                        TimeUnit::Second => {
+                            let mut b = TimestampSecondBuilder::with_capacity(capacity);
+                            for (len, index) in chunks {
+                                match index {
+                                    Some(ColumnIndexMetaData::INT64(index)) => {
+                                        b.extend_from_iter_option(
+                                            index.$values_iter()
+                                                .map(|val| val.copied()),
+                                        );
+                                    }
+                                    _ => b.append_nulls(len),
+                                }
+                            }
+                            Ok(Arc::new(b.finish().with_timezone_opt(timezone.clone())))
                         }
-                    })
+                        TimeUnit::Millisecond => {
+                            let mut b = TimestampMillisecondBuilder::with_capacity(capacity);
+                            for (len, index) in chunks {
+                                match index {
+                                    Some(ColumnIndexMetaData::INT64(index)) => {
+                                        b.extend_from_iter_option(
+                                            index.$values_iter()
+                                                .map(|val| val.copied()),
+                                        );
+                                    }
+                                    _ => b.append_nulls(len),
+                                }
+                            }
+                            Ok(Arc::new(b.finish().with_timezone_opt(timezone.clone())))
+                        }
+                        TimeUnit::Microsecond => {
+                            let mut b = TimestampMicrosecondBuilder::with_capacity(capacity);
+                            for (len, index) in chunks {
+                                match index {
+                                    Some(ColumnIndexMetaData::INT64(index)) => {
+                                        b.extend_from_iter_option(
+                                            index.$values_iter()
+                                                .map(|val| val.copied()),
+                                        );
+                                    }
+                                    _ => b.append_nulls(len),
+                                }
+                            }
+                            Ok(Arc::new(b.finish().with_timezone_opt(timezone.clone())))
+                        }
+                        TimeUnit::Nanosecond => {
+                            let mut b = TimestampNanosecondBuilder::with_capacity(capacity);
+                            for (len, index) in chunks {
+                                match index {
+                                    Some(ColumnIndexMetaData::INT64(index)) => {
+                                        b.extend_from_iter_option(
+                                            index.$values_iter()
+                                                .map(|val| val.copied()),
+                                        );
+                                    }
+                                    _ => b.append_nulls(len),
+                                }
+                            }
+                            Ok(Arc::new(b.finish().with_timezone_opt(timezone.clone())))
+                        }
+                    }
+                },
+                DataType::Date32 => {
+                    let mut b = Date32Builder::with_capacity(capacity);
+                    for (len, index) in chunks {
+                        match index {
+                            Some(ColumnIndexMetaData::INT32(index)) => {
+                                b.extend_from_iter_option(
+                                    index.$values_iter()
+                                        .map(|val| val.copied()),
+                                );
+                            }
+                            _ => b.append_nulls(len),
+                        }
+                    }
+                    Ok(Arc::new(b.finish()))
+                },
+                DataType::Date64 if $physical_type == Some(PhysicalType::INT32)=> {
+                    let mut b = Date64Builder::with_capacity(capacity);
+                    for (len, index) in chunks {
+                        match index {
+                            Some(ColumnIndexMetaData::INT32(index)) => {
+                                b.extend_from_iter_option(
+                                    index.$values_iter()
+                                        .map(|val| val.map(|&x| (x as i64) * 24 * 60 * 60 * 1000)),
+                                );
+                            }
+                            _ => b.append_nulls(len),
+                        }
+                    }
+                    Ok(Arc::new(b.finish()))
+                },
+                DataType::Date64 if $physical_type == Some(PhysicalType::INT64) => {
+                    let mut b = Date64Builder::with_capacity(capacity);
+                    for (len, index) in chunks {
+                        match index {
+                            Some(ColumnIndexMetaData::INT64(index)) => {
+                                b.extend_from_iter_option(
+                                    index.$values_iter()
+                                        .map(|val| val.copied()),
+                                );
+                            }
+                            _ => b.append_nulls(len),
+                        }
+                    }
+                    Ok(Arc::new(b.finish()))
+                },
+                DataType::Decimal32(precision, scale) => {
+                    let mut b = Decimal32Builder::with_capacity(capacity);
+                    for (len, index) in chunks {
+                        match index {
+                            Some(ColumnIndexMetaData::INT32(index)) => {
+                                b.extend_from_iter_option(
+                                    index.$values_iter()
+                                        .map(|val| val.copied()),
+                                );
+                            }
+                            Some(ColumnIndexMetaData::INT64(index)) => {
+                                b.extend_from_iter_option(
+                                    index.$values_iter()
+                                        .map(|val| val.and_then(|&x| i32::try_from(x).ok())),
+                                );
+                            }
+                            Some(ColumnIndexMetaData::BYTE_ARRAY(index)) => {
+                                b.extend_from_iter_option(
+                                    index.$values_iter()
+                                        .map(|val| val.map(|x| from_bytes_to_i32(x.as_ref()))),
+                                );
+                            }
+                            Some(ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(index)) => {
+                                b.extend_from_iter_option(
+                                    index.$values_iter()
+                                        .map(|val| val.map(|x| from_bytes_to_i32(x.as_ref()))),
+                                );
+                            }
+                            _ => b.append_nulls(len),
+                        }
+                    }
+                    Ok(Arc::new(b.with_precision_and_scale(*precision, *scale)?.finish()))
+                },
+                DataType::Decimal64(precision, scale) => {
+                    let mut b = Decimal64Builder::with_capacity(capacity);
+                    for (len, index) in chunks {
+                        match index {
+                            Some(ColumnIndexMetaData::INT32(index)) => {
+                                b.extend_from_iter_option(
+                                    index.$values_iter()
+                                        .map(|val| val.map(|x| *x as i64)),
+                                );
+                            }
+                            Some(ColumnIndexMetaData::INT64(index)) => {
+                                b.extend_from_iter_option(
+                                    index.$values_iter()
+                                        .map(|val| val.copied()),
+                                );
+                            }
+                            Some(ColumnIndexMetaData::BYTE_ARRAY(index)) => {
+                                b.extend_from_iter_option(
+                                    index.$values_iter()
+                                        .map(|val| val.map(|x| from_bytes_to_i64(x.as_ref()))),
+                                );
+                            }
+                            Some(ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(index)) => {
+                                b.extend_from_iter_option(
+                                    index.$values_iter()
+                                        .map(|val| val.map(|x| from_bytes_to_i64(x.as_ref()))),
+                                );
+                            }
+                            _ => b.append_nulls(len),
+                        }
+                    }
+                    Ok(Arc::new(b.with_precision_and_scale(*precision, *scale)?.finish()))
+                },
+                DataType::Decimal128(precision, scale) => {
+                    let mut b = Decimal128Array::builder(capacity);
+                    for (len, index) in chunks {
+                        match index {
+                            Some(ColumnIndexMetaData::INT32(index)) => {
+                                b.extend_from_iter_option(
+                                    index.$values_iter()
+                                        .map(|val| val.map(|x| *x as i128)),
+                                );
+                            }
+                            Some(ColumnIndexMetaData::INT64(index)) => {
+                                b.extend_from_iter_option(
+                                    index.$values_iter()
+                                        .map(|val| val.map(|x| *x as i128)),
+                                );
+                            }
+                            Some(ColumnIndexMetaData::BYTE_ARRAY(index)) => {
+                                b.extend_from_iter_option(
+                                    index.$values_iter()
+                                        .map(|val| val.map(|x| from_bytes_to_i128(x.as_ref()))),
+                                );
+                            }
+                            Some(ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(index)) => {
+                                b.extend_from_iter_option(
+                                    index.$values_iter()
+                                        .map(|val| val.map(|x| from_bytes_to_i128(x.as_ref()))),
+                                );
+                            }
+                            _ => b.append_nulls(len),
+                        }
+                    }
+                    Ok(Arc::new(b.with_precision_and_scale(*precision, *scale)?.finish()))
+                },
+                DataType::Decimal256(precision, scale) => {
+                    let mut b = Decimal256Array::builder(capacity);
+                    for (len, index) in chunks {
+                        match index {
+                            Some(ColumnIndexMetaData::INT32(index)) => {
+                                b.extend_from_iter_option(
+                                    index.$values_iter()
+                                        .map(|val| val.map(|x| i256::from_i128(*x as i128))),
+                                );
+                            }
+                            Some(ColumnIndexMetaData::INT64(index)) => {
+                                b.extend_from_iter_option(
+                                    index.$values_iter()
+                                        .map(|val| val.map(|x| i256::from_i128(*x as i128))),
+                                );
+                            }
+                            Some(ColumnIndexMetaData::BYTE_ARRAY(index)) => {
+                                b.extend_from_iter_option(
+                                    index.$values_iter()
+                                        .map(|val| val.map(|x| from_bytes_to_i256(x.as_ref()))),
+                                );
+                            }
+                            Some(ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(index)) => {
+                                b.extend_from_iter_option(
+                                    index.$values_iter()
+                                        .map(|val| val.map(|x| from_bytes_to_i256(x.as_ref()))),
+                                );
+                            }
+                            _ => b.append_nulls(len),
+                        }
+                    }
+                    Ok(Arc::new(b.with_precision_and_scale(*precision, *scale)?.finish()))
+                },
+                DataType::Time32(unit) => {
+                    match unit {
+                        TimeUnit::Second => {
+                            let mut b = Time32SecondBuilder::with_capacity(capacity);
+                            for (len, index) in chunks {
+                                match index {
+                                    Some(ColumnIndexMetaData::INT32(index)) => {
+                                        b.extend_from_iter_option(
+                                            index.$values_iter()
+                                                .map(|val| val.copied()),
+                                        );
+                                    }
+                                    _ => b.append_nulls(len),
+                                }
+                            }
+                            Ok(Arc::new(b.finish()))
+                        }
+                        TimeUnit::Millisecond => {
+                            let mut b = Time32MillisecondBuilder::with_capacity(capacity);
+                            for (len, index) in chunks {
+                                match index {
+                                    Some(ColumnIndexMetaData::INT32(index)) => {
+                                        b.extend_from_iter_option(
+                                            index.$values_iter()
+                                                .map(|val| val.copied()),
+                                        );
+                                    }
+                                    _ => b.append_nulls(len),
+                                }
+                            }
+                            Ok(Arc::new(b.finish()))
+                        }
+                        _ => {
+                            Ok(new_null_array($data_type, capacity))
+                        }
+                    }
                 }
                 DataType::Time64(unit) => {
-                    Ok(match unit {
-                        TimeUnit::Microsecond =>  Arc::new(Time64MicrosecondArray::from_iter(
-                            [<$stat_type_prefix Int64DataPageStatsIterator>]::new($iterator).flatten(),
-                        )),
-                        TimeUnit::Nanosecond => Arc::new(Time64NanosecondArray::from_iter(
-                            [<$stat_type_prefix Int64DataPageStatsIterator>]::new($iterator).flatten(),
-                        )),
-                        _ => {
-                            // don't know how to extract statistics, so return an empty array
-                            new_empty_array(&DataType::Time64(unit.clone()))
+                    match unit {
+                        TimeUnit::Microsecond => {
+                            let mut b = Time64MicrosecondBuilder::with_capacity(capacity);
+                            for (len, index) in chunks {
+                                match index {
+                                    Some(ColumnIndexMetaData::INT64(index)) => {
+                                        b.extend_from_iter_option(
+                                            index.$values_iter()
+                                                .map(|val| val.copied()),
+                                        );
+                                    }
+                                    _ => b.append_nulls(len),
+                                }
+                            }
+                            Ok(Arc::new(b.finish()))
                         }
-                    })
+                        TimeUnit::Nanosecond => {
+                            let mut b = Time64NanosecondBuilder::with_capacity(capacity);
+                            for (len, index) in chunks {
+                                match index {
+                                    Some(ColumnIndexMetaData::INT64(index)) => {
+                                        b.extend_from_iter_option(
+                                            index.$values_iter()
+                                                .map(|val| val.copied()),
+                                        );
+                                    }
+                                    _ => b.append_nulls(len),
+                                }
+                            }
+                            Ok(Arc::new(b.finish()))
+                        }
+                        _ => {
+                            Ok(new_null_array($data_type, capacity))
+                        }
+                    }
                 },
                 DataType::FixedSizeBinary(size) => {
-                    let mut builder = FixedSizeBinaryBuilder::new(*size);
-                    let iterator = [<$stat_type_prefix FixedLenByteArrayDataPageStatsIterator>]::new($iterator);
-                    for x in iterator {
-                        for x in x.into_iter() {
-                            let Some(x) = x else {
-                                builder.append_null(); // no statistics value
-                                continue;
-                            };
-
-                            if x.len() == *size as usize {
-                                let _ = builder.append_value(x.data());
-                            } else {
-                                builder.append_null();
+                    let mut b = FixedSizeBinaryBuilder::with_capacity(capacity, *size);
+                    for (len, index) in chunks {
+                        match index {
+                            Some(ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(index)) => {
+                                for val in index.$values_iter() {
+                                    match val {
+                                        Some(v) => {
+                                           if v.len() == *size as usize {
+                                               let _ = b.append_value(v.as_ref())?;
+                                           } else {
+                                               b.append_null();
+                                           }
+                                       }
+                                        None => b.append_null(),
+                                    }
+                                }
+                            }
+                            _ => b.append_nulls(len),
+                        }
+                    }
+                    Ok(Arc::new(b.finish()))
+                },
+                DataType::Utf8View => {
+                    let mut b = StringViewBuilder::with_capacity(capacity);
+                    for (len, index) in chunks {
+                        match index {
+                            Some(ColumnIndexMetaData::BYTE_ARRAY(index)) => {
+                                for val in index.$values_iter() {
+                                    match val {
+                                        Some(x) => match std::str::from_utf8(x.as_ref()) {
+                                            Ok(s) => b.append_value(s),
+                                            _ => b.append_null(),
+                                        }
+                                        None => b.append_null(),
+                                    }
+                                }
+                            }
+                            _ => {
+                                for _ in 0..len { b.append_null(); }
                             }
                         }
                     }
-                    Ok(Arc::new(builder.finish()))
-                },
-                DataType::Utf8View => {
-                    let mut builder = StringViewBuilder::new();
-                    let iterator = [<$stat_type_prefix ByteArrayDataPageStatsIterator>]::new($iterator);
-                    for x in iterator {
-                        for x in x.into_iter() {
-                            let Some(x) = x else {
-                                builder.append_null(); // no statistics value
-                                continue;
-                            };
-
-                            let Ok(x) = std::str::from_utf8(x.data()) else {
-                                builder.append_null();
-                                continue;
-                            };
-
-                            builder.append_value(x);
-                        }
-                    }
-                    Ok(Arc::new(builder.finish()))
+                    Ok(Arc::new(b.finish()))
                 },
                 DataType::BinaryView => {
-                    let mut builder = BinaryViewBuilder::new();
-                    let iterator = [<$stat_type_prefix ByteArrayDataPageStatsIterator>]::new($iterator);
-                    for x in iterator {
-                        for x in x.into_iter() {
-                            let Some(x) = x else {
-                                builder.append_null(); // no statistics value
-                                continue;
-                            };
-
-                            builder.append_value(x);
+                    let mut b = BinaryViewBuilder::with_capacity(capacity);
+                    for (len, index) in chunks {
+                        match index {
+                            Some(ColumnIndexMetaData::BYTE_ARRAY(index)) => {
+                                for val in index.$values_iter() {
+                                    match val {
+                                        Some(v) => b.append_value(v.as_ref()),
+                                        None => b.append_null(),
+                                    }
+                                }
+                            }
+                            _ => {
+                                for _ in 0..len { b.append_null(); }
+                            }
                         }
                     }
-                    Ok(Arc::new(builder.finish()))
+                    Ok(Arc::new(b.finish()))
                 },
                 DataType::Date64 |  // required to cover $physical_type match guard
                 DataType::Null |
@@ -1077,13 +1324,12 @@ macro_rules! get_data_page_statistics {
                 DataType::Union(_, _) |
                 DataType::Map(_, _) |
                 DataType::RunEndEncoded(_, _) => {
-                    let len = $iterator.count();
                     // don't know how to extract statistics, so return a null array
-                    Ok(new_null_array($data_type, len))
+                    Ok(new_null_array($data_type, capacity))
                 },
             }
         }
-    }
+    };
 }
 /// Extracts the min statistics from an iterator of [`ParquetStatistics`] to an
 /// [`ArrayRef`]
@@ -1116,7 +1362,7 @@ pub(crate) fn min_page_statistics<'a, I>(
     physical_type: Option<PhysicalType>,
 ) -> Result<ArrayRef>
 where
-    I: Iterator<Item = (usize, &'a ColumnIndexMetaData)>,
+    I: Iterator<Item = (usize, Option<&'a ColumnIndexMetaData>)>,
 {
     get_data_page_statistics!(Min, data_type, iterator, physical_type)
 }
@@ -1129,7 +1375,7 @@ pub(crate) fn max_page_statistics<'a, I>(
     physical_type: Option<PhysicalType>,
 ) -> Result<ArrayRef>
 where
-    I: Iterator<Item = (usize, &'a ColumnIndexMetaData)>,
+    I: Iterator<Item = (usize, Option<&'a ColumnIndexMetaData>)>,
 {
     get_data_page_statistics!(Max, data_type, iterator, physical_type)
 }
@@ -1140,16 +1386,56 @@ where
 /// The returned Array is an [`UInt64Array`]
 pub(crate) fn null_counts_page_statistics<'a, I>(iterator: I) -> Result<UInt64Array>
 where
-    I: Iterator<Item = (usize, &'a ColumnIndexMetaData)>,
+    I: Iterator<Item = (usize, Option<&'a ColumnIndexMetaData>)>,
 {
-    let iter = iterator.flat_map(|(len, index)| match index {
-        ColumnIndexMetaData::NONE => vec![None; len],
-        column_index => column_index.null_counts().map_or(vec![None; len], |v| {
-            v.iter().map(|i| Some(*i as u64)).collect::<Vec<_>>()
-        }),
-    });
+    let chunks: Vec<_> = iterator.collect();
+    let total_capacity: usize = chunks.iter().map(|(len, _)| *len).sum();
+    let mut values = Vec::with_capacity(total_capacity);
+    let mut nulls = NullBufferBuilder::new(total_capacity);
+    for (len, index) in chunks {
+        match index {
+            Some(index) if index.null_counts().is_some() => {
+                values.extend(index.null_counts().unwrap().iter().map(|&x| x as u64));
+                nulls.append_n_non_nulls(len);
+            }
+            _ => {
+                values.resize(values.len() + len, 0);
+                nulls.append_n_nulls(len);
+            }
+        }
+    }
+    let null_buffer = nulls.build();
+    let array = UInt64Array::new(values.into(), null_buffer);
+    Ok(array)
+}
 
-    Ok(UInt64Array::from_iter(iter))
+/// Extracts the NaN count statistics from an iterator
+/// of parquet page [`ColumnIndexMetaData`]'s to an [`ArrayRef`]
+///
+/// The returned Array is an [`UInt64Array`]
+pub(crate) fn nan_counts_page_statistics<'a, I>(iterator: I) -> Result<UInt64Array>
+where
+    I: Iterator<Item = (usize, Option<&'a ColumnIndexMetaData>)>,
+{
+    let chunks: Vec<_> = iterator.collect();
+    let total_capacity: usize = chunks.iter().map(|(len, _)| *len).sum();
+    let mut values = Vec::with_capacity(total_capacity);
+    let mut nulls = NullBufferBuilder::new(total_capacity);
+    for (len, index) in chunks {
+        match index {
+            Some(index) if index.nan_counts().is_some() => {
+                values.extend(index.nan_counts().unwrap().iter().map(|&x| x as u64));
+                nulls.append_n_non_nulls(len);
+            }
+            _ => {
+                values.resize(values.len() + len, 0);
+                nulls.append_n_nulls(len);
+            }
+        }
+    }
+    let null_buffer = nulls.build();
+    let array = UInt64Array::new(values.into(), null_buffer);
+    Ok(array)
 }
 
 /// Extracts Parquet statistics as Arrow arrays
@@ -1170,7 +1456,10 @@ where
 /// Note: The Parquet schema and Arrow schema do not have to be identical (for
 /// example, the columns may be in different orders and one or the other schemas
 /// may have additional columns). The function [`parquet_column`] is used to
-/// match the column in the Parquet schema to the column in the Arrow schema.
+/// match the column in the Parquet schema to the column in the Arrow schema
+/// when using [`Self::try_new`]. For nested fields (e.g., struct fields),
+/// where `parquet_column` does not support schema resolution, use
+/// [`Self::from_column_index`] instead with a pre-resolved leaf column index.
 #[derive(Debug)]
 pub struct StatisticsConverter<'a> {
     /// the index of the matched column in the Parquet schema
@@ -1253,7 +1542,7 @@ impl<'a> StatisticsConverter<'a> {
         };
 
         let mut builder = UInt64Array::builder(10);
-        for metadata in metadatas.into_iter() {
+        for metadata in metadatas {
             let row_count = metadata.num_rows();
             let row_count: u64 = row_count.try_into().map_err(|e| {
                 arrow_err!(format!(
@@ -1270,6 +1559,9 @@ impl<'a> StatisticsConverter<'a> {
     /// Note if there is no corresponding column in the parquet file, the returned
     /// arrays will be null. This can happen if the column is in the arrow
     /// schema but not in the parquet schema due to schema evolution.
+    ///
+    /// This constructor only supports top-level, non-nested columns. For nested
+    /// fields (e.g., fields within a struct), use [`Self::from_column_index`].
     ///
     /// See example on [`Self::row_group_mins`] for usage
     ///
@@ -1309,6 +1601,50 @@ impl<'a> StatisticsConverter<'a> {
             arrow_field,
             missing_null_counts_as_zero: true,
             physical_type: parquet_index.map(|idx| parquet_schema.column(idx).physical_type()),
+        })
+    }
+
+    /// Create a new `StatisticsConverter` from a Parquet leaf column index directly.
+    ///
+    /// Unlike [`Self::try_new`], this constructor bypasses schema resolution and
+    /// accepts a Parquet column index directly. This is useful for nested fields
+    /// (e.g., struct fields) where the caller has already resolved the mapping
+    /// from the Arrow field to the Parquet leaf column.
+    ///
+    /// # Arguments
+    ///
+    /// * `parquet_column_index` - The index of the leaf column in the Parquet schema
+    /// * `arrow_field` - The Arrow field describing the column's data type
+    /// * `parquet_schema` - The Parquet schema descriptor (used to look up the physical type)
+    ///
+    /// The caller must ensure that `arrow_field` describes the same leaf column as
+    /// `parquet_column_index`. This mapping is not validated by the converter; if
+    /// the Arrow type does not match the Parquet column statistics, extraction
+    /// returns null statistics values rather than an error.
+    ///
+    /// # Errors
+    ///
+    /// * If the `parquet_column_index` is out of bounds
+    pub fn from_column_index(
+        parquet_column_index: usize,
+        arrow_field: &'a Field,
+        parquet_schema: &'a SchemaDescriptor,
+    ) -> Result<Self> {
+        if parquet_column_index >= parquet_schema.columns().len() {
+            return Err(arrow_err!(format!(
+                "Parquet column index {} out of bounds, column count {}",
+                parquet_column_index,
+                parquet_schema.columns().len()
+            )));
+        }
+
+        let physical_type = parquet_schema.column(parquet_column_index).physical_type();
+
+        Ok(Self {
+            parquet_column_index: Some(parquet_column_index),
+            arrow_field,
+            missing_null_counts_as_zero: true,
+            physical_type: Some(physical_type),
         })
     }
 
@@ -1453,15 +1789,58 @@ impl<'a> StatisticsConverter<'a> {
             .into_iter()
             .map(|x| x.column(parquet_index).statistics())
             .map(|s| {
-                s.and_then(|s| {
-                    if self.missing_null_counts_as_zero {
-                        Some(s.null_count_opt().unwrap_or(0))
-                    } else {
-                        s.null_count_opt()
-                    }
-                })
+                let s = s?;
+                if self.missing_null_counts_as_zero {
+                    Some(s.null_count_opt().unwrap_or(0))
+                } else {
+                    s.null_count_opt()
+                }
             });
         Ok(UInt64Array::from_iter(null_counts))
+    }
+
+    /// Extract the NaN counts from row group statistics in [`RowGroupMetaData`]
+    ///
+    /// See docs on [`Self::row_group_mins`] for details
+    pub fn row_group_nan_counts<I>(&self, metadatas: I) -> Result<UInt64Array>
+    where
+        I: IntoIterator<Item = &'a RowGroupMetaData>,
+    {
+        let Some(parquet_index) = self.parquet_column_index else {
+            let num_row_groups = metadatas.into_iter().count();
+            return Ok(UInt64Array::from_iter(std::iter::repeat_n(
+                None,
+                num_row_groups,
+            )));
+        };
+
+        let nan_counts = metadatas
+            .into_iter()
+            .map(|x| x.column(parquet_index).statistics())
+            .map(|s| s?.nan_count_opt());
+        Ok(UInt64Array::from_iter(nan_counts))
+    }
+
+    /// Extract the distinct counts from row group statistics in [`RowGroupMetaData`]
+    ///
+    /// See docs on [`Self::row_group_mins`] for details
+    pub fn row_group_distinct_counts<I>(&self, metadatas: I) -> Result<UInt64Array>
+    where
+        I: IntoIterator<Item = &'a RowGroupMetaData>,
+    {
+        let Some(parquet_index) = self.parquet_column_index else {
+            let num_row_groups = metadatas.into_iter().count();
+            return Ok(UInt64Array::from_iter(std::iter::repeat_n(
+                None,
+                num_row_groups,
+            )));
+        };
+
+        let distinct_counts = metadatas
+            .into_iter()
+            .map(|x| x.column(parquet_index).statistics())
+            .map(|s| s?.distinct_count_opt());
+        Ok(UInt64Array::from_iter(distinct_counts))
     }
 
     /// Extract the minimum values from Data Page statistics.
@@ -1469,7 +1848,7 @@ impl<'a> StatisticsConverter<'a> {
     /// In Parquet files, in addition to the Column Chunk level statistics
     /// (stored for each column for each row group) there are also
     /// optional statistics stored for each data page, as part of
-    /// the [`ParquetColumnIndex`].
+    /// the [`PageIndex`].
     ///
     /// Since a single Column Chunk is stored as one or more pages,
     /// page level statistics can prune at a finer granularity.
@@ -1480,11 +1859,7 @@ impl<'a> StatisticsConverter<'a> {
     ///
     /// # Parameters:
     ///
-    /// * `column_page_index`: The parquet column page indices, read from
-    ///   `ParquetMetaData` column_index
-    ///
-    /// * `column_offset_index`: The parquet column offset indices, read from
-    ///   `ParquetMetaData` offset_index
+    /// * `page_index`: The parquet page indices, read from `ParquetMetaData`
     ///
     /// * `row_group_indices`: The indices of the row groups, that are used to
     ///   extract the column page index and offset index on a per row group
@@ -1515,10 +1890,11 @@ impl<'a> StatisticsConverter<'a> {
     /// * the column is not present in the parquet file
     /// * statistics for the pages are not present in the row group
     /// * the stored statistic value can not be converted to the requested type
+    ///
+    /// [`PageIndex`]: crate::file::metadata::page_index::PageIndex
     pub fn data_page_mins<I>(
         &self,
-        column_page_index: &ParquetColumnIndex,
-        column_offset_index: &ParquetOffsetIndex,
+        page_index: &dyn PageIndexProvider,
         row_group_indices: I,
     ) -> Result<ArrayRef>
     where
@@ -1532,12 +1908,12 @@ impl<'a> StatisticsConverter<'a> {
 
         let iter = row_group_indices.into_iter().map(|rg_index| {
             let column_page_index_per_row_group_per_column =
-                &column_page_index[*rg_index][parquet_index];
-            let num_data_pages = &column_offset_index[*rg_index][parquet_index]
-                .page_locations()
-                .len();
+                page_index.column_index(*rg_index, parquet_index);
+            let num_data_pages = page_index
+                .num_data_pages(*rg_index, parquet_index)
+                .unwrap_or(0);
 
-            (*num_data_pages, column_page_index_per_row_group_per_column)
+            (num_data_pages, column_page_index_per_row_group_per_column)
         });
 
         min_page_statistics(data_type, iter, self.physical_type)
@@ -1548,8 +1924,7 @@ impl<'a> StatisticsConverter<'a> {
     /// See docs on [`Self::data_page_mins`] for details.
     pub fn data_page_maxes<I>(
         &self,
-        column_page_index: &ParquetColumnIndex,
-        column_offset_index: &ParquetOffsetIndex,
+        page_index: &dyn PageIndexProvider,
         row_group_indices: I,
     ) -> Result<ArrayRef>
     where
@@ -1563,12 +1938,12 @@ impl<'a> StatisticsConverter<'a> {
 
         let iter = row_group_indices.into_iter().map(|rg_index| {
             let column_page_index_per_row_group_per_column =
-                &column_page_index[*rg_index][parquet_index];
-            let num_data_pages = &column_offset_index[*rg_index][parquet_index]
-                .page_locations()
-                .len();
+                page_index.column_index(*rg_index, parquet_index);
+            let num_data_pages = page_index
+                .num_data_pages(*rg_index, parquet_index)
+                .unwrap_or(0);
 
-            (*num_data_pages, column_page_index_per_row_group_per_column)
+            (num_data_pages, column_page_index_per_row_group_per_column)
         });
 
         max_page_statistics(data_type, iter, self.physical_type)
@@ -1579,8 +1954,7 @@ impl<'a> StatisticsConverter<'a> {
     /// See docs on [`Self::data_page_mins`] for details.
     pub fn data_page_null_counts<I>(
         &self,
-        column_page_index: &ParquetColumnIndex,
-        column_offset_index: &ParquetOffsetIndex,
+        page_index: &dyn PageIndexProvider,
         row_group_indices: I,
     ) -> Result<UInt64Array>
     where
@@ -1588,22 +1962,47 @@ impl<'a> StatisticsConverter<'a> {
     {
         let Some(parquet_index) = self.parquet_column_index else {
             let num_row_groups = row_group_indices.into_iter().count();
-            return Ok(UInt64Array::from_iter(std::iter::repeat_n(
-                None,
-                num_row_groups,
-            )));
+            return Ok(UInt64Array::new_null(num_row_groups));
         };
 
         let iter = row_group_indices.into_iter().map(|rg_index| {
             let column_page_index_per_row_group_per_column =
-                &column_page_index[*rg_index][parquet_index];
-            let num_data_pages = &column_offset_index[*rg_index][parquet_index]
-                .page_locations()
-                .len();
+                page_index.column_index(*rg_index, parquet_index);
+            let num_data_pages = page_index
+                .num_data_pages(*rg_index, parquet_index)
+                .unwrap_or(0);
 
-            (*num_data_pages, column_page_index_per_row_group_per_column)
+            (num_data_pages, column_page_index_per_row_group_per_column)
         });
         null_counts_page_statistics(iter)
+    }
+
+    /// Returns a [`UInt64Array`] with NaN counts for each data page.
+    ///
+    /// See docs on [`Self::data_page_mins`] for details.
+    pub fn data_page_nan_counts<I>(
+        &self,
+        page_index: &dyn PageIndexProvider,
+        row_group_indices: I,
+    ) -> Result<UInt64Array>
+    where
+        I: IntoIterator<Item = &'a usize>,
+    {
+        let Some(parquet_index) = self.parquet_column_index else {
+            let num_row_groups = row_group_indices.into_iter().count();
+            return Ok(UInt64Array::new_null(num_row_groups));
+        };
+
+        let iter = row_group_indices.into_iter().map(|rg_index| {
+            let column_page_index_per_row_group_per_column =
+                page_index.column_index(*rg_index, parquet_index);
+            let num_data_pages = page_index
+                .num_data_pages(*rg_index, parquet_index)
+                .unwrap_or(0);
+
+            (num_data_pages, column_page_index_per_row_group_per_column)
+        });
+        nan_counts_page_statistics(iter)
     }
 
     /// Returns a [`UInt64Array`] with row counts for each data page.
@@ -1625,7 +2024,7 @@ impl<'a> StatisticsConverter<'a> {
     /// See docs on [`Self::data_page_mins`] for details.
     pub fn data_page_row_counts<I>(
         &self,
-        column_offset_index: &ParquetOffsetIndex,
+        page_index: &dyn PageIndexProvider,
         row_group_metadatas: &'a [RowGroupMetaData],
         row_group_indices: I,
     ) -> Result<Option<UInt64Array>>
@@ -1639,9 +2038,22 @@ impl<'a> StatisticsConverter<'a> {
             return Ok(None);
         };
 
-        let mut row_count_total = Vec::new();
+        let mut row_counts = Vec::new();
+        let mut nulls = NullBufferBuilder::new(0);
         for rg_idx in row_group_indices {
-            let page_locations = &column_offset_index[*rg_idx][parquet_index].page_locations();
+            let Some(offset_index) = page_index.offset_index(*rg_idx, parquet_index) else {
+                // A partial page index may contain the ColumnIndex but not the OffsetIndex.
+                // Preserve page-wise alignment with data_page_{mins,maxes,null_counts} by
+                // emitting one null row count for every page known from the ColumnIndex.
+                let num_pages = page_index
+                    .column_index(*rg_idx, parquet_index)
+                    .map(|index| index.num_pages() as usize)
+                    .unwrap_or(0);
+                row_counts.resize(row_counts.len() + num_pages, 0);
+                nulls.append_n_nulls(num_pages);
+                continue;
+            };
+            let page_locations = offset_index.page_locations();
 
             let row_count_per_page = page_locations
                 .windows(2)
@@ -1649,17 +2061,22 @@ impl<'a> StatisticsConverter<'a> {
 
             // append the last page row count
             let num_rows_in_row_group = &row_group_metadatas[*rg_idx].num_rows();
-            let row_count_per_page = row_count_per_page
-                .chain(std::iter::once(Some(
-                    *num_rows_in_row_group as u64
-                        - page_locations.last().unwrap().first_row_index as u64,
-                )))
-                .collect::<Vec<_>>();
+            let row_count_per_page = row_count_per_page.chain(std::iter::once(Some(
+                *num_rows_in_row_group as u64
+                    - page_locations.last().unwrap().first_row_index as u64,
+            )));
 
-            row_count_total.extend(row_count_per_page);
+            row_counts.extend(row_count_per_page.clone().map(|x| x.unwrap_or(0)));
+            for val in row_count_per_page {
+                if val.is_some() {
+                    nulls.append_non_null();
+                } else {
+                    nulls.append_null();
+                }
+            }
         }
 
-        Ok(Some(UInt64Array::from_iter(row_count_total)))
+        Ok(Some(UInt64Array::new(row_counts.into(), nulls.build())))
     }
 
     /// Returns a null array of data_type with one element per row group

@@ -53,7 +53,10 @@
 //! # }
 //! ```
 //!
-//! [`object_store`] provides it's native implementation of [`AsyncFileWriter`] by [`ParquetObjectWriter`].
+//! There is a blanket implementation of [`AsyncFileWriter`] for all types that
+//! implement [`AsyncWrite`], so writers such as `tokio::fs::File`, or
+//! `object_store::buffered::BufWriter` for writing to object storage, can be
+//! passed to [`AsyncArrowWriter`] directly.
 
 #[cfg(feature = "object_store")]
 mod store;
@@ -340,7 +343,7 @@ mod tests {
         let reader = get_test_reader();
 
         let write_props = WriterProperties::builder()
-            .set_max_row_group_size(64)
+            .set_max_row_group_row_count(Some(64))
             .build();
 
         let mut async_buffer = Vec::new();

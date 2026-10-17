@@ -140,6 +140,10 @@ where
     fn finish_cloned(&self) -> ArrayRef {
         Arc::new(self.finish_cloned())
     }
+
+    fn finish_preserve_values(&mut self) -> ArrayRef {
+        Arc::new(self.finish_preserve_values())
+    }
 }
 
 impl<T: ArrayBuilder> FixedSizeListBuilder<T>
@@ -166,6 +170,10 @@ where
     }
 
     /// Builds the [`FixedSizeListBuilder`] and reset this builder.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the length of the child array is not `self.len() * value_length`
     pub fn finish(&mut self) -> FixedSizeListArray {
         let len = self.len();
         let values = self.values_builder.finish();
@@ -189,10 +197,36 @@ where
     }
 
     /// Builds the [`FixedSizeListBuilder`] without resetting the builder.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the length of the child array is not `self.len() * value_length`
     pub fn finish_cloned(&self) -> FixedSizeListArray {
         let len = self.len();
         let values = self.values_builder.finish_cloned();
         let nulls = self.null_buffer_builder.finish_cloned();
+
+        assert_eq!(
+            values.len(),
+            len * self.list_len as usize,
+            "Length of the child array ({}) must be the multiple of the value length ({}) and the array length ({}).",
+            values.len(),
+            self.list_len,
+            len,
+        );
+
+        let field = self
+            .field
+            .clone()
+            .unwrap_or_else(|| Arc::new(Field::new_list_field(values.data_type().clone(), true)));
+
+        FixedSizeListArray::new(field, self.list_len, values, nulls)
+    }
+
+    fn finish_preserve_values(&mut self) -> FixedSizeListArray {
+        let len = self.len();
+        let values = self.values_builder.finish_preserve_values();
+        let nulls = self.null_buffer_builder.finish();
 
         assert_eq!(
             values.len(),
@@ -224,7 +258,7 @@ mod tests {
 
     use crate::Array;
     use crate::Int32Array;
-    use crate::builder::Int32Builder;
+    use crate::builder::{Int32Builder, tests::PreserveValuesMock};
 
     fn make_list_builder(
         include_null_element: bool,
@@ -255,17 +289,14 @@ mod tests {
             builder.append(true);
         }
 
+        builder.values().append_value(3);
         if include_null_in_values {
-            builder.values().append_value(3);
             builder.values().append_null();
-            builder.values().append_value(5);
-            builder.append(true);
         } else {
-            builder.values().append_value(3);
             builder.values().append_value(4);
-            builder.values().append_value(5);
-            builder.append(true);
         }
+        builder.values().append_value(5);
+        builder.append(true);
 
         builder
     }
@@ -279,7 +310,7 @@ mod tests {
         assert_eq!(DataType::Int32, list_array.value_type());
         assert_eq!(4, list_array.len());
         assert_eq!(1, list_array.null_count());
-        assert_eq!(6, list_array.value_offset(2));
+        assert_eq!(6, list_array.value_offset_at(2));
         assert_eq!(3, list_array.value_length());
     }
 
@@ -292,7 +323,7 @@ mod tests {
         assert_eq!(DataType::Int32, list_array.value_type());
         assert_eq!(4, list_array.len());
         assert_eq!(0, list_array.null_count());
-        assert_eq!(6, list_array.value_offset(2));
+        assert_eq!(6, list_array.value_offset_at(2));
         assert_eq!(3, list_array.value_length());
     }
 
@@ -305,7 +336,7 @@ mod tests {
         assert_eq!(DataType::Int32, list_array.value_type());
         assert_eq!(4, list_array.len());
         assert_eq!(1, list_array.null_count());
-        assert_eq!(6, list_array.value_offset(2));
+        assert_eq!(6, list_array.value_offset_at(2));
         assert_eq!(3, list_array.value_length());
     }
 
@@ -352,7 +383,7 @@ mod tests {
         assert_eq!(DataType::Int32, list_array.value_type());
         assert_eq!(4, list_array.len());
         assert_eq!(1, list_array.null_count());
-        assert_eq!(6, list_array.value_offset(2));
+        assert_eq!(6, list_array.value_offset_at(2));
         assert_eq!(3, list_array.value_length());
     }
 
@@ -374,7 +405,7 @@ mod tests {
         assert_eq!(DataType::Int32, list_array.value_type());
         assert_eq!(4, list_array.len());
         assert_eq!(1, list_array.null_count());
-        assert_eq!(6, list_array.value_offset(2));
+        assert_eq!(6, list_array.value_offset_at(2));
         assert_eq!(3, list_array.value_length());
     }
 
@@ -411,7 +442,7 @@ mod tests {
         assert_eq!(DataType::Int32, list_array.value_type());
         assert_eq!(6, list_array.len());
         assert_eq!(2, list_array.null_count());
-        assert_eq!(6, list_array.value_offset(2));
+        assert_eq!(6, list_array.value_offset_at(2));
         assert_eq!(3, list_array.value_length());
     }
 
@@ -490,5 +521,19 @@ mod tests {
         builder.append(true);
 
         builder.finish();
+    }
+
+    #[test]
+    fn test_finish_preserve_values() {
+        let mut builder = FixedSizeListBuilder::new(PreserveValuesMock::default(), 2);
+
+        builder.values().inner.append_value(0);
+        builder.values().inner.append_value(1);
+        builder.append(true);
+
+        let arr = builder.finish_preserve_values();
+
+        assert_eq!(1, arr.len());
+        assert_eq!(1, builder.values().called);
     }
 }

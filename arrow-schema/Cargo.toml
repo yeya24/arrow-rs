@@ -19,7 +19,6 @@
 name = "arrow-schema"
 version = { workspace = true }
 description = "Defines the logical types for arrow arrays"
-homepage = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
 license = { workspace = true }
@@ -53,14 +52,14 @@ serde = ["dep:serde_core", "dep:serde"]
 all-features = true
 
 [dev-dependencies]
-bincode = { version = "2.0.1", default-features = false, features = [
-    "std",
-    "serde",
-] }
-criterion = { version = "0.5", default-features = false }
-insta = "1.43.1"
+criterion = { workspace = true, default-features = false }
+insta = { workspace = true, default-features = true }
+postcard = { version = "1.0.10", default-features = false, features = ["use-std"] }
 
 [[bench]]
 name = "ffi"
 harness = false
 required-features = ["ffi"]
+
+[lints]
+workspace = true

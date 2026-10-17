@@ -46,6 +46,8 @@ pub enum ArrowError {
     CsvError(String),
     /// Error during JSON-related operations.
     JsonError(String),
+    /// Error during Avro-related operations.
+    AvroError(String),
     /// Error during IO operations.
     IoError(String, std::io::Error),
     /// Error during IPC operations in `arrow-ipc` or `arrow-flight`.
@@ -58,7 +60,7 @@ pub enum ArrowError {
     CDataInterface(String),
     /// Error when a dictionary key is bigger than the key type
     DictionaryKeyOverflowError,
-    /// Error when the run end index in a REE array is bigger than the array length
+    /// Error when a run-end index is bigger than the run-end type
     RunEndIndexOverflowError,
     /// Error when the offset overflows.
     OffsetOverflowError(usize),
@@ -99,9 +101,9 @@ impl Display for ArrowError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             ArrowError::NotYetImplemented(source) => {
-                write!(f, "Not yet implemented: {}", &source)
+                write!(f, "Not yet implemented: {source}")
             }
-            ArrowError::ExternalError(source) => write!(f, "External error: {}", &source),
+            ArrowError::ExternalError(source) => write!(f, "External error: {source}"),
             ArrowError::CastError(desc) => write!(f, "Cast error: {desc}"),
             ArrowError::MemoryError(desc) => write!(f, "Memory error: {desc}"),
             ArrowError::ParseError(desc) => write!(f, "Parser error: {desc}"),
@@ -109,6 +111,7 @@ impl Display for ArrowError {
             ArrowError::ComputeError(desc) => write!(f, "Compute error: {desc}"),
             ArrowError::ArithmeticOverflow(desc) => write!(f, "Arithmetic overflow: {desc}"),
             ArrowError::DivideByZero => write!(f, "Divide by zero error"),
+            ArrowError::AvroError(desc) => write!(f, "Avro error: {desc}"),
             ArrowError::CsvError(desc) => write!(f, "Csv error: {desc}"),
             ArrowError::JsonError(desc) => write!(f, "Json error: {desc}"),
             ArrowError::IoError(desc, _) => write!(f, "Io error: {desc}"),
@@ -126,7 +129,7 @@ impl Display for ArrowError {
                 write!(f, "Dictionary key bigger than the key type")
             }
             ArrowError::RunEndIndexOverflowError => {
-                write!(f, "Run end encoded array index overflow error")
+                write!(f, "Run end index bigger than the run-end type")
             }
             ArrowError::OffsetOverflowError(offset) => {
                 write!(f, "Offset overflow error: {offset}")

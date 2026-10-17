@@ -58,17 +58,24 @@ impl<T: ByteArrayType> GenericByteBuilder<T> {
 
     /// Creates a new  [`GenericByteBuilder`] from buffers.
     ///
+    /// Any bytes in `value_buffer` after the last offset are dropped. The first
+    /// bit of `null_buffer` is for the first row.
+    ///
     /// # Safety
     ///
     /// This doesn't verify buffer contents as it assumes the buffers are from
     /// existing and valid [`GenericByteArray`].
     pub unsafe fn new_from_buffer(
         offsets_buffer: MutableBuffer,
-        value_buffer: MutableBuffer,
+        mut value_buffer: MutableBuffer,
         null_buffer: Option<MutableBuffer>,
     ) -> Self {
         let offsets_builder: Vec<T::Offset> =
             ScalarBuffer::<T::Offset>::from(offsets_buffer).into();
+
+        // New values are appended at the end of the values buffer, so it must end
+        // at the last offset
+        value_buffer.truncate(offsets_builder.last().unwrap().as_usize());
         let value_builder: Vec<u8> = ScalarBuffer::<u8>::from(value_buffer).into();
 
         let null_buffer_builder = null_buffer
@@ -76,8 +83,8 @@ impl<T: ByteArrayType> GenericByteBuilder<T> {
             .unwrap_or_else(|| NullBufferBuilder::new_with_len(offsets_builder.len() - 1));
 
         Self {
-            offsets_builder,
             value_builder,
+            offsets_builder,
             null_buffer_builder,
         }
     }
@@ -110,18 +117,41 @@ impl<T: ByteArrayType> GenericByteBuilder<T> {
         self.offsets_builder.push(self.next_offset());
     }
 
+    /// Appends a value of type `T` into the builder `n` times.
+    ///
+    /// See [`Self::append_value`] for more panic information.
+    ///
+    /// # Panics
+    ///
+    /// Panics for the same reasons as [`Self::append_value`]
+    #[inline]
+    pub fn append_value_n(&mut self, value: impl AsRef<T::Native>, n: usize) {
+        let bytes: &[u8] = value.as_ref().as_ref();
+        self.value_builder.reserve(bytes.len() * n);
+        self.offsets_builder.reserve(n);
+        for _ in 0..n {
+            self.value_builder.extend_from_slice(bytes);
+            self.offsets_builder.push(self.next_offset());
+        }
+        self.null_buffer_builder.append_n_non_nulls(n);
+    }
+
     /// Append an `Option` value into the builder.
     ///
     /// - A `None` value will append a null value.
     /// - A `Some` value will append the value.
     ///
     /// See [`Self::append_value`] for more panic information.
+    ///
+    /// # Panics
+    ///
+    /// Panics for the same reasons as [`Self::append_value`]
     #[inline]
     pub fn append_option(&mut self, value: Option<impl AsRef<T::Native>>) {
         match value {
             None => self.append_null(),
             Some(v) => self.append_value(v),
-        };
+        }
     }
 
     /// Append a null value into the builder.
@@ -192,6 +222,7 @@ impl<T: ByteArrayType> GenericByteBuilder<T> {
             .nulls(self.null_buffer_builder.finish());
 
         self.offsets_builder.push(self.next_offset());
+        // SAFETY: builder is constructed from valid offset and value buffers maintained by the builder
         let array_data = unsafe { array_builder.build_unchecked() };
         GenericByteArray::from(array_data)
     }
@@ -207,6 +238,7 @@ impl<T: ByteArrayType> GenericByteBuilder<T> {
             .add_buffer(value_buffer)
             .nulls(self.null_buffer_builder.finish_cloned());
 
+        // SAFETY: builder is constructed from valid offset and value buffers maintained by the builder
         let array_data = unsafe { array_builder.build_unchecked() };
         GenericByteArray::from(array_data)
     }
@@ -216,14 +248,29 @@ impl<T: ByteArrayType> GenericByteBuilder<T> {
         self.value_builder.as_slice()
     }
 
+    /// Returns the current values buffer capacity, in bytes.
+    pub fn values_capacity(&self) -> usize {
+        self.value_builder.capacity()
+    }
+
     /// Returns the current offsets buffer as a slice
     pub fn offsets_slice(&self) -> &[T::Offset] {
         self.offsets_builder.as_slice()
     }
 
+    /// Returns the current offsets buffer capacity, in offsets.
+    pub fn offsets_capacity(&self) -> usize {
+        self.offsets_builder.capacity()
+    }
+
     /// Returns the current null buffer as a slice
     pub fn validity_slice(&self) -> Option<&[u8]> {
         self.null_buffer_builder.as_slice()
+    }
+
+    /// Returns the current null buffer allocated capacity, in bytes.
+    pub fn validity_capacity(&self) -> usize {
+        self.null_buffer_builder.allocated_size()
     }
 
     /// Returns the current null buffer as a mutable slice
@@ -345,6 +392,94 @@ impl<O: OffsetSizeTrait> std::fmt::Write for GenericStringBuilder<O> {
     fn write_str(&mut self, s: &str) -> std::fmt::Result {
         self.value_builder.extend_from_slice(s.as_bytes());
         Ok(())
+    }
+}
+
+/// A byte size value representing the number of bytes to allocate per string in [`GenericStringBuilder`]
+///
+/// To create a [`GenericStringBuilder`] using `.with_capacity` we are required to provide: \
+/// - `item_capacity` - the row count \
+/// - `data_capacity` - total string byte count \
+///
+/// We will use the `AVERAGE_STRING_LENGTH` * row_count for `data_capacity`. \
+///
+/// These capacities are preallocation hints used to improve performance,
+/// but consequences of passing a hint too large or too small should be negligible.
+const AVERAGE_STRING_LENGTH: usize = 16;
+/// Trait for string-like array builders
+///
+/// This trait provides unified interface for builders that append string-like data
+/// such as [`GenericStringBuilder<O>`] and [`crate::builder::StringViewBuilder`]
+pub trait StringLikeArrayBuilder: ArrayBuilder {
+    /// Returns a human-readable type name for the builder.
+    fn type_name() -> &'static str;
+
+    /// Creates a new builder with the given row capacity.
+    fn with_capacity(capacity: usize) -> Self;
+
+    /// Appends a non-null string value to the builder.
+    fn append_value(&mut self, value: &str);
+
+    /// Appends a null value to the builder.
+    fn append_null(&mut self);
+}
+
+impl<O: OffsetSizeTrait> StringLikeArrayBuilder for GenericStringBuilder<O> {
+    fn type_name() -> &'static str {
+        std::any::type_name::<Self>()
+    }
+    fn with_capacity(capacity: usize) -> Self {
+        Self::with_capacity(capacity, capacity * AVERAGE_STRING_LENGTH)
+    }
+    fn append_value(&mut self, value: &str) {
+        Self::append_value(self, value);
+    }
+    fn append_null(&mut self) {
+        Self::append_null(self);
+    }
+}
+
+/// A byte size value representing the number of bytes to allocate per binary in [`GenericBinaryBuilder`]
+///
+/// To create a [`GenericBinaryBuilder`] using `.with_capacity` we are required to provide: \
+/// - `item_capacity` - the row count \
+/// - `data_capacity` - total binary byte count \
+///
+/// We will use the `AVERAGE_BINARY_LENGTH` * row_count for `data_capacity`. \
+///
+/// These capacities are preallocation hints used to improve performance,
+/// but consequences of passing a hint too large or too small should be negligible.
+const AVERAGE_BINARY_LENGTH: usize = 128;
+/// Trait for binary-like array builders
+///
+/// This trait provides unified interface for builders that append binary-like data
+/// such as [`GenericBinaryBuilder<O>`] and [`crate::builder::BinaryViewBuilder`]
+pub trait BinaryLikeArrayBuilder: ArrayBuilder {
+    /// Returns a human-readable type name for the builder.
+    fn type_name() -> &'static str;
+
+    /// Creates a new builder with the given row capacity.
+    fn with_capacity(capacity: usize) -> Self;
+
+    /// Appends a non-null string value to the builder.
+    fn append_value(&mut self, value: &[u8]);
+
+    /// Appends a null value to the builder.
+    fn append_null(&mut self);
+}
+
+impl<O: OffsetSizeTrait> BinaryLikeArrayBuilder for GenericBinaryBuilder<O> {
+    fn type_name() -> &'static str {
+        std::any::type_name::<Self>()
+    }
+    fn with_capacity(capacity: usize) -> Self {
+        Self::with_capacity(capacity, capacity * AVERAGE_BINARY_LENGTH)
+    }
+    fn append_value(&mut self, value: &[u8]) {
+        Self::append_value(self, value);
+    }
+    fn append_null(&mut self) {
+        Self::append_null(self);
     }
 }
 
@@ -659,7 +794,7 @@ mod tests {
         let r: Vec<_> = a.iter().flatten().collect();
         assert_eq!(
             r,
-            &["foo".as_bytes(), "bar\n".as_bytes(), "fizbuz".as_bytes()]
+            &[b"foo".as_slice(), b"bar\n".as_slice(), b"fizbuz".as_slice()]
         )
     }
 
@@ -850,5 +985,22 @@ mod tests {
         let result = builder.append_array(&overflow_array);
 
         assert!(matches!(result, Err(ArrowError::OffsetOverflowError(_))));
+    }
+
+    #[test]
+    fn test_append_value_n() {
+        let mut builder = GenericStringBuilder::<i32>::new();
+        builder.append_value("hello");
+        builder.append_value_n("world", 3);
+        builder.append_null();
+        let array = builder.finish();
+
+        assert_eq!(5, array.len());
+        assert_eq!(1, array.null_count());
+        assert_eq!("hello", array.value(0));
+        assert_eq!("world", array.value(1));
+        assert_eq!("world", array.value(2));
+        assert_eq!("world", array.value(3));
+        assert!(array.is_null(4));
     }
 }

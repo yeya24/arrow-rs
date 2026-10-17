@@ -77,7 +77,7 @@ pub fn read_plaintext_footer_file_without_decryption_properties() {
         _ => {
             panic!("Expected ArrowError::ParquetError");
         }
-    };
+    }
 }
 
 #[cfg(feature = "async")]
@@ -139,8 +139,8 @@ pub async fn read_plaintext_footer_file_without_decryption_properties_async() {
         Some(Err(ParquetError::ArrowError(s))) => {
             assert!(s.contains("Parquet error"));
         }
-        _ => {
-            panic!("Expected ArrowError::ParquetError");
+        err => {
+            panic!("Expected ArrowError::ParquetError, got {err:?}");
         }
-    };
+    }
 }

@@ -17,7 +17,11 @@
 
 use std::{fmt::Display, iter::Peekable, str::Chars, sync::Arc};
 
-use crate::{ArrowError, DataType, Field, Fields, IntervalUnit, TimeUnit};
+use crate::{
+    ArrowError, DECIMAL32_MAX_PRECISION, DECIMAL64_MAX_PRECISION, DECIMAL128_MAX_PRECISION,
+    DECIMAL256_MAX_PRECISION, DataType, Field, Fields, IntervalUnit, TimeUnit, UnionFields,
+    UnionMode,
+};
 
 /// Parses a DataType from a string representation
 ///
@@ -83,9 +87,14 @@ impl<'a> Parser<'a> {
             Token::Decimal256 => self.parse_decimal_256(),
             Token::Dictionary => self.parse_dictionary(),
             Token::List => self.parse_list(),
+            Token::ListView => self.parse_list_view(),
             Token::LargeList => self.parse_large_list(),
+            Token::LargeListView => self.parse_large_list_view(),
             Token::FixedSizeList => self.parse_fixed_size_list(),
             Token::Struct => self.parse_struct(),
+            Token::Union => self.parse_union(),
+            Token::Map => self.parse_map(),
+            Token::RunEndEncoded => self.parse_run_end_encoded(),
             tok => Err(make_error(
                 self.val,
                 &format!("finding next type, got unexpected '{tok}'"),
@@ -93,37 +102,116 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parses the List type
+    /// parses Field, this is the inversion of `format_field` in `datatype_display.rs`.
+    /// E.g: "a": non-null Int64
+    ///
+    /// TODO: support metadata: `"a": non-null Int64 metadata: {"foo": "value"}`
+    fn parse_field(&mut self) -> ArrowResult<Field> {
+        let name = self.parse_double_quoted_string("Field")?;
+        self.expect_token(Token::Colon)?;
+        let nullable = self.parse_opt_nullable();
+        let data_type = self.parse_next_type()?;
+        Ok(Field::new(name, data_type, nullable))
+    }
+
+    /// Parses field inside a list. Use `Field::LIST_FIELD_DEFAULT_NAME`
+    /// if no field name is specified.
+    /// E.g: `non-null Int64, field: 'foo'` or `non-null Int64`
+    ///
+    /// TODO: support metadata: `non-ull Int64, metadata: {"foo2": "value"}`
+    fn parse_list_field(&mut self, context: &str) -> ArrowResult<Field> {
+        let nullable = self.parse_opt_nullable();
+        let data_type = self.parse_next_type()?;
+
+        // the field name (if exists) must be after a comma
+        let field_name = if self
+            .tokenizer
+            .next_if(|next| matches!(next, Ok(Token::Comma)))
+            .is_none()
+        {
+            Field::LIST_FIELD_DEFAULT_NAME.into()
+        } else {
+            // expects: `field: 'field_name'`.
+            self.expect_token(Token::Field)?;
+            self.expect_token(Token::Colon)?;
+            self.parse_single_quoted_string(context)?
+        };
+
+        Ok(Field::new(field_name, data_type, nullable))
+    }
+
+    /// Parses the List type (called after `List` has been consumed)
+    /// E.g: List(non-null Int64, field: 'foo')
     fn parse_list(&mut self) -> ArrowResult<DataType> {
         self.expect_token(Token::LParen)?;
-        let data_type = self.parse_next_type()?;
+        let field = self.parse_list_field("List")?;
         self.expect_token(Token::RParen)?;
-        Ok(DataType::List(Arc::new(Field::new_list_field(
-            data_type, true,
-        ))))
+        Ok(DataType::List(Arc::new(field)))
     }
 
-    /// Parses the LargeList type
+    /// Parses the ListView type (called after `ListView` has been consumed)
+    /// E.g: ListView(non-null Int64, field: 'foo')
+    fn parse_list_view(&mut self) -> ArrowResult<DataType> {
+        self.expect_token(Token::LParen)?;
+        let field = self.parse_list_field("ListView")?;
+        self.expect_token(Token::RParen)?;
+        Ok(DataType::ListView(Arc::new(field)))
+    }
+
+    /// Parses the LargeList type (called after `LargeList` has been consumed)
+    /// E.g: LargeList(non-null Int64, field: 'foo')
     fn parse_large_list(&mut self) -> ArrowResult<DataType> {
         self.expect_token(Token::LParen)?;
-        let data_type = self.parse_next_type()?;
+        let field = self.parse_list_field("LargeList")?;
         self.expect_token(Token::RParen)?;
-        Ok(DataType::LargeList(Arc::new(Field::new_list_field(
-            data_type, true,
-        ))))
+        Ok(DataType::LargeList(Arc::new(field)))
     }
 
-    /// Parses the FixedSizeList type
+    /// Parses the LargeListView type (called after `LargeListView` has been consumed)
+    /// E.g: LargeListView(non-null Int64, field: 'foo')
+    fn parse_large_list_view(&mut self) -> ArrowResult<DataType> {
+        self.expect_token(Token::LParen)?;
+        let field = self.parse_list_field("LargeListView")?;
+        self.expect_token(Token::RParen)?;
+        Ok(DataType::LargeListView(Arc::new(field)))
+    }
+
+    /// Parses the FixedSizeList type (called after `FixedSizeList` has been consumed)
+    ///
+    /// Examples:
+    /// * `FixedSizeList(5 x non-null Int64, field: 'foo')`
+    /// * `FixedSizeList(4, Int64)`
+    ///
     fn parse_fixed_size_list(&mut self) -> ArrowResult<DataType> {
         self.expect_token(Token::LParen)?;
         let length = self.parse_i32("FixedSizeList")?;
-        self.expect_token(Token::Comma)?;
-        let data_type = self.parse_next_type()?;
-        self.expect_token(Token::RParen)?;
-        Ok(DataType::FixedSizeList(
-            Arc::new(Field::new_list_field(data_type, true)),
-            length,
-        ))
+        if length < 0 {
+            return Err(make_error(
+                self.val,
+                &format!("FixedSizeList length must be non-negative, got {length}"),
+            ));
+        }
+        match self.next_token()? {
+            // `FixedSizeList(5 x non-null Int64, field: 'foo')` format
+            Token::X => {
+                let field = self.parse_list_field("FixedSizeList")?;
+                self.expect_token(Token::RParen)?;
+                Ok(DataType::FixedSizeList(Arc::new(field), length))
+            }
+            // `FixedSizeList(4, Int64)` format
+            Token::Comma => {
+                let data_type = self.parse_next_type()?;
+                self.expect_token(Token::RParen)?;
+                Ok(DataType::FixedSizeList(
+                    Arc::new(Field::new_list_field(data_type, true)),
+                    length,
+                ))
+            }
+            tok => Err(make_error(
+                self.val,
+                &format!("Expected 'x' or ',' after length for FixedSizeList, got '{tok}'"),
+            )),
+        }
     }
 
     /// Parses the next timeunit
@@ -146,6 +234,19 @@ impl<'a> Parser<'a> {
             Err(make_error(
                 self.val,
                 &format!("expected double quoted string for {context}, got '{token}'"),
+            ))
+        }
+    }
+
+    /// Parses the next single quoted string
+    fn parse_single_quoted_string(&mut self, context: &str) -> ArrowResult<String> {
+        let token = self.next_token()?;
+        if let Token::SingleQuotedString(string) = token {
+            Ok(string)
+        } else {
+            Err(make_error(
+                self.val,
+                &format!("expected single quoted string for {context}, got '{token}'"),
             ))
         }
     }
@@ -223,7 +324,7 @@ impl<'a> Parser<'a> {
                             &format!("Expected None, Some, or a timezone string, got {tok:?}"),
                         ));
                     }
-                };
+                }
                 self.expect_token(Token::RParen)?;
             }
             // No timezone (e.g `Timestamp(ns)`)
@@ -244,6 +345,15 @@ impl<'a> Parser<'a> {
     fn parse_time32(&mut self) -> ArrowResult<DataType> {
         self.expect_token(Token::LParen)?;
         let time_unit = self.parse_time_unit("Time32")?;
+        match time_unit {
+            TimeUnit::Second | TimeUnit::Millisecond => (),
+            TimeUnit::Microsecond | TimeUnit::Nanosecond => {
+                return Err(make_error(
+                    self.val,
+                    &format!("Time32 time unit must be 's' or 'ms', got '{time_unit}'"),
+                ));
+            }
+        }
         self.expect_token(Token::RParen)?;
         Ok(DataType::Time32(time_unit))
     }
@@ -252,6 +362,15 @@ impl<'a> Parser<'a> {
     fn parse_time64(&mut self) -> ArrowResult<DataType> {
         self.expect_token(Token::LParen)?;
         let time_unit = self.parse_time_unit("Time64")?;
+        match time_unit {
+            TimeUnit::Microsecond | TimeUnit::Nanosecond => (),
+            TimeUnit::Second | TimeUnit::Millisecond => {
+                return Err(make_error(
+                    self.val,
+                    &format!("Time64 time unit must be 'µs' or 'ns', got '{time_unit}'"),
+                ));
+            }
+        }
         self.expect_token(Token::RParen)?;
         Ok(DataType::Time64(time_unit))
     }
@@ -284,8 +403,40 @@ impl<'a> Parser<'a> {
     fn parse_fixed_size_binary(&mut self) -> ArrowResult<DataType> {
         self.expect_token(Token::LParen)?;
         let length = self.parse_i32("FixedSizeBinary")?;
+        if length < 0 {
+            return Err(make_error(
+                self.val,
+                &format!("FixedSizeBinary length must be non-negative, got {length}"),
+            ));
+        }
         self.expect_token(Token::RParen)?;
         Ok(DataType::FixedSizeBinary(length))
+    }
+
+    fn validate_decimal(
+        &self,
+        precision: u8,
+        scale: i8,
+        type_name: &str,
+        max_precision: u8,
+    ) -> ArrowResult<()> {
+        if precision == 0 || precision > max_precision {
+            return Err(make_error(
+                self.val,
+                &format!(
+                    "{type_name} precision must be in range [1, {max_precision}], got '{precision}'"
+                ),
+            ));
+        }
+        if scale > 0 && scale as u8 > precision {
+            return Err(make_error(
+                self.val,
+                &format!(
+                    "{type_name} scale '{scale}' cannot be greater than precision '{precision}'"
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Parses the next Decimal32 (called after `Decimal32` has been consumed)
@@ -295,6 +446,7 @@ impl<'a> Parser<'a> {
         self.expect_token(Token::Comma)?;
         let scale = self.parse_i8("Decimal32")?;
         self.expect_token(Token::RParen)?;
+        self.validate_decimal(precision, scale, "Decimal32", DECIMAL32_MAX_PRECISION)?;
         Ok(DataType::Decimal32(precision, scale))
     }
 
@@ -305,6 +457,7 @@ impl<'a> Parser<'a> {
         self.expect_token(Token::Comma)?;
         let scale = self.parse_i8("Decimal64")?;
         self.expect_token(Token::RParen)?;
+        self.validate_decimal(precision, scale, "Decimal64", DECIMAL64_MAX_PRECISION)?;
         Ok(DataType::Decimal64(precision, scale))
     }
 
@@ -315,6 +468,7 @@ impl<'a> Parser<'a> {
         self.expect_token(Token::Comma)?;
         let scale = self.parse_i8("Decimal128")?;
         self.expect_token(Token::RParen)?;
+        self.validate_decimal(precision, scale, "Decimal128", DECIMAL128_MAX_PRECISION)?;
         Ok(DataType::Decimal128(precision, scale))
     }
 
@@ -325,6 +479,7 @@ impl<'a> Parser<'a> {
         self.expect_token(Token::Comma)?;
         let scale = self.parse_i8("Decimal256")?;
         self.expect_token(Token::RParen)?;
+        self.validate_decimal(precision, scale, "Decimal256", DECIMAL256_MAX_PRECISION)?;
         Ok(DataType::Decimal256(precision, scale))
     }
 
@@ -340,34 +495,24 @@ impl<'a> Parser<'a> {
             Box::new(value_type),
         ))
     }
+
+    /// Parses the next Struct (called after `Struct` has been consumed)
     fn parse_struct(&mut self) -> ArrowResult<DataType> {
         self.expect_token(Token::LParen)?;
         let mut fields = Vec::new();
         loop {
-            // expects:   "field name": [nullable] #datatype
-
-            let field_name = match self.next_token()? {
-                Token::RParen => {
-                    break;
-                }
-                Token::DoubleQuotedString(field_name) => field_name,
-                tok => {
-                    return Err(make_error(
-                        self.val,
-                        &format!("Expected a quoted string for a field name; got {tok:?}"),
-                    ));
-                }
-            };
-            self.expect_token(Token::Colon)?;
-
-            let nullable = self
+            if self
                 .tokenizer
-                .next_if(|next| matches!(next, Ok(Token::Nullable)))
-                .is_some();
-            let field_type = self.parse_next_type()?;
-            fields.push(Arc::new(Field::new(field_name, field_type, nullable)));
+                .next_if(|next| matches!(next, Ok(Token::RParen)))
+                .is_some()
+            {
+                break;
+            }
+
+            let field = self.parse_field()?;
+            fields.push(Arc::new(field));
             match self.next_token()? {
-                Token::Comma => continue,
+                Token::Comma => {}
                 Token::RParen => break,
                 tok => {
                     return Err(make_error(
@@ -380,6 +525,157 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(DataType::Struct(Fields::from(fields)))
+    }
+
+    /// Parses the next Union (called after `Union` has been consumed)
+    /// E.g: Union(Sparse, 0: ("a": Int32), 1: ("b": non-null Utf8))
+    fn parse_union(&mut self) -> ArrowResult<DataType> {
+        self.expect_token(Token::LParen)?;
+        let union_mode = self.parse_union_mode()?;
+        let mut type_ids = vec![];
+        let mut fields = vec![];
+        loop {
+            if self
+                .tokenizer
+                .next_if(|next| matches!(next, Ok(Token::RParen)))
+                .is_some()
+            {
+                break;
+            }
+            self.expect_token(Token::Comma)?;
+            let (type_id, field) = self.parse_union_field()?;
+            type_ids.push(type_id);
+            fields.push(field);
+        }
+        Ok(DataType::Union(
+            UnionFields::try_new(type_ids, fields)?,
+            union_mode,
+        ))
+    }
+
+    /// Parses the next UnionMode
+    fn parse_union_mode(&mut self) -> ArrowResult<UnionMode> {
+        match self.next_token()? {
+            Token::UnionMode(union_mode) => Ok(union_mode),
+            tok => Err(make_error(
+                self.val,
+                &format!("finding UnionMode for Union, got {tok}"),
+            )),
+        }
+    }
+
+    /// Parses the next UnionField
+    /// 0: ("a": non-null Int32)
+    fn parse_union_field(&mut self) -> ArrowResult<(i8, Field)> {
+        let type_id = self.parse_i8("UnionField")?;
+        self.expect_token(Token::Colon)?;
+        self.expect_token(Token::LParen)?;
+        let field = self.parse_field()?;
+        self.expect_token(Token::RParen)?;
+        Ok((type_id, field))
+    }
+
+    /// Parses the next Map (called after `Map` has been consumed)
+    /// E.g: Map("entries": Struct("key": Utf8, "value": non-null Int32), sorted)
+    fn parse_map(&mut self) -> ArrowResult<DataType> {
+        self.expect_token(Token::LParen)?;
+        let field = self.parse_field()?;
+        if field.is_nullable() {
+            return Err(make_error(self.val, "Map entries field cannot be nullable"));
+        }
+        if let DataType::Struct(fields) = field.data_type() {
+            if fields.len() != 2 {
+                return Err(make_error(
+                    self.val,
+                    &format!(
+                        "Map entries must contain two children, got {}",
+                        fields.len()
+                    ),
+                ));
+            }
+            if fields[0].is_nullable() {
+                return Err(make_error(self.val, "Map key field cannot be nullable"));
+            }
+        } else {
+            return Err(make_error(
+                self.val,
+                &format!(
+                    "Map entries must be a Struct type, got {}",
+                    field.data_type()
+                ),
+            ));
+        }
+        self.expect_token(Token::Comma)?;
+        let sorted = self.parse_map_sorted()?;
+        self.expect_token(Token::RParen)?;
+        Ok(DataType::Map(Arc::new(field), sorted))
+    }
+
+    /// Parses map's sorted
+    fn parse_map_sorted(&mut self) -> ArrowResult<bool> {
+        match self.next_token()? {
+            Token::MapSorted(sorted) => Ok(sorted),
+            tok => Err(make_error(
+                self.val,
+                &format!("Expected sorted or unsorted for a map; got {tok:?}"),
+            )),
+        }
+    }
+
+    /// Parses the next RunEndEncoded (called after `RunEndEncoded` has been consumed).
+    ///
+    /// Compact form (default field names): `RunEndEncoded(non-null Int32, non-null Utf8)`
+    /// Verbose form (custom field names):  `RunEndEncoded("re": Int32, "v": non-null Utf8)`
+    fn parse_run_end_encoded(&mut self) -> ArrowResult<DataType> {
+        self.expect_token(Token::LParen)?;
+
+        // Distinguish compact from verbose by peeking: verbose starts with a double-quoted name.
+        let verbose = matches!(
+            self.tokenizer.peek(),
+            Some(Ok(Token::DoubleQuotedString(_)))
+        );
+
+        let (run_ends, values) = if verbose {
+            let run_ends = self.parse_field()?;
+            if run_ends.is_nullable() {
+                return Err(make_error(
+                    self.val,
+                    "RunEndEncoded run_ends field cannot be nullable",
+                ));
+            }
+            self.expect_token(Token::Comma)?;
+            let values = self.parse_field()?;
+            (run_ends, values)
+        } else {
+            if self.parse_opt_nullable() {
+                return Err(make_error(
+                    self.val,
+                    "RunEndEncoded run_ends field cannot be nullable",
+                ));
+            }
+            let re_type = self.parse_next_type()?;
+            self.expect_token(Token::Comma)?;
+            let v_nullable = self.parse_opt_nullable();
+            let v_type = self.parse_next_type()?;
+            (
+                Field::new(Field::REE_RUN_ENDS_FIELD_DEFAULT_NAME, re_type, false),
+                Field::new(Field::REE_VALUES_FIELD_DEFAULT_NAME, v_type, v_nullable),
+            )
+        };
+
+        self.expect_token(Token::RParen)?;
+        Ok(DataType::RunEndEncoded(
+            Arc::new(run_ends),
+            Arc::new(values),
+        ))
+    }
+
+    /// consume the next token and return `false` if the field is `nonnull`.
+    fn parse_opt_nullable(&mut self) -> bool {
+        let tok = self
+            .tokenizer
+            .next_if(|next| matches!(next, Ok(Token::NonNull | Token::Nullable)));
+        !matches!(tok, Some(Ok(Token::NonNull)))
     }
 
     /// return the next token, or an error if there are none left
@@ -406,8 +702,13 @@ fn is_separator(c: char) -> bool {
     c == '(' || c == ')' || c == ',' || c == ':' || c == ' '
 }
 
+enum QuoteType {
+    Double,
+    Single,
+}
+
 #[derive(Debug)]
-/// Splits a strings like Dictionary(Int32, Int64) into tokens sutable for parsing
+/// Splits a strings like Dictionary(Int32, Int64) into tokens suitable for parsing
 ///
 /// For example the string "Timestamp(ns)" would be parsed into:
 ///
@@ -497,7 +798,9 @@ impl<'a> Tokenizer<'a> {
             "Date64" => Token::SimpleType(DataType::Date64),
 
             "List" => Token::List,
+            "ListView" => Token::ListView,
             "LargeList" => Token::LargeList,
+            "LargeListView" => Token::LargeListView,
             "FixedSizeList" => Token::FixedSizeList,
 
             "s" | "Second" => Token::TimeUnit(TimeUnit::Second),
@@ -526,9 +829,22 @@ impl<'a> Tokenizer<'a> {
             "Some" => Token::Some,
             "None" => Token::None,
 
+            "non-null" => Token::NonNull,
             "nullable" => Token::Nullable,
+            "field" => Token::Field,
+            "x" => Token::X,
 
             "Struct" => Token::Struct,
+
+            "Union" => Token::Union,
+            "Sparse" => Token::UnionMode(UnionMode::Sparse),
+            "Dense" => Token::UnionMode(UnionMode::Dense),
+
+            "Map" => Token::Map,
+            "sorted" => Token::MapSorted(true),
+            "unsorted" => Token::MapSorted(false),
+
+            "RunEndEncoded" => Token::RunEndEncoded,
 
             token => {
                 return Err(make_error(self.val, &format!("unknown token: {token}")));
@@ -537,9 +853,14 @@ impl<'a> Tokenizer<'a> {
         Ok(token)
     }
 
-    /// Parses e.g. `"foo bar"`
-    fn parse_quoted_string(&mut self) -> ArrowResult<Token> {
-        if self.next_char() != Some('\"') {
+    /// Parses e.g. `"foo bar"`, `'foo bar'`
+    fn parse_quoted_string(&mut self, quote_type: QuoteType) -> ArrowResult<Token> {
+        let quote = match quote_type {
+            QuoteType::Double => '\"',
+            QuoteType::Single => '\'',
+        };
+
+        if self.next_char() != Some(quote) {
             return Err(make_error(self.val, "Expected \""));
         }
 
@@ -561,7 +882,7 @@ impl<'a> Tokenizer<'a> {
                         is_escaped = true;
                         self.word.push(c);
                     }
-                    '"' => {
+                    c if c == quote => {
                         if is_escaped {
                             self.word.push(c);
                             is_escaped = false;
@@ -585,7 +906,10 @@ impl<'a> Tokenizer<'a> {
             return Err(make_error(self.val, "empty strings aren't allowed"));
         }
 
-        Ok(Token::DoubleQuotedString(val))
+        match quote_type {
+            QuoteType::Double => Ok(Token::DoubleQuotedString(val)),
+            QuoteType::Single => Ok(Token::SingleQuotedString(val)),
+        }
     }
 }
 
@@ -598,10 +922,12 @@ impl Iterator for Tokenizer<'_> {
                 ' ' => {
                     // skip whitespace
                     self.next_char();
-                    continue;
                 }
                 '"' => {
-                    return Some(self.parse_quoted_string());
+                    return Some(self.parse_quoted_string(QuoteType::Double));
+                }
+                '\'' => {
+                    return Some(self.parse_quoted_string(QuoteType::Single));
                 }
                 '(' => {
                     self.next_char();
@@ -652,11 +978,22 @@ enum Token {
     None,
     Integer(i64),
     DoubleQuotedString(String),
+    SingleQuotedString(String),
     List,
+    ListView,
     LargeList,
+    LargeListView,
     FixedSizeList,
     Struct,
+    Union,
+    UnionMode(UnionMode),
+    Map,
+    MapSorted(bool),
+    RunEndEncoded,
+    NonNull,
     Nullable,
+    Field,
+    X,
 }
 
 impl Display for Token {
@@ -664,7 +1001,9 @@ impl Display for Token {
         match self {
             Token::SimpleType(t) => write!(f, "{t}"),
             Token::List => write!(f, "List"),
+            Token::ListView => write!(f, "ListView"),
             Token::LargeList => write!(f, "LargeList"),
+            Token::LargeListView => write!(f, "LargeListView"),
             Token::FixedSizeList => write!(f, "FixedSizeList"),
             Token::Timestamp => write!(f, "Timestamp"),
             Token::Time32 => write!(f, "Time32"),
@@ -687,8 +1026,19 @@ impl Display for Token {
             Token::Dictionary => write!(f, "Dictionary"),
             Token::Integer(v) => write!(f, "Integer({v})"),
             Token::DoubleQuotedString(s) => write!(f, "DoubleQuotedString({s})"),
+            Token::SingleQuotedString(s) => write!(f, "SingleQuotedString({s})"),
             Token::Struct => write!(f, "Struct"),
+            Token::Union => write!(f, "Union"),
+            Token::UnionMode(m) => write!(f, "{m:?}"),
+            Token::Map => write!(f, "Map"),
+            Token::MapSorted(sorted) => {
+                write!(f, "{}", if *sorted { "sorted" } else { "unsorted" })
+            }
+            Token::RunEndEncoded => write!(f, "RunEndEncoded"),
+            Token::NonNull => write!(f, "non-null"),
             Token::Nullable => write!(f, "nullable"),
+            Token::Field => write!(f, "field"),
+            Token::X => write!(f, "x"),
         }
     }
 }
@@ -752,10 +1102,6 @@ mod test {
             DataType::Date64,
             DataType::Time32(TimeUnit::Second),
             DataType::Time32(TimeUnit::Millisecond),
-            DataType::Time32(TimeUnit::Microsecond),
-            DataType::Time32(TimeUnit::Nanosecond),
-            DataType::Time64(TimeUnit::Second),
-            DataType::Time64(TimeUnit::Millisecond),
             DataType::Time64(TimeUnit::Microsecond),
             DataType::Time64(TimeUnit::Nanosecond),
             DataType::Duration(TimeUnit::Second),
@@ -769,15 +1115,14 @@ mod test {
             DataType::BinaryView,
             DataType::FixedSizeBinary(0),
             DataType::FixedSizeBinary(1234),
-            DataType::FixedSizeBinary(-432),
             DataType::LargeBinary,
             DataType::Utf8,
             DataType::Utf8View,
             DataType::LargeUtf8,
-            DataType::Decimal32(7, 8),
-            DataType::Decimal64(6, 9),
-            DataType::Decimal128(7, 12),
-            DataType::Decimal256(6, 13),
+            DataType::Decimal32(7, 6),
+            DataType::Decimal64(6, 5),
+            DataType::Decimal128(7, 6),
+            DataType::Decimal256(6, 5),
             // ---------
             // Nested types
             // ---------
@@ -827,8 +1172,171 @@ mod test {
                     true,
                 ),
             ])),
+            DataType::Struct(Fields::from(vec![Field::new("f1", DataType::Int64, true)])),
             DataType::Struct(Fields::empty()),
-            // TODO support more structured types (List, LargeList, Union, Map, RunEndEncoded, etc)
+            DataType::List(Arc::new(Field::new_list_field(DataType::Int64, true))),
+            DataType::List(Arc::new(Field::new_list_field(DataType::Int64, false))),
+            DataType::List(Arc::new(Field::new("Int64", DataType::Int64, true))),
+            DataType::List(Arc::new(Field::new("Int64", DataType::Int64, false))),
+            DataType::List(Arc::new(Field::new(
+                "nested_list",
+                DataType::List(Arc::new(Field::new("Int64", DataType::Int64, true))),
+                true,
+            ))),
+            DataType::ListView(Arc::new(Field::new_list_field(DataType::Int64, true))),
+            DataType::ListView(Arc::new(Field::new_list_field(DataType::Int64, false))),
+            DataType::ListView(Arc::new(Field::new("Int64", DataType::Int64, true))),
+            DataType::ListView(Arc::new(Field::new("Int64", DataType::Int64, false))),
+            DataType::ListView(Arc::new(Field::new(
+                "nested_list_view",
+                DataType::ListView(Arc::new(Field::new("Int64", DataType::Int64, true))),
+                true,
+            ))),
+            DataType::LargeList(Arc::new(Field::new_list_field(DataType::Int64, true))),
+            DataType::LargeList(Arc::new(Field::new_list_field(DataType::Int64, false))),
+            DataType::LargeList(Arc::new(Field::new("Int64", DataType::Int64, true))),
+            DataType::LargeList(Arc::new(Field::new("Int64", DataType::Int64, false))),
+            DataType::LargeList(Arc::new(Field::new(
+                "nested_large_list",
+                DataType::LargeList(Arc::new(Field::new("Int64", DataType::Int64, true))),
+                true,
+            ))),
+            DataType::LargeListView(Arc::new(Field::new_list_field(DataType::Int64, true))),
+            DataType::LargeListView(Arc::new(Field::new_list_field(DataType::Int64, false))),
+            DataType::LargeListView(Arc::new(Field::new("Int64", DataType::Int64, true))),
+            DataType::LargeListView(Arc::new(Field::new("Int64", DataType::Int64, false))),
+            DataType::LargeListView(Arc::new(Field::new(
+                "nested_large_list_view",
+                DataType::LargeListView(Arc::new(Field::new("Int64", DataType::Int64, true))),
+                true,
+            ))),
+            DataType::FixedSizeList(Arc::new(Field::new_list_field(DataType::Int64, true)), 2),
+            DataType::FixedSizeList(Arc::new(Field::new_list_field(DataType::Int64, false)), 2),
+            DataType::FixedSizeList(Arc::new(Field::new("Int64", DataType::Int64, true)), 2),
+            DataType::FixedSizeList(Arc::new(Field::new("Int64", DataType::Int64, false)), 2),
+            DataType::FixedSizeList(
+                Arc::new(Field::new(
+                    "nested_fixed_size_list",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("Int64", DataType::Int64, true)),
+                        2,
+                    ),
+                    true,
+                )),
+                2,
+            ),
+            DataType::Union(
+                UnionFields::from_fields(vec![
+                    Field::new("Int32", DataType::Int32, false),
+                    Field::new("Utf8", DataType::Utf8, true),
+                ]),
+                UnionMode::Sparse,
+            ),
+            DataType::Union(
+                UnionFields::from_fields(vec![
+                    Field::new("Int32", DataType::Int32, false),
+                    Field::new("Utf8", DataType::Utf8, true),
+                ]),
+                UnionMode::Dense,
+            ),
+            DataType::Union(
+                UnionFields::from_fields(vec![
+                    Field::new_union(
+                        "nested_union",
+                        vec![0, 1],
+                        vec![
+                            Field::new("Int32", DataType::Int32, false),
+                            Field::new("Utf8", DataType::Utf8, true),
+                        ],
+                        UnionMode::Dense,
+                    ),
+                    Field::new("Utf8", DataType::Utf8, true),
+                ]),
+                UnionMode::Sparse,
+            ),
+            DataType::Union(
+                UnionFields::from_fields(vec![Field::new("Int32", DataType::Int32, false)]),
+                UnionMode::Dense,
+            ),
+            DataType::Union(
+                UnionFields::try_new(Vec::<i8>::new(), Vec::<Field>::new()).unwrap(),
+                UnionMode::Sparse,
+            ),
+            DataType::RunEndEncoded(
+                Arc::new(Field::new(
+                    Field::REE_RUN_ENDS_FIELD_DEFAULT_NAME,
+                    DataType::UInt32,
+                    false,
+                )),
+                Arc::new(Field::new(
+                    Field::REE_VALUES_FIELD_DEFAULT_NAME,
+                    DataType::Int32,
+                    true,
+                )),
+            ),
+            DataType::RunEndEncoded(
+                Arc::new(Field::new(
+                    Field::REE_RUN_ENDS_FIELD_DEFAULT_NAME,
+                    DataType::RunEndEncoded(
+                        Arc::new(Field::new(
+                            Field::REE_RUN_ENDS_FIELD_DEFAULT_NAME,
+                            DataType::UInt32,
+                            false,
+                        )),
+                        Arc::new(Field::new(
+                            Field::REE_VALUES_FIELD_DEFAULT_NAME,
+                            DataType::Int32,
+                            true,
+                        )),
+                    ),
+                    false,
+                )),
+                Arc::new(Field::new(
+                    Field::REE_VALUES_FIELD_DEFAULT_NAME,
+                    DataType::Int32,
+                    true,
+                )),
+            ),
+            // non-default field names trigger verbose display form
+            DataType::RunEndEncoded(
+                Arc::new(Field::new(
+                    Field::REE_RUN_ENDS_FIELD_DEFAULT_NAME,
+                    DataType::RunEndEncoded(
+                        Arc::new(Field::new(
+                            Field::REE_RUN_ENDS_FIELD_DEFAULT_NAME,
+                            DataType::UInt32,
+                            false,
+                        )),
+                        Arc::new(Field::new(
+                            Field::REE_VALUES_FIELD_DEFAULT_NAME,
+                            DataType::Int32,
+                            true,
+                        )),
+                    ),
+                    false,
+                )),
+                Arc::new(Field::new("named_values", DataType::Int32, false)),
+            ),
+            // verbose form with non-null inner values
+            DataType::RunEndEncoded(
+                Arc::new(Field::new(
+                    Field::REE_RUN_ENDS_FIELD_DEFAULT_NAME,
+                    DataType::RunEndEncoded(
+                        Arc::new(Field::new(
+                            Field::REE_RUN_ENDS_FIELD_DEFAULT_NAME,
+                            DataType::UInt32,
+                            false,
+                        )),
+                        Arc::new(Field::new(
+                            Field::REE_VALUES_FIELD_DEFAULT_NAME,
+                            DataType::Int32,
+                            false,
+                        )),
+                    ),
+                    false,
+                )),
+                Arc::new(Field::new("named_values", DataType::Int32, false)),
+            ),
         ]
     }
 
@@ -871,9 +1379,9 @@ mod test {
         use IntervalUnit::*;
         use TimeUnit::*;
         // List below created with:
-        // for t in list_datatypes() {
-        // println!(r#"("{t}", {t:?}),"#)
-        // }
+        for t in list_datatypes() {
+            println!(r#"("{t}", {t:?}),"#);
+        }
         // (string to parse, expected DataType)
         let cases = [
             ("Timestamp(Nanosecond, None)", Timestamp(Nanosecond, None)),
@@ -951,10 +1459,6 @@ mod test {
             ("Date64", Date64),
             ("Time32(s)", Time32(Second)),
             ("Time32(ms)", Time32(Millisecond)),
-            ("Time32(µs)", Time32(Microsecond)),
-            ("Time32(ns)", Time32(Nanosecond)),
-            ("Time64(s)", Time64(Second)),
-            ("Time64(ms)", Time64(Millisecond)),
             ("Time64(µs)", Time64(Microsecond)),
             ("Time64(ns)", Time64(Nanosecond)),
             ("Duration(s)", Duration(Second)),
@@ -968,15 +1472,14 @@ mod test {
             ("BinaryView", BinaryView),
             ("FixedSizeBinary(0)", FixedSizeBinary(0)),
             ("FixedSizeBinary(1234)", FixedSizeBinary(1234)),
-            ("FixedSizeBinary(-432)", FixedSizeBinary(-432)),
             ("LargeBinary", LargeBinary),
             ("Utf8", Utf8),
             ("Utf8View", Utf8View),
             ("LargeUtf8", LargeUtf8),
-            ("Decimal32(7, 8)", Decimal32(7, 8)),
-            ("Decimal64(6, 9)", Decimal64(6, 9)),
-            ("Decimal128(7, 12)", Decimal128(7, 12)),
-            ("Decimal256(6, 13)", Decimal256(6, 13)),
+            ("Decimal32(7, 6)", Decimal32(7, 6)),
+            ("Decimal64(6, 5)", Decimal64(6, 5)),
+            ("Decimal128(7, 6)", Decimal128(7, 6)),
+            ("Decimal256(6, 5)", Decimal256(6, 5)),
             (
                 "Dictionary(Int32, Utf8)",
                 Dictionary(Box::new(Int32), Box::new(Utf8)),
@@ -1031,7 +1534,19 @@ mod test {
                     ),
                 ])),
             ),
-            (r#"Struct()"#, Struct(Fields::empty())),
+            (r"Struct()", Struct(Fields::empty())),
+            (
+                "FixedSizeList(4, Int64)",
+                FixedSizeList(Arc::new(Field::new_list_field(Int64, true)), 4),
+            ),
+            (
+                "List(Int64)",
+                List(Arc::new(Field::new_list_field(Int64, true))),
+            ),
+            (
+                "LargeList(Int64)",
+                LargeList(Arc::new(Field::new_list_field(Int64, true))),
+            ),
         ];
 
         for (data_type_string, expected_data_type) in cases {
@@ -1051,12 +1566,12 @@ mod test {
             ("", "Error finding next token"),
             ("null", "Unsupported type 'null'"),
             ("Nu", "Unsupported type 'Nu'"),
-            (r#"Timestamp(ns, +00:00)"#, "Error unknown token: +00"),
+            (r"Timestamp(ns, +00:00)", "Error unknown token: +00"),
             (
                 r#"Timestamp(ns, "+00:00)"#,
                 r#"Unterminated string at: "+00:00)"#,
             ),
-            (r#"Timestamp(ns, "")"#, r#"empty strings aren't allowed"#),
+            (r#"Timestamp(ns, "")"#, r"empty strings aren't allowed"),
             (
                 r#"Timestamp(ns, "+00:00"")"#,
                 r#"Parser error: Unterminated string at: ")"#,
@@ -1079,46 +1594,150 @@ mod test {
             // too large for i32
             (
                 "FixedSizeBinary(4000000000), ",
-                "Error converting 4000000000 into i32 for FixedSizeBinary: out of range integral type conversion attempted",
+                "Error converting 4000000000 into i32 for FixedSizeBinary:",
+            ),
+            // can't have negative width
+            (
+                "FixedSizeBinary(-1), ",
+                "FixedSizeBinary length must be non-negative, got -1",
+            ),
+            (
+                "FixedSizeList(-1, Int64), ",
+                "FixedSizeList length must be non-negative, got -1",
             ),
             // can't have negative precision
             (
                 "Decimal32(-3, 5)",
-                "Error converting -3 into u8 for Decimal32: out of range integral type conversion attempted",
+                "Error converting -3 into u8 for Decimal32:",
             ),
             (
                 "Decimal64(-3, 5)",
-                "Error converting -3 into u8 for Decimal64: out of range integral type conversion attempted",
+                "Error converting -3 into u8 for Decimal64:",
             ),
             (
                 "Decimal128(-3, 5)",
-                "Error converting -3 into u8 for Decimal128: out of range integral type conversion attempted",
+                "Error converting -3 into u8 for Decimal128:",
             ),
             (
                 "Decimal256(-3, 5)",
-                "Error converting -3 into u8 for Decimal256: out of range integral type conversion attempted",
+                "Error converting -3 into u8 for Decimal256:",
             ),
             (
                 "Decimal32(3, 500)",
-                "Error converting 500 into i8 for Decimal32: out of range integral type conversion attempted",
+                "Error converting 500 into i8 for Decimal32:",
             ),
             (
                 "Decimal64(3, 500)",
-                "Error converting 500 into i8 for Decimal64: out of range integral type conversion attempted",
+                "Error converting 500 into i8 for Decimal64:",
             ),
             (
                 "Decimal128(3, 500)",
-                "Error converting 500 into i8 for Decimal128: out of range integral type conversion attempted",
+                "Error converting 500 into i8 for Decimal128:",
             ),
             (
                 "Decimal256(3, 500)",
-                "Error converting 500 into i8 for Decimal256: out of range integral type conversion attempted",
+                "Error converting 500 into i8 for Decimal256:",
             ),
             ("Struct(f1 Int64)", "Error unknown token: f1"),
             ("Struct(\"f1\" Int64)", "Expected ':'"),
             (
                 "Struct(\"f1\": )",
                 "Error finding next type, got unexpected ')'",
+            ),
+            // Invalid time combinations
+            (
+                "Time32(µs)",
+                "Error Time32 time unit must be 's' or 'ms', got 'µs'",
+            ),
+            (
+                "Time32(ns)",
+                "Error Time32 time unit must be 's' or 'ms', got 'ns'",
+            ),
+            (
+                "Time64(s)",
+                "Error Time64 time unit must be 'µs' or 'ns', got 's'",
+            ),
+            (
+                "Time64(ms)",
+                "Error Time64 time unit must be 'µs' or 'ns', got 'ms'",
+            ),
+            // Decimals can't have scale exceeding precision
+            (
+                "Decimal32(5, 6)",
+                "Error Decimal32 scale '6' cannot be greater than precision '5'",
+            ),
+            (
+                "Decimal64(5, 6)",
+                "Error Decimal64 scale '6' cannot be greater than precision '5'",
+            ),
+            (
+                "Decimal128(5, 6)",
+                "Error Decimal128 scale '6' cannot be greater than precision '5'",
+            ),
+            (
+                "Decimal256(5, 6)",
+                "Error Decimal256 scale '6' cannot be greater than precision '5'",
+            ),
+            // Decimals have a max supported precision
+            (
+                "Decimal32(10, 0)",
+                "Error Decimal32 precision must be in range [1, 9], got '10'",
+            ),
+            (
+                "Decimal64(19, 0)",
+                "Error Decimal64 precision must be in range [1, 18], got '19'",
+            ),
+            (
+                "Decimal128(39, 0)",
+                "Error Decimal128 precision must be in range [1, 38], got '39'",
+            ),
+            (
+                "Decimal256(77, 0)",
+                "Error Decimal256 precision must be in range [1, 76], got '77'",
+            ),
+            // Decimals precision can't be 0
+            (
+                "Decimal32(0, 0)",
+                "Error Decimal32 precision must be in range [1, 9], got '0'",
+            ),
+            (
+                "Decimal64(0, 0)",
+                "Error Decimal64 precision must be in range [1, 18], got '0'",
+            ),
+            (
+                "Decimal128(0, 0)",
+                "Error Decimal128 precision must be in range [1, 38], got '0'",
+            ),
+            (
+                "Decimal256(0, 0)",
+                "Error Decimal256 precision must be in range [1, 76], got '0'",
+            ),
+            // REE run_ends cannot be nullable
+            (
+                r#"RunEndEncoded("re": nullable Int32, "v": non-null Utf8)"#,
+                "RunEndEncoded run_ends field cannot be nullable",
+            ),
+            (
+                r#"RunEndEncoded("re": Int32, "v": non-null Utf8)"#,
+                "RunEndEncoded run_ends field cannot be nullable",
+            ),
+            (
+                "RunEndEncoded(nullable Int32, non-null Utf8)",
+                "RunEndEncoded run_ends field cannot be nullable",
+            ),
+            // Map entries field cannot be nullable
+            (
+                r#"Map("entries": Struct("key": non-null Utf8, "value": nullable Int32), unsorted)"#,
+                "Map entries field cannot be nullable",
+            ),
+            // Map key cannot be nullable
+            (
+                r#"Map("entries": non-null Struct("key": nullable Utf8, "value": nullable Int32), unsorted)"#,
+                "Map key field cannot be nullable",
+            ),
+            (
+                r#"Map("entries": non-null Struct("key": Utf8, "value": nullable Int32), unsorted)"#,
+                "Map key field cannot be nullable",
             ),
         ];
 

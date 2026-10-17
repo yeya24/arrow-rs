@@ -139,12 +139,24 @@ impl EncoderOptions {
     }
 }
 
-/// A trait to create custom encoders for specific data types.
+/// Creates custom encoders for specific data types when writing JSON data.
 ///
-/// This allows overriding the default encoders for specific data types,
-/// or adding new encoders for custom data types.
+/// This trait allows customizing JSON encoding for specific data types,
+/// or adding new encoders for unsupported or custom data types.
 ///
-/// # Examples
+/// You can register an implementation of this trait using
+/// [`WriterBuilder::with_encoder_factory`].
+///
+/// [`WriterBuilder::with_encoder_factory`]: crate::writer::WriterBuilder::with_encoder_factory
+///
+/// # Example: Encode a `BinaryArray` as an array of integers
+///
+/// This example encodes each `BinaryArray` value as an array of integers. For
+/// example, the bytes `b"abc"` would be encoded as `[97, 98, 99]`. See the
+/// example on [`DecoderFactory`] for how to decode this back into a
+/// `BinaryArray`.
+///
+/// [`DecoderFactory`]: crate::DecoderFactory
 ///
 /// ```
 /// use std::io::Write;
@@ -158,6 +170,8 @@ impl EncoderOptions {
 /// use serde_json::json;
 /// use serde_json::Value;
 ///
+/// /// Encoder for `BinaryArray` that encodes the bytes as an array of integers.
+/// /// For example, the bytes `b"abc"` would be encoded as `[97, 98, 99]`.
 /// struct IntArrayBinaryEncoder<B> {
 ///     array: B,
 /// }
@@ -179,10 +193,11 @@ impl EncoderOptions {
 ///     }
 /// }
 ///
+/// /// Factory that creates an `IntArrayBinaryEncoder` for `BinaryArray` types.
 /// #[derive(Debug)]
-/// struct IntArayBinaryEncoderFactory;
+/// struct IntArrayBinaryEncoderFactory;
 ///
-/// impl EncoderFactory for IntArayBinaryEncoderFactory {
+/// impl EncoderFactory for IntArrayBinaryEncoderFactory {
 ///     fn make_default_encoder<'a>(
 ///         &self,
 ///         _field: &'a FieldRef,
@@ -202,6 +217,9 @@ impl EncoderOptions {
 ///     }
 /// }
 ///
+/// // The input has two columns:
+/// // bytes: [b"a", null, b"b"]
+/// // float: [1.0, 2.3, null]
 /// let binary_array = BinaryArray::from_iter([Some(b"a".as_slice()), None, Some(b"b".as_slice())]);
 /// let float_array = Float64Array::from(vec![Some(1.0), Some(2.3), None]);
 /// let fields = vec![
@@ -217,10 +235,12 @@ impl EncoderOptions {
 /// )
 /// .unwrap();
 ///
+/// // write the record batch to JSON using the custom encoder factory
+/// // and then reparse into serde_json::Value to verify the output
 /// let json_value: Value = {
 ///     let mut buf = Vec::new();
 ///     let mut writer = WriterBuilder::new()
-///         .with_encoder_factory(Arc::new(IntArayBinaryEncoderFactory))
+///         .with_encoder_factory(Arc::new(IntArrayBinaryEncoderFactory))
 ///         .build::<_, JsonArray>(&mut buf);
 ///     writer.write_batches(&[&batch]).unwrap();
 ///     writer.finish().unwrap();
@@ -242,7 +262,7 @@ pub trait EncoderFactory: std::fmt::Debug + Send + Sync {
     /// Note that the type of the field may not match the type of the array: for dictionary arrays unless the top-level dictionary is handled this
     /// will be called again for the keys and values of the dictionary, at which point the field type will still be the outer dictionary type but the
     /// array will have a different type.
-    /// For example, `field`` might have the type `Dictionary(i32, Utf8)` but `array` will be `Utf8`.
+    /// For example, `field` might have the type `Dictionary(i32, Utf8)` but `array` will be `Utf8`.
     fn make_default_encoder<'a>(
         &self,
         _field: &'a FieldRef,
@@ -262,21 +282,28 @@ pub struct NullableEncoder<'a> {
 
 impl<'a> NullableEncoder<'a> {
     /// Create a new encoder with a null buffer.
+    #[inline]
     pub fn new(encoder: Box<dyn Encoder + 'a>, nulls: Option<NullBuffer>) -> Self {
         Self { encoder, nulls }
     }
 
     /// Encode the value at index `idx` to `out`.
+    #[inline]
     pub fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
         self.encoder.encode(idx, out)
     }
 
     /// Returns whether the value at index `idx` is null.
+    #[inline]
     pub fn is_null(&self, idx: usize) -> bool {
-        self.nulls.as_ref().is_some_and(|nulls| nulls.is_null(idx))
+        match self.nulls {
+            Some(ref nulls) => nulls.is_null(idx),
+            None => false,
+        }
     }
 
     /// Returns whether the encoder has any nulls.
+    #[inline]
     pub fn has_nulls(&self) -> bool {
         match self.nulls {
             Some(ref nulls) => nulls.null_count() > 0,
@@ -286,6 +313,7 @@ impl<'a> NullableEncoder<'a> {
 }
 
 impl Encoder for NullableEncoder<'_> {
+    #[inline]
     fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
         self.encoder.encode(idx, out)
     }
@@ -317,10 +345,10 @@ pub fn make_encoder<'a>(
         }};
     }
 
-    if let Some(factory) = options.encoder_factory() {
-        if let Some(encoder) = factory.make_default_encoder(field, array, options)? {
-            return Ok(encoder);
-        }
+    if let Some(factory) = options.encoder_factory()
+        && let Some(encoder) = factory.make_default_encoder(field, array, options)?
+    {
+        return Ok(encoder);
     }
 
     let nulls = array.nulls().cloned();
@@ -346,22 +374,44 @@ pub fn make_encoder<'a>(
             let array = array.as_string_view();
             NullableEncoder::new(Box::new(StringViewEncoder(array)), array.nulls().cloned())
         }
+        DataType::BinaryView => {
+            let array = array.as_binary_view();
+            NullableEncoder::new(Box::new(BinaryViewEncoder(array)), array.nulls().cloned())
+        }
         DataType::List(_) => {
             let array = array.as_list::<i32>();
-            NullableEncoder::new(Box::new(ListEncoder::try_new(field, array, options)?), array.nulls().cloned())
+            NullableEncoder::new(Box::new(ListLikeEncoder::try_new(field, array, options)?), array.nulls().cloned())
         }
         DataType::LargeList(_) => {
             let array = array.as_list::<i64>();
-            NullableEncoder::new(Box::new(ListEncoder::try_new(field, array, options)?), array.nulls().cloned())
+            NullableEncoder::new(Box::new(ListLikeEncoder::try_new(field, array, options)?), array.nulls().cloned())
+        }
+        DataType::ListView(_) => {
+            let array = array.as_list_view::<i32>();
+            NullableEncoder::new(Box::new(ListLikeEncoder::try_new(field, array, options)?), array.nulls().cloned())
+        }
+        DataType::LargeListView(_) => {
+            let array = array.as_list_view::<i64>();
+            NullableEncoder::new(Box::new(ListLikeEncoder::try_new(field, array, options)?), array.nulls().cloned())
         }
         DataType::FixedSizeList(_, _) => {
             let array = array.as_fixed_size_list();
-            NullableEncoder::new(Box::new(FixedSizeListEncoder::try_new(field, array, options)?), array.nulls().cloned())
+            NullableEncoder::new(Box::new(ListLikeEncoder::try_new(field, array, options)?), array.nulls().cloned())
         }
 
         DataType::Dictionary(_, _) => downcast_dictionary_array! {
             array => {
                 NullableEncoder::new(Box::new(DictionaryEncoder::try_new(field, array, options)?), array.nulls().cloned())
+            },
+            _ => unreachable!()
+        }
+
+        DataType::RunEndEncoded(_, _) => downcast_run_array! {
+            array => {
+                NullableEncoder::new(
+                    Box::new(RunEndEncodedEncoder::try_new(field, array, options)?),
+                    array.logical_nulls(),
+                )
             },
             _ => unreachable!()
         }
@@ -390,8 +440,14 @@ pub fn make_encoder<'a>(
             let array = array.as_struct();
             let encoders = fields.iter().zip(array.columns()).map(|(field, array)| {
                 let encoder = make_encoder(field, array, options)?;
-                Ok(FieldEncoder{
-                    field: field.clone(),
+
+                // For typical ASCII names, this will be the exact length (includes 2x quotes, 1x colon).
+                let mut field_name = Vec::with_capacity(field.name().len() + 3);
+                encode_string(field.name(), &mut field_name);
+                field_name.push(b':');
+
+                Ok(FieldEncoder {
+                    field_name,
                     encoder,
                 })
             }).collect::<Result<Vec<_>, ArrowError>>()?;
@@ -440,12 +496,21 @@ fn encode_string(s: &str, out: &mut Vec<u8>) {
     serializer.serialize_str(s).unwrap();
 }
 
+fn encode_binary(bytes: &[u8], out: &mut Vec<u8>) {
+    out.push(b'"');
+    for byte in bytes {
+        write!(out, "{byte:02x}").unwrap();
+    }
+    out.push(b'"');
+}
+
 struct FieldEncoder<'a> {
-    field: FieldRef,
+    field_name: Vec<u8>,
     encoder: NullableEncoder<'a>,
 }
 
 impl FieldEncoder<'_> {
+    #[inline]
     fn is_null(&self, idx: usize) -> bool {
         self.encoder.is_null(idx)
     }
@@ -467,7 +532,7 @@ impl Encoder for StructArrayEncoder<'_> {
         // Nulls can only be dropped in explicit mode
         let drop_nulls = (self.struct_mode == StructMode::ObjectOnly) && !self.explicit_nulls;
 
-        for field_encoder in self.encoders.iter_mut() {
+        for field_encoder in &mut self.encoders {
             let is_null = field_encoder.is_null(idx);
             if is_null && drop_nulls {
                 continue;
@@ -479,8 +544,7 @@ impl Encoder for StructArrayEncoder<'_> {
             is_first = false;
 
             if self.struct_mode == StructMode::ObjectOnly {
-                encode_string(field_encoder.field.name(), out);
-                out.push(b':');
+                out.extend_from_slice(&field_encoder.field_name);
             }
 
             if is_null {
@@ -609,77 +673,38 @@ impl Encoder for StringViewEncoder<'_> {
     }
 }
 
-struct ListEncoder<'a, O: OffsetSizeTrait> {
-    offsets: OffsetBuffer<O>,
+struct BinaryViewEncoder<'a>(&'a BinaryViewArray);
+
+impl Encoder for BinaryViewEncoder<'_> {
+    fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
+        encode_binary(self.0.value(idx), out);
+    }
+}
+
+struct ListLikeEncoder<'a, L: ListLikeArray> {
+    list_array: &'a L,
     encoder: NullableEncoder<'a>,
 }
 
-impl<'a, O: OffsetSizeTrait> ListEncoder<'a, O> {
+impl<'a, L: ListLikeArray> ListLikeEncoder<'a, L> {
     fn try_new(
         field: &'a FieldRef,
-        array: &'a GenericListArray<O>,
+        array: &'a L,
         options: &'a EncoderOptions,
     ) -> Result<Self, ArrowError> {
         let encoder = make_encoder(field, array.values().as_ref(), options)?;
         Ok(Self {
-            offsets: array.offsets().clone(),
+            list_array: array,
             encoder,
         })
     }
 }
 
-impl<O: OffsetSizeTrait> Encoder for ListEncoder<'_, O> {
+impl<L: ListLikeArray> Encoder for ListLikeEncoder<'_, L> {
     fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
-        let end = self.offsets[idx + 1].as_usize();
-        let start = self.offsets[idx].as_usize();
-        out.push(b'[');
-
-        if self.encoder.has_nulls() {
-            for idx in start..end {
-                if idx != start {
-                    out.push(b',')
-                }
-                if self.encoder.is_null(idx) {
-                    out.extend_from_slice(b"null");
-                } else {
-                    self.encoder.encode(idx, out);
-                }
-            }
-        } else {
-            for idx in start..end {
-                if idx != start {
-                    out.push(b',')
-                }
-                self.encoder.encode(idx, out);
-            }
-        }
-        out.push(b']');
-    }
-}
-
-struct FixedSizeListEncoder<'a> {
-    value_length: usize,
-    encoder: NullableEncoder<'a>,
-}
-
-impl<'a> FixedSizeListEncoder<'a> {
-    fn try_new(
-        field: &'a FieldRef,
-        array: &'a FixedSizeListArray,
-        options: &'a EncoderOptions,
-    ) -> Result<Self, ArrowError> {
-        let encoder = make_encoder(field, array.values().as_ref(), options)?;
-        Ok(Self {
-            encoder,
-            value_length: array.value_length().as_usize(),
-        })
-    }
-}
-
-impl Encoder for FixedSizeListEncoder<'_> {
-    fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
-        let start = idx * self.value_length;
-        let end = start + self.value_length;
+        let range = self.list_array.element_range(idx);
+        let start = range.start;
+        let end = range.end;
         out.push(b'[');
         if self.encoder.has_nulls() {
             for idx in start..end {
@@ -727,6 +752,32 @@ impl<'a, K: ArrowDictionaryKeyType> DictionaryEncoder<'a, K> {
 impl<K: ArrowDictionaryKeyType> Encoder for DictionaryEncoder<'_, K> {
     fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
         self.encoder.encode(self.keys[idx].as_usize(), out)
+    }
+}
+
+struct RunEndEncodedEncoder<'a, R: RunEndIndexType> {
+    run_array: &'a RunArray<R>,
+    encoder: NullableEncoder<'a>,
+}
+
+impl<'a, R: RunEndIndexType> RunEndEncodedEncoder<'a, R> {
+    fn try_new(
+        field: &'a FieldRef,
+        array: &'a RunArray<R>,
+        options: &'a EncoderOptions,
+    ) -> Result<Self, ArrowError> {
+        let encoder = make_encoder(field, array.values().as_ref(), options)?;
+        Ok(Self {
+            run_array: array,
+            encoder,
+        })
+    }
+}
+
+impl<R: RunEndIndexType> Encoder for RunEndEncodedEncoder<'_, R> {
+    fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
+        let physical_idx = self.run_array.get_physical_index(idx);
+        self.encoder.encode(physical_idx, out)
     }
 }
 
@@ -784,7 +835,10 @@ impl<'a> MapEncoder<'a> {
         let values = array.values();
         let keys = array.keys();
 
-        if !matches!(keys.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
+        if !matches!(
+            keys.data_type(),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        ) {
             return Err(ArrowError::JsonError(format!(
                 "Only UTF8 keys supported by JSON MapArray Writer: got {:?}",
                 keys.data_type()

@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Tests for the `parquet_derive` procedural macros.
+
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/apache/parquet-format/25f05e73d8cd7f5c83532ce51cb4f4de8ba5f2a2/logo/parquet-logos_1.svg",
     html_favicon_url = "https://raw.githubusercontent.com/apache/parquet-format/25f05e73d8cd7f5c83532ce51cb4f4de8ba5f2a2/logo/parquet-logos_1.svg"
@@ -23,15 +25,22 @@
 #![allow(clippy::approx_constant)]
 
 use parquet_derive::{ParquetRecordReader, ParquetRecordWriter};
+use std::sync::Arc;
 
 #[derive(ParquetRecordWriter)]
+#[expect(
+    clippy::ref_option_ref,
+    reason = "the point of this struct is to cover every field type the derive supports, including `&Option<&T>`"
+)]
 struct ACompleteRecord<'a> {
     pub a_bool: bool,
     pub a_str: &'a str,
     pub a_string: String,
     pub a_borrowed_string: &'a String,
+    pub a_arc_str: Arc<str>,
     pub maybe_a_str: Option<&'a str>,
     pub maybe_a_string: Option<String>,
+    pub maybe_a_arc_str: Option<Arc<str>>,
     pub i16: i16,
     pub i32: i32,
     pub u64: u64,
@@ -106,6 +115,15 @@ struct APrunedRecord {
     pub isize: isize,
 }
 
+// This struct has a field declared with a raw identifier,
+// which maps to a parquet column named without the `r#` prefix
+// (e.g. a column named `type`, as written by other tools)
+#[derive(PartialEq, ParquetRecordWriter, ParquetRecordReader, Debug)]
+struct ARecordWithRawIdentifiers {
+    pub r#type: i32,
+    pub count: i32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,8 +148,10 @@ mod tests {
             REQUIRED BINARY          a_str (STRING);
             REQUIRED BINARY          a_string (STRING);
             REQUIRED BINARY          a_borrowed_string (STRING);
+            REQUIRED BINARY          a_arc_str (STRING);
             OPTIONAL BINARY          maybe_a_str (STRING);
             OPTIONAL BINARY          maybe_a_string (STRING);
+            OPTIONAL BINARY          maybe_a_arc_str (STRING);
             REQUIRED INT32           i16 (INTEGER(16,true));
             REQUIRED INT32           i32;
             REQUIRED INT64           u64 (INTEGER(64,false));
@@ -159,8 +179,10 @@ mod tests {
 
         let a_str = "hello mother".to_owned();
         let a_borrowed_string = "cool news".to_owned();
+        let a_arc_str: Arc<str> = "hello arc".into();
         let maybe_a_string = Some("it's true, I'm a string".to_owned());
         let maybe_a_str = Some(&a_str[..]);
+        let maybe_a_arc_str = Some(a_arc_str.clone());
         let borrowed_byte_vec = vec![0x68, 0x69, 0x70];
         let borrowed_maybe_byte_vec = Some(vec![0x71, 0x72]);
         let borrowed_maybe_borrowed_byte_vec = Some(&borrowed_byte_vec[..]);
@@ -170,8 +192,10 @@ mod tests {
             a_str: &a_str[..],
             a_string: "hello father".into(),
             a_borrowed_string: &a_borrowed_string,
+            a_arc_str,
             maybe_a_str: Some(&a_str[..]),
             maybe_a_string: Some(a_str.clone()),
+            maybe_a_arc_str,
             i16: -45,
             i32: 456,
             u64: 4563424,
@@ -348,6 +372,46 @@ mod tests {
     }
 
     #[test]
+    fn test_parquet_derive_raw_identifiers() {
+        let file = get_temp_file("test_parquet_derive_raw_identifiers", &[]);
+        let drs = vec![ARecordWithRawIdentifiers {
+            r#type: 456,
+            count: 123,
+        }];
+
+        let generated_schema = drs.as_slice().schema().unwrap();
+
+        // raw identifiers are written without the `r#` prefix,
+        // while normal identifiers are unchanged
+        assert_eq!(
+            vec!["type", "count"],
+            generated_schema
+                .get_fields()
+                .iter()
+                .map(|field| field.name())
+                .collect::<Vec<_>>()
+        );
+
+        let props = Default::default();
+        let mut writer =
+            SerializedFileWriter::new(file.try_clone().unwrap(), generated_schema, props).unwrap();
+
+        let mut row_group = writer.next_row_group().unwrap();
+        drs.as_slice().write_to_row_group(&mut row_group).unwrap();
+        row_group.close().unwrap();
+        writer.close().unwrap();
+
+        use parquet::file::{reader::FileReader, serialized_reader::SerializedFileReader};
+        let reader = SerializedFileReader::new(file).unwrap();
+        let mut out: Vec<ARecordWithRawIdentifiers> = Vec::new();
+
+        let mut row_group = reader.get_row_group(0).unwrap();
+        out.read_from_row_group(&mut *row_group, 1).unwrap();
+
+        assert_eq!(drs, out);
+    }
+
+    #[test]
     fn test_aliased_result() {
         // Issue 7547, Where aliasing the `Result` led to
         // a collision with the macro internals of derive ParquetRecordReader
@@ -388,12 +452,9 @@ mod tests {
     /// Returns file handle for a temp file in 'target' directory with a provided content
     pub fn get_temp_file(file_name: &str, content: &[u8]) -> fs::File {
         // build tmp path to a file in "target/debug/testdata"
-        let mut path_buf = env::current_dir().unwrap();
-        path_buf.push("target");
-        path_buf.push("debug");
-        path_buf.push("testdata");
-        fs::create_dir_all(&path_buf).unwrap();
-        path_buf.push(file_name);
+        let dir = env::current_dir().unwrap().join("target/debug/testdata");
+        fs::create_dir_all(&dir).unwrap();
+        let path_buf = dir.join(file_name);
 
         // write file content
         let mut tmp_file = fs::File::create(path_buf.as_path()).unwrap();

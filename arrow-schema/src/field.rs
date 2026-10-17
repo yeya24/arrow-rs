@@ -17,7 +17,6 @@
 
 use crate::error::ArrowError;
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -26,7 +25,7 @@ use crate::datatype::DataType;
 use crate::extension::CanonicalExtensionType;
 use crate::schema::SchemaBuilder;
 use crate::{
-    Fields, UnionFields, UnionMode,
+    Fields, Metadata, UnionFields, UnionMode,
     extension::{EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_KEY, ExtensionType},
 };
 
@@ -57,7 +56,7 @@ pub struct Field {
     dict_id: i64,
     dict_is_ordered: bool,
     /// A map of key-value pairs containing additional custom meta data.
-    metadata: HashMap<String, String>,
+    metadata: Metadata,
 }
 
 impl std::fmt::Debug for Field {
@@ -128,31 +127,7 @@ impl Ord for Field {
             .cmp(other.name())
             .then_with(|| self.data_type.cmp(other.data_type()))
             .then_with(|| self.nullable.cmp(&other.nullable))
-            .then_with(|| {
-                // ensure deterministic key order
-                let mut keys: Vec<&String> =
-                    self.metadata.keys().chain(other.metadata.keys()).collect();
-                keys.sort();
-                for k in keys {
-                    match (self.metadata.get(k), other.metadata.get(k)) {
-                        (None, None) => {}
-                        (Some(_), None) => {
-                            return Ordering::Less;
-                        }
-                        (None, Some(_)) => {
-                            return Ordering::Greater;
-                        }
-                        (Some(v1), Some(v2)) => match v1.cmp(v2) {
-                            Ordering::Equal => {}
-                            other => {
-                                return other;
-                            }
-                        },
-                    }
-                }
-
-                Ordering::Equal
-            })
+            .then_with(|| self.metadata.cmp(&other.metadata))
     }
 }
 
@@ -161,14 +136,8 @@ impl Hash for Field {
         self.name.hash(state);
         self.data_type.hash(state);
         self.nullable.hash(state);
-
-        // ensure deterministic key order
-        let mut keys: Vec<&String> = self.metadata.keys().collect();
-        keys.sort();
-        for k in keys {
-            k.hash(state);
-            self.metadata.get(k).expect("key valid").hash(state);
-        }
+        // `Metadata` iterates in deterministic (sorted) key order
+        self.metadata.hash(state);
     }
 }
 
@@ -181,6 +150,26 @@ impl AsRef<Field> for Field {
 impl Field {
     /// Default list member field name
     pub const LIST_FIELD_DEFAULT_NAME: &'static str = "item";
+    /// Default field name for the entries field for Map
+    ///
+    /// See [Arrow Spec](https://github.com/apache/arrow/blob/b19c4761b558ade94ae05743062d92aacedef10e/format/Schema.fbs#L127-L138))
+    pub const MAP_ENTRIES_FIELD_DEFAULT_NAME: &'static str = "entries";
+    /// Default field name for the key field for Map
+    ///
+    /// See [Arrow Spec](https://github.com/apache/arrow/blob/b19c4761b558ade94ae05743062d92aacedef10e/format/Schema.fbs#L127-L138))
+    pub const MAP_KEY_FIELD_DEFAULT_NAME: &'static str = "key";
+    /// Default field name for the value field for Map
+    ///
+    /// See [Arrow Spec](https://github.com/apache/arrow/blob/b19c4761b558ade94ae05743062d92aacedef10e/format/Schema.fbs#L127-L138))
+    pub const MAP_VALUE_FIELD_DEFAULT_NAME: &'static str = "value";
+    /// Default field name for the run-ends field for RunEndEncoded
+    ///
+    /// See [Arrow Spec](https://arrow.apache.org/docs/format/Columnar.html#run-end-encoded-layout)
+    pub const REE_RUN_ENDS_FIELD_DEFAULT_NAME: &'static str = "run_ends";
+    /// Default field name for the values field for RunEndEncoded
+    ///
+    /// See [Arrow Spec](https://arrow.apache.org/docs/format/Columnar.html#run-end-encoded-layout)
+    pub const REE_VALUES_FIELD_DEFAULT_NAME: &'static str = "values";
 
     /// Creates a new field with the given name, data type, and nullability
     ///
@@ -190,14 +179,14 @@ impl Field {
     /// Field::new("field_name", DataType::Int32, true);
     /// ```
     pub fn new(name: impl Into<String>, data_type: DataType, nullable: bool) -> Self {
-        #[allow(deprecated)]
+        #[expect(deprecated)]
         Field {
             name: name.into(),
             data_type,
             nullable,
             dict_id: 0,
             dict_is_ordered: false,
-            metadata: HashMap::default(),
+            metadata: Default::default(),
         }
     }
 
@@ -231,14 +220,14 @@ impl Field {
         dict_id: i64,
         dict_is_ordered: bool,
     ) -> Self {
-        #[allow(deprecated)]
+        #[expect(deprecated)]
         Field {
             name: name.into(),
             data_type,
             nullable,
             dict_id,
             dict_is_ordered,
-            metadata: HashMap::default(),
+            metadata: Default::default(),
         }
     }
 
@@ -342,6 +331,13 @@ impl Field {
     /// - `type_ids`: the union type ids
     /// - `fields`: the union fields
     /// - `mode`: the union mode
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - any type ID is negative
+    /// - type IDs contain duplicates
+    /// - the number of type IDs does not equal the number of fields
     pub fn new_union<S, F, T>(name: S, type_ids: T, fields: F, mode: UnionMode) -> Self
     where
         S: Into<String>,
@@ -351,32 +347,35 @@ impl Field {
     {
         Self::new(
             name,
-            DataType::Union(UnionFields::new(type_ids, fields), mode),
+            DataType::Union(
+                UnionFields::try_new(type_ids, fields).expect("Invalid UnionField"),
+                mode,
+            ),
             false, // Unions cannot be nullable
         )
     }
 
     /// Sets the `Field`'s optional custom metadata.
     #[inline]
-    pub fn set_metadata(&mut self, metadata: HashMap<String, String>) {
-        self.metadata = metadata;
+    pub fn set_metadata(&mut self, metadata: impl Into<Metadata>) {
+        self.metadata = metadata.into();
     }
 
     /// Sets the metadata of this `Field` to be `metadata` and returns self
-    pub fn with_metadata(mut self, metadata: HashMap<String, String>) -> Self {
+    pub fn with_metadata(mut self, metadata: impl Into<Metadata>) -> Self {
         self.set_metadata(metadata);
         self
     }
 
     /// Returns the immutable reference to the `Field`'s optional custom metadata.
     #[inline]
-    pub const fn metadata(&self) -> &HashMap<String, String> {
+    pub const fn metadata(&self) -> &Metadata {
         &self.metadata
     }
 
     /// Returns a mutable reference to the `Field`'s optional custom metadata.
     #[inline]
-    pub fn metadata_mut(&mut self) -> &mut HashMap<String, String> {
+    pub fn metadata_mut(&mut self) -> &mut Metadata {
         &mut self.metadata
     }
 
@@ -454,11 +453,8 @@ impl Field {
     /// let field = Field::new("", DataType::Null, false);
     /// assert_eq!(field.extension_type_name(), None);
     ///
-    /// let field = Field::new("", DataType::Null, false).with_metadata(
-    ///    [(EXTENSION_TYPE_NAME_KEY.to_owned(), "example".to_owned())]
-    ///        .into_iter()
-    ///        .collect(),
-    /// );
+    /// let field = Field::new("", DataType::Null, false)
+    ///     .with_metadata([(EXTENSION_TYPE_NAME_KEY, "example")]);
     /// assert_eq!(field.extension_type_name(), Some("example"));
     /// ```
     pub fn extension_type_name(&self) -> Option<&str> {
@@ -481,11 +477,8 @@ impl Field {
     /// let field = Field::new("", DataType::Null, false);
     /// assert_eq!(field.extension_type_metadata(), None);
     ///
-    /// let field = Field::new("", DataType::Null, false).with_metadata(
-    ///    [(EXTENSION_TYPE_METADATA_KEY.to_owned(), "example".to_owned())]
-    ///        .into_iter()
-    ///        .collect(),
-    /// );
+    /// let field = Field::new("", DataType::Null, false)
+    ///     .with_metadata([(EXTENSION_TYPE_METADATA_KEY, "example")]);
     /// assert_eq!(field.extension_type_metadata(), Some("example"));
     /// ```
     pub fn extension_type_metadata(&self) -> Option<&str> {
@@ -494,13 +487,39 @@ impl Field {
             .map(String::as_ref)
     }
 
+    /// Returns `true` if this [`Field`] has the given [`ExtensionType`] name
+    /// and can be successfully validated as that extension type.
+    ///
+    /// This first checks the extension type name and only calls
+    /// [`ExtensionType::validate`] when the name matches.
+    ///
+    /// This is useful when you only need a boolean validity check and do not
+    /// need to retrieve the extension type instance.
+    #[inline]
+    pub fn has_valid_extension_type<E: ExtensionType>(&self) -> bool {
+        if self.extension_type_name() != Some(E::NAME) {
+            return false;
+        }
+
+        let ext_metadata = self
+            .metadata()
+            .get(EXTENSION_TYPE_METADATA_KEY)
+            .map(|s| s.as_str());
+
+        E::deserialize_metadata(ext_metadata)
+            .and_then(|metadata| E::validate(self.data_type(), metadata))
+            .is_ok()
+    }
+
     /// Returns an instance of the given [`ExtensionType`] of this [`Field`],
     /// if set in the [`Field::metadata`].
     ///
     /// Note that using `try_extension_type` with an extension type that does
     /// not match the name in the metadata will return an `ArrowError` which can
     /// be slow due to string allocations. If you only want to check if a
-    /// [`Field`] has a specific [`ExtensionType`], see the example below.
+    /// [`Field`] has a specific [`ExtensionType`], first check
+    /// [`Field::extension_type_name`], or use [`Field::has_valid_extension_type`]
+    /// to also validate metadata and data type.
     ///
     /// # Errors
     ///
@@ -514,7 +533,7 @@ impl Field {
     ///   fail (for example when the [`Field::data_type`] is not supported by
     ///   the extension type ([`ExtensionType::supports_data_type`]))
     ///
-    /// # Examples: Check and retrieve an extension type
+    /// # Example: Check and retrieve an extension type
     /// You can use this to check if a [`Field`] has a specific
     /// [`ExtensionType`] and retrieve it:
     /// ```
@@ -536,60 +555,14 @@ impl Field {
     ///   // do something with extension_type
     /// }
     /// ```
-    ///
-    /// # Example: Checking if a field has a specific extension type first
-    ///
-    /// Since `try_extension_type` returns an error, it is more
-    /// efficient to first check if the name matches before calling
-    /// `try_extension_type`:
-    /// ```
-    /// # use arrow_schema::{DataType, Field, ArrowError};
-    /// # use arrow_schema::extension::ExtensionType;
-    /// # struct MyExtensionType;
-    /// # impl ExtensionType for MyExtensionType {
-    /// # const NAME: &'static str = "my_extension";
-    /// # type Metadata = String;
-    /// # fn supports_data_type(&self, data_type: &DataType) -> Result<(), ArrowError> { Ok(()) }
-    /// # fn try_new(data_type: &DataType, metadata: Self::Metadata) -> Result<Self, ArrowError> { Ok(Self) }
-    /// # fn serialize_metadata(&self) -> Option<String> { unimplemented!() }
-    /// # fn deserialize_metadata(s: Option<&str>) -> Result<Self::Metadata, ArrowError> { unimplemented!() }
-    /// # fn metadata(&self) -> &<Self as ExtensionType>::Metadata { todo!() }
-    /// # }
-    /// # fn get_field() -> Field { Field::new("field", DataType::Null, false) }
-    /// let field = get_field();
-    /// // First check if the name matches before calling the potentially expensive `try_extension_type`
-    /// if field.extension_type_name() == Some(MyExtensionType::NAME) {
-    ///   if let Ok(extension_type) = field.try_extension_type::<MyExtensionType>() {
-    ///     // do something with extension_type
-    ///   }
-    /// }
-    /// ```
     pub fn try_extension_type<E: ExtensionType>(&self) -> Result<E, ArrowError> {
-        // Check the extension name in the metadata
-        match self.extension_type_name() {
-            // It should match the name of the given extension type
-            Some(name) if name == E::NAME => {
-                // Deserialize the metadata and try to construct the extension
-                // type
-                E::deserialize_metadata(self.extension_type_metadata())
-                    .and_then(|metadata| E::try_new(self.data_type(), metadata))
-            }
-            // Name mismatch
-            Some(name) => Err(ArrowError::InvalidArgumentError(format!(
-                "Field extension type name mismatch, expected {}, found {name}",
-                E::NAME
-            ))),
-            // Name missing
-            None => Err(ArrowError::InvalidArgumentError(
-                "Field extension type name missing".to_owned(),
-            )),
-        }
+        E::try_new_from_field_metadata(self.data_type(), self.metadata())
     }
 
     /// Returns an instance of the given [`ExtensionType`] of this [`Field`],
     /// panics if this [`Field`] does not have this extension type.
     ///
-    /// # Panic
+    /// # Panics
     ///
     /// This calls [`Field::try_extension_type`] and panics when it returns an
     /// error.
@@ -708,6 +681,8 @@ impl Field {
             DataType::Union(fields, _) => fields.iter().flat_map(|(_, f)| f.fields()).collect(),
             DataType::List(field)
             | DataType::LargeList(field)
+            | DataType::ListView(field)
+            | DataType::LargeListView(field)
             | DataType::FixedSizeList(field, _)
             | DataType::Map(field, _) => field.fields(),
             DataType::Dictionary(_, value_field) => Field::_fields(value_field.as_ref()),
@@ -727,7 +702,7 @@ impl Field {
         self.fields()
             .into_iter()
             .filter(|&field| {
-                #[allow(deprecated)]
+                #[expect(deprecated)]
                 let matching_dict_id = field.dict_id == id;
                 matches!(field.data_type(), DataType::Dictionary(_, _)) && matching_dict_id
             })
@@ -742,7 +717,7 @@ impl Field {
     )]
     pub const fn dict_id(&self) -> Option<i64> {
         match self.data_type {
-            #[allow(deprecated)]
+            #[expect(deprecated)]
             DataType::Dictionary(_, _) => Some(self.dict_id),
             _ => None,
         }
@@ -778,7 +753,7 @@ impl Field {
     pub fn with_dict_is_ordered(mut self, dict_is_ordered: bool) -> Self {
         if matches!(self.data_type, DataType::Dictionary(_, _)) {
             self.dict_is_ordered = dict_is_ordered;
-        };
+        }
         self
     }
 
@@ -836,6 +811,9 @@ impl Field {
                         .try_for_each(|f| builder.try_merge(f))?;
                     *nested_fields = builder.finish().fields;
                 }
+                DataType::Null => {
+                    self.nullable = true;
+                }
                 _ => {
                     return Err(ArrowError::SchemaError(format!(
                         "Fail to merge schema field '{}' because the from data_type = {} is not DataType::Struct",
@@ -846,6 +824,9 @@ impl Field {
             DataType::Union(nested_fields, _) => match &from.data_type {
                 DataType::Union(from_nested_fields, _) => {
                     nested_fields.try_merge(from_nested_fields)?
+                }
+                DataType::Null => {
+                    self.nullable = true;
                 }
                 _ => {
                     return Err(ArrowError::SchemaError(format!(
@@ -860,6 +841,9 @@ impl Field {
                     f.try_merge(from_field)?;
                     (*field) = Arc::new(f);
                 }
+                DataType::Null => {
+                    self.nullable = true;
+                }
                 _ => {
                     return Err(ArrowError::SchemaError(format!(
                         "Fail to merge schema field '{}' because the from data_type = {} is not DataType::List",
@@ -872,6 +856,9 @@ impl Field {
                     let mut f = (**field).clone();
                     f.try_merge(from_field)?;
                     (*field) = Arc::new(f);
+                }
+                DataType::Null => {
+                    self.nullable = true;
                 }
                 _ => {
                     return Err(ArrowError::SchemaError(format!(
@@ -948,7 +935,7 @@ impl Field {
         && (self.nullable || !other.nullable)
         // make sure self.metadata is a superset of other.metadata
         && other.metadata.iter().all(|(k, v1)| {
-            self.metadata.get(k).map(|v2| v1 == v2).unwrap_or_default()
+            self.metadata.get(k).is_some_and(|v2| v1 == v2)
         })
     }
 
@@ -959,7 +946,7 @@ impl Field {
         std::mem::size_of_val(self) - std::mem::size_of_val(&self.data_type)
             + self.data_type.size()
             + self.name.capacity()
-            + (std::mem::size_of::<(String, String)>() * self.metadata.capacity())
+            + (std::mem::size_of::<(String, String)>() * self.metadata.len())
             + self
                 .metadata
                 .iter()
@@ -1005,7 +992,63 @@ impl std::fmt::Display for Field {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::collections::HashMap;
     use std::collections::hash_map::DefaultHasher;
+
+    #[derive(Debug, Clone, Copy)]
+    struct TestExtensionType;
+
+    impl ExtensionType for TestExtensionType {
+        const NAME: &'static str = "test.extension";
+        type Metadata = ();
+
+        fn metadata(&self) -> &Self::Metadata {
+            &()
+        }
+
+        fn serialize_metadata(&self) -> Option<String> {
+            None
+        }
+
+        fn deserialize_metadata(metadata: Option<&str>) -> Result<Self::Metadata, ArrowError> {
+            metadata.map_or(Ok(()), |_| {
+                Err(ArrowError::InvalidArgumentError(
+                    "TestExtensionType expects no metadata".to_owned(),
+                ))
+            })
+        }
+
+        fn supports_data_type(&self, _data_type: &DataType) -> Result<(), ArrowError> {
+            Ok(())
+        }
+
+        fn try_new(_data_type: &DataType, _metadata: Self::Metadata) -> Result<Self, ArrowError> {
+            Ok(Self)
+        }
+    }
+
+    #[test]
+    fn test_has_valid_extension_type() {
+        let no_extension = Field::new("f", DataType::Null, false);
+        assert!(!no_extension.has_valid_extension_type::<TestExtensionType>());
+
+        let matching_name = Field::new("f", DataType::Null, false)
+            .with_metadata([(EXTENSION_TYPE_NAME_KEY, TestExtensionType::NAME)]);
+        assert!(matching_name.has_valid_extension_type::<TestExtensionType>());
+
+        let matching_name_with_invalid_metadata = Field::new("f", DataType::Null, false)
+            .with_metadata([
+                (EXTENSION_TYPE_NAME_KEY, TestExtensionType::NAME),
+                (EXTENSION_TYPE_METADATA_KEY, "invalid"),
+            ]);
+        assert!(
+            !matching_name_with_invalid_metadata.has_valid_extension_type::<TestExtensionType>()
+        );
+
+        let different_name = Field::new("f", DataType::Null, false)
+            .with_metadata([(EXTENSION_TYPE_NAME_KEY, "some.other_extension")]);
+        assert!(!different_name.has_valid_extension_type::<TestExtensionType>());
+    }
 
     #[test]
     fn test_new_with_string() {
@@ -1018,12 +1061,12 @@ mod test {
     fn test_new_dict_with_string() {
         // Fields should allow owned Strings to support reuse
         let s = "c1";
-        #[allow(deprecated)]
+        #[expect(deprecated)]
         Field::new_dict(s, DataType::Int64, false, 4, false);
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)] // Can't handle the inlined strings of the assert_debug_snapshot macro
+    #[cfg_attr(miri, ignore)] // fork is not supported
     fn test_debug_format_field() {
         // Make sure the `Debug` formatting of `Field` is readable and not too long
         insta::assert_debug_snapshot!(Field::new("item", DataType::UInt8, false), @r"
@@ -1157,7 +1200,7 @@ mod test {
 
     #[test]
     fn test_fields_with_dict_id() {
-        #[allow(deprecated)]
+        #[expect(deprecated)]
         let dict1 = Field::new_dict(
             "dict1",
             DataType::Dictionary(DataType::Utf8.into(), DataType::Int32.into()),
@@ -1165,7 +1208,7 @@ mod test {
             10,
             false,
         );
-        #[allow(deprecated)]
+        #[expect(deprecated)]
         let dict2 = Field::new_dict(
             "dict2",
             DataType::Dictionary(DataType::Int32.into(), DataType::Int8.into()),
@@ -1202,11 +1245,11 @@ mod test {
             false,
         );
 
-        #[allow(deprecated)]
+        #[expect(deprecated)]
         for field in field.fields_with_dict_id(10) {
             assert_eq!(dict1, *field);
         }
-        #[allow(deprecated)]
+        #[expect(deprecated)]
         for field in field.fields_with_dict_id(20) {
             assert_eq!(dict2, *field);
         }
@@ -1221,7 +1264,7 @@ mod test {
     #[test]
     fn test_field_comparison_case() {
         // dictionary-encoding properties not used for field comparison
-        #[allow(deprecated)]
+        #[expect(deprecated)]
         let dict1 = Field::new_dict(
             "dict1",
             DataType::Dictionary(DataType::Utf8.into(), DataType::Int32.into()),
@@ -1229,7 +1272,7 @@ mod test {
             10,
             false,
         );
-        #[allow(deprecated)]
+        #[expect(deprecated)]
         let dict2 = Field::new_dict(
             "dict1",
             DataType::Dictionary(DataType::Utf8.into(), DataType::Int32.into()),
@@ -1241,7 +1284,7 @@ mod test {
         assert_eq!(dict1, dict2);
         assert_eq!(get_field_hash(&dict1), get_field_hash(&dict2));
 
-        #[allow(deprecated)]
+        #[expect(deprecated)]
         let dict1 = Field::new_dict(
             "dict0",
             DataType::Dictionary(DataType::Utf8.into(), DataType::Int32.into()),
@@ -1373,13 +1416,14 @@ mod test {
         let field1 = Field::new(
             "field1",
             DataType::Union(
-                UnionFields::new(
+                UnionFields::try_new(
                     vec![1, 2],
                     vec![
                         Field::new("field1", DataType::UInt8, true),
                         Field::new("field3", DataType::Utf8, false),
                     ],
-                ),
+                )
+                .unwrap(),
                 UnionMode::Dense,
             ),
             true,
@@ -1387,13 +1431,14 @@ mod test {
         let field2 = Field::new(
             "field1",
             DataType::Union(
-                UnionFields::new(
+                UnionFields::try_new(
                     vec![1, 3],
                     vec![
                         Field::new("field1", DataType::UInt8, false),
                         Field::new("field3", DataType::Utf8, false),
                     ],
-                ),
+                )
+                .unwrap(),
                 UnionMode::Dense,
             ),
             true,
@@ -1404,13 +1449,14 @@ mod test {
         let field1 = Field::new(
             "field1",
             DataType::Union(
-                UnionFields::new(
+                UnionFields::try_new(
                     vec![1, 2],
                     vec![
                         Field::new("field1", DataType::UInt8, true),
                         Field::new("field3", DataType::Utf8, false),
                     ],
-                ),
+                )
+                .unwrap(),
                 UnionMode::Dense,
             ),
             true,
@@ -1418,13 +1464,14 @@ mod test {
         let field2 = Field::new(
             "field1",
             DataType::Union(
-                UnionFields::new(
+                UnionFields::try_new(
                     vec![1, 2],
                     vec![
                         Field::new("field1", DataType::UInt8, false),
                         Field::new("field3", DataType::Utf8, false),
                     ],
-                ),
+                )
+                .unwrap(),
                 UnionMode::Dense,
             ),
             true,
@@ -1434,10 +1481,8 @@ mod test {
 
     #[cfg(feature = "serde")]
     fn assert_binary_serde_round_trip(field: Field) {
-        let config = bincode::config::legacy();
-        let serialized = bincode::serde::encode_to_vec(&field, config).unwrap();
-        let (deserialized, _): (Field, _) =
-            bincode::serde::decode_from_slice(&serialized, config).unwrap();
+        let serialized = postcard::to_stdvec(&field).unwrap();
+        let deserialized: Field = postcard::from_bytes(&serialized).unwrap();
         assert_eq!(field, deserialized)
     }
 
@@ -1460,9 +1505,63 @@ mod test {
     #[test]
     fn test_field_with_nonempty_metadata_serde() {
         let mut metadata = HashMap::new();
-        metadata.insert("hi".to_owned(), "".to_owned());
+        metadata.insert("hi".to_owned(), String::new());
         let field = Field::new("name", DataType::Boolean, false).with_metadata(metadata);
 
         assert_binary_serde_round_trip(field)
+    }
+
+    #[test]
+    fn test_merge_compound_with_null() {
+        // Struct + Null
+        let mut field = Field::new(
+            "s",
+            DataType::Struct(Fields::from(vec![Field::new("a", DataType::Int32, false)])),
+            false,
+        );
+        field
+            .try_merge(&Field::new("s", DataType::Null, true))
+            .expect("Struct should merge with Null");
+        assert!(field.is_nullable());
+        assert!(matches!(field.data_type(), DataType::Struct(_)));
+
+        // List + Null
+        let mut field = Field::new(
+            "l",
+            DataType::List(Field::new("item", DataType::Utf8, false).into()),
+            false,
+        );
+        field
+            .try_merge(&Field::new("l", DataType::Null, true))
+            .expect("List should merge with Null");
+        assert!(field.is_nullable());
+        assert!(matches!(field.data_type(), DataType::List(_)));
+
+        // LargeList + Null
+        let mut field = Field::new(
+            "ll",
+            DataType::LargeList(Field::new("item", DataType::Utf8, false).into()),
+            false,
+        );
+        field
+            .try_merge(&Field::new("ll", DataType::Null, true))
+            .expect("LargeList should merge with Null");
+        assert!(field.is_nullable());
+        assert!(matches!(field.data_type(), DataType::LargeList(_)));
+
+        // Union + Null
+        let mut field = Field::new(
+            "u",
+            DataType::Union(
+                UnionFields::try_new(vec![0], vec![Field::new("f", DataType::Int32, false)])
+                    .unwrap(),
+                UnionMode::Dense,
+            ),
+            false,
+        );
+        field
+            .try_merge(&Field::new("u", DataType::Null, true))
+            .expect("Union should merge with Null");
+        assert!(matches!(field.data_type(), DataType::Union(_, _)));
     }
 }

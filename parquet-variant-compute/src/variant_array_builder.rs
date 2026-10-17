@@ -18,7 +18,9 @@
 //! [`VariantArrayBuilder`] implementation
 
 use crate::VariantArray;
-use arrow::array::{ArrayRef, BinaryViewArray, BinaryViewBuilder, NullBufferBuilder, StructArray};
+use arrow::array::builder::make_view;
+use arrow::array::{ArrayRef, BinaryViewArray, NullBufferBuilder, StructArray};
+use arrow::buffer::Buffer;
 use arrow_schema::{ArrowError, DataType, Field, Fields};
 use parquet_variant::{
     BuilderSpecificState, ListBuilder, MetadataBuilder, ObjectBuilder, Variant, VariantBuilderExt,
@@ -37,6 +39,14 @@ use std::sync::Arc;
 /// This builder always creates a `VariantArray` using [`BinaryViewArray`] for both
 /// the metadata and value fields.
 ///
+/// `VariantArrayBuilder` implements [`VariantBuilderExt`], so you append values
+/// and nested objects or lists the same way as when building a single
+/// [`Variant`] value with [`VariantBuilder`], rather than constructing a
+/// `VariantBuilder` per row.
+///
+/// [`VariantBuilder`]: parquet_variant::VariantBuilder
+/// [`VariantBuilderExt`]: parquet_variant::VariantBuilderExt
+///
 /// # TODO
 /// 1. Support shredding: <https://github.com/apache/arrow-rs/issues/7895>
 ///
@@ -45,6 +55,7 @@ use std::sync::Arc;
 /// # use arrow::array::Array;
 /// # use parquet_variant::{Variant, VariantBuilder, VariantBuilderExt};
 /// # use parquet_variant_compute::VariantArrayBuilder;
+/// # use parquet_variant::ShortString;
 /// // Create a new VariantArrayBuilder with a capacity of 100 rows
 /// let mut builder = VariantArrayBuilder::new(100);
 /// // append variant values
@@ -56,9 +67,13 @@ use std::sync::Arc;
 ///   .with_field("foo", "bar")
 ///   .finish();
 ///
+/// // bulk insert a list of values
+/// // `Option::None` is a null value
+/// builder.extend([None, Some(Variant::from("norm"))]);
+///
 /// // create the final VariantArray
 /// let variant_array = builder.build();
-/// assert_eq!(variant_array.len(), 3);
+/// assert_eq!(variant_array.len(), 5);
 /// // // Access the values
 /// // row 1 is not null and is an integer
 /// assert!(!variant_array.is_null(0));
@@ -70,6 +85,12 @@ use std::sync::Arc;
 /// let value = variant_array.value(2);
 /// let obj = value.as_object().expect("expected object");
 /// assert_eq!(obj.get("foo"), Some(Variant::from("bar")));
+/// // row 3 is null
+/// assert!(variant_array.is_null(3));
+/// // row 4 is not null and is a short string
+/// assert!(!variant_array.is_null(4));
+/// let value = variant_array.value(4);
+/// assert_eq!(value, Variant::ShortString(ShortString::try_new("norm").unwrap()));
 /// ```
 #[derive(Debug)]
 pub struct VariantArrayBuilder {
@@ -145,6 +166,18 @@ impl VariantArrayBuilder {
         self.value_offsets.push(self.value_builder.offset());
     }
 
+    /// Appends `n` null rows to the builder.
+    pub fn append_nulls(&mut self, n: usize) {
+        self.nulls.append_n_nulls(n);
+        // The subfields are expected to be non-nullable according to the parquet variant spec.
+        let metadata_offset = self.metadata_builder.offset();
+        let value_offset = self.value_builder.offset();
+        self.metadata_offsets
+            .extend(std::iter::repeat_n(metadata_offset, n));
+        self.value_offsets
+            .extend(std::iter::repeat_n(value_offset, n));
+    }
+
     /// Append the [`Variant`] to the builder as the next row
     pub fn append_variant(&mut self, variant: Variant) {
         ValueBuilder::append_variant(self.parent_state(), variant);
@@ -159,6 +192,17 @@ impl VariantArrayBuilder {
         };
 
         ParentState::new(&mut self.value_builder, &mut self.metadata_builder, state)
+    }
+}
+
+impl<'m, 'v> Extend<Option<Variant<'m, 'v>>> for VariantArrayBuilder {
+    fn extend<T: IntoIterator<Item = Option<Variant<'m, 'v>>>>(&mut self, iter: T) {
+        for v in iter {
+            match v {
+                Some(v) => self.append_variant(v),
+                None => self.append_null(),
+            }
+        }
     }
 }
 
@@ -389,7 +433,7 @@ impl<'a> VariantValueArrayBuilderExt<'a> {
     }
 }
 
-impl<'a> VariantBuilderExt for VariantValueArrayBuilderExt<'a> {
+impl VariantBuilderExt for VariantValueArrayBuilderExt<'_> {
     type State<'b>
         = ValueArrayBuilderState<'b>
     where
@@ -416,36 +460,39 @@ impl<'a> VariantBuilderExt for VariantValueArrayBuilderExt<'a> {
 }
 
 fn binary_view_array_from_buffers(buffer: Vec<u8>, offsets: Vec<usize>) -> BinaryViewArray {
-    // All offsets are less than or equal to the buffer length, so we can safely cast all offsets
-    // inside the loop below, as long as the buffer length fits in u32.
-    u32::try_from(buffer.len()).expect("buffer length should fit in u32");
+    // Each builder records the current buffer length after appending a row, so offsets are
+    // monotonically increasing and bounded by the final buffer length.
+    assert!(buffer.len() < u32::MAX as usize);
 
-    let mut builder = BinaryViewBuilder::with_capacity(offsets.len());
-    let block = builder.append_block(buffer.into());
-    // TODO this can be much faster if it creates the views directly during append
-    let mut start = 0;
+    let buffer = Buffer::from(buffer);
+    let mut views = Vec::with_capacity(offsets.len());
+    let mut start = 0_usize;
     for end in offsets {
-        let end = end as u32; // Safe cast: validated max offset fits in u32 above
-        builder
-            .try_append_view(block, start, end - start)
-            .expect("Failed to append view");
+        views.push(make_view(&buffer[start..end], 0, start as u32));
         start = end;
     }
-    builder.finish()
+
+    // SAFETY: `make_view` constructs every view from an in-bounds slice of buffer 0, and there
+    // are no nulls. The buffer length check above guarantees every offset fits in a `u32`.
+    unsafe { BinaryViewArray::new_unchecked(views.into(), vec![buffer].into(), None) }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
     use arrow::array::Array;
-    use parquet_variant::Variant;
+    use parquet_variant::{ShortString, Variant};
 
     /// Test that both the metadata and value buffers are non nullable
     #[test]
     fn test_variant_array_builder_non_nullable() {
         let mut builder = VariantArrayBuilder::new(10);
-        builder.append_null(); // should not panic
-        builder.append_variant(Variant::from(42i32));
+
+        builder.extend([
+            None, // should not panic
+            Some(Variant::from(42_i32)),
+        ]);
+
         let variant_array = builder.build();
 
         assert_eq!(variant_array.len(), 2);
@@ -454,8 +501,8 @@ mod test {
         assert_eq!(variant_array.value(1), Variant::from(42i32));
 
         // the metadata and value fields of non shredded variants should not be null
-        assert!(variant_array.metadata_field().nulls().is_none());
-        assert!(variant_array.value_field().unwrap().nulls().is_none());
+        assert!(variant_array.metadata_column().nulls().is_none());
+        assert!(variant_array.value_column().nulls().is_none());
         let DataType::Struct(fields) = variant_array.data_type() else {
             panic!("Expected VariantArray to have Struct data type");
         };
@@ -498,6 +545,40 @@ mod test {
         let variant = variant_array.value(3);
         let list = variant.as_list().expect("variant to be a list");
         assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn test_variant_array_builder_append_nulls() {
+        let mut builder = VariantArrayBuilder::new(6);
+        builder.append_variant(Variant::from(1i32));
+        builder.append_nulls(0); // should be a no-op
+        builder.append_nulls(3);
+        builder.append_variant(Variant::from(2i32));
+
+        let variant_array = builder.build();
+
+        assert_eq!(variant_array.len(), 5);
+        assert_eq!(variant_array.value(0), Variant::from(1i32));
+        assert!(variant_array.is_null(1));
+        assert!(variant_array.is_null(2));
+        assert!(variant_array.is_null(3));
+        assert_eq!(variant_array.value(4), Variant::from(2i32));
+    }
+
+    #[test]
+    fn test_extend_variant_array_builder() {
+        let mut b = VariantArrayBuilder::new(3);
+        b.extend([None, Some(Variant::Null), Some(Variant::from("norm"))]);
+
+        let variant_array = b.build();
+
+        assert_eq!(variant_array.len(), 3);
+        assert!(variant_array.is_null(0));
+        assert_eq!(variant_array.value(1), Variant::Null);
+        assert_eq!(
+            variant_array.value(2),
+            Variant::ShortString(ShortString::try_new("norm").unwrap())
+        );
     }
 
     #[test]
@@ -566,8 +647,8 @@ mod test {
             .finish();
 
         let array2 = VariantArray::from_parts(
-            array.metadata_field().clone(),
-            Some(value_builder.build().unwrap()),
+            array.metadata_column().clone(),
+            Arc::new(value_builder.build().unwrap()),
             None,
             None,
         );

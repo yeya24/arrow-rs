@@ -58,8 +58,8 @@ pub fn garbage_collect_dictionary<K: ArrowDictionaryKeyType>(
     // Create a mapping from the old keys to the new keys, use a Vec for easy indexing
     let mut key_remap = vec![K::Native::ZERO; values.len()];
     for (new_idx, old_idx) in mask.set_indices().enumerate() {
-        key_remap[old_idx] = K::Native::from_usize(new_idx)
-            .expect("new index should fit in K::Native, as old index was in range");
+        key_remap[old_idx] =
+            K::Native::from_usize(new_idx).ok_or(ArrowError::DictionaryKeyOverflowError)?;
     }
 
     // ... and then build the new keys array
@@ -82,9 +82,7 @@ pub fn garbage_collect_dictionary<K: ArrowDictionaryKeyType>(
 pub fn garbage_collect_any_dictionary(
     dictionary: &dyn AnyDictionaryArray,
 ) -> Result<ArrayRef, ArrowError> {
-    // FIXME: this is a workaround for MSRV Rust versions below 1.86 where trait upcasting is not stable.
-    // From 1.86 onward, `&dyn AnyDictionaryArray` can be directly passed to `downcast_dictionary_array!`.
-    let dictionary = &*dictionary.slice(0, dictionary.len());
+    let dictionary: &dyn Array = dictionary;
     downcast_dictionary_array!(
         dictionary => garbage_collect_dictionary(dictionary).map(|dict| Arc::new(dict) as ArrayRef),
         _ => unreachable!("have a dictionary array")
@@ -174,10 +172,14 @@ type PtrEq = fn(&dyn Array, &dyn Array) -> bool;
 /// some return over the naive approach used by MutableArrayData
 ///
 /// `len` is the total length of the merged output
+///
+/// Returns `(should_merge, has_overflow)` where:
+/// - `should_merge`: whether dictionary values should be merged
+/// - `has_overflow`: whether the combined dictionary values would overflow the key type
 pub(crate) fn should_merge_dictionary_values<K: ArrowDictionaryKeyType>(
     dictionaries: &[&DictionaryArray<K>],
     len: usize,
-) -> bool {
+) -> (bool, bool) {
     use DataType::*;
     let first_values = dictionaries[0].values().as_ref();
     let ptr_eq: PtrEq = match first_values.data_type() {
@@ -187,7 +189,11 @@ pub(crate) fn should_merge_dictionary_values<K: ArrowDictionaryKeyType>(
         LargeBinary => bytes_ptr_eq::<LargeBinaryType>,
         dt => {
             if !dt.is_primitive() {
-                return false;
+                return (
+                    false,
+                    K::Native::from_usize(dictionaries.iter().map(|d| d.values().len()).sum())
+                        .is_none(),
+                );
             }
             |a, b| a.to_data().ptr_eq(&b.to_data())
         }
@@ -206,7 +212,10 @@ pub(crate) fn should_merge_dictionary_values<K: ArrowDictionaryKeyType>(
     let overflow = K::Native::from_usize(total_values).is_none();
     let values_exceed_length = total_values >= len;
 
-    !single_dictionary && (overflow || values_exceed_length)
+    (
+        !single_dictionary && (overflow || values_exceed_length),
+        overflow,
+    )
 }
 
 /// Given an array of dictionaries and an optional key mask compute a values array

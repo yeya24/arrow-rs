@@ -23,7 +23,7 @@ use std::io::Write;
 
 use crate::parquet_thrift::{
     ElementType, FieldType, ReadThrift, ThriftCompactInputProtocol, ThriftCompactOutputProtocol,
-    WriteThrift, WriteThriftField, read_thrift_vec,
+    WriteThrift, WriteThriftField, read_thrift_vec, validate_list_type,
 };
 use crate::{
     errors::{ParquetError, Result},
@@ -48,9 +48,9 @@ thrift_struct!(
 /// [`OffsetIndex`] information for a column chunk. Contains offsets and sizes for each page
 /// in the chunk. Optionally stores fully decoded page sizes for BYTE_ARRAY columns.
 ///
-/// See [`ParquetOffsetIndex`] for more information.
+/// See [`PageIndex`] for more information.
 ///
-/// [`ParquetOffsetIndex`]: crate::file::metadata::ParquetOffsetIndex
+/// [`PageIndex`]: crate::file::metadata::page_index::PageIndex
 /// [`OffsetIndex`]: https://github.com/apache/parquet-format/blob/master/PageIndex.md
 pub struct OffsetIndexMetaData {
   /// Vector of [`PageLocation`] objects, one per page in the chunk.
@@ -90,6 +90,7 @@ impl OffsetIndexMetaData {
 
         // we have to do this manually because we want to use the fast PageLocation decoder
         let list_ident = prot.read_list_begin()?;
+        validate_list_type(ElementType::Struct, &list_ident)?;
         let mut page_locations = Vec::with_capacity(list_ident.size as usize);
         for _ in 0..list_ident.size {
             page_locations.push(read_page_location(prot)?);

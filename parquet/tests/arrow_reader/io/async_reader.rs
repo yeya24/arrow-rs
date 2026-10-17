@@ -28,6 +28,7 @@ use parquet::arrow::arrow_reader::{ArrowReaderOptions, RowSelection, RowSelector
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::errors::Result;
+use parquet::file::metadata::PageIndexPolicy;
 use parquet::file::metadata::ParquetMetaData;
 use std::ops::Range;
 use std::sync::Arc;
@@ -206,7 +207,7 @@ async fn test_read_single_row_filter_no_page_index() {
     // Apply a filter  "b" > 575 and <less> than 625
     // (last data page in Row Group 0 and first DataPage in Row Group 1)
     let test_file = test_file();
-    let options = test_options().with_page_index(false);
+    let options = test_options().with_page_index_policy(PageIndexPolicy::from(false));
     let builder = async_builder(&test_file, options).await;
     let schema_descr = builder.metadata().file_metadata().schema_descr_ptr();
 
@@ -274,9 +275,7 @@ async fn test_read_multiple_row_filter() {
             "Read Multi:",
             "  Row Group 1, column 'a': MultiPage(dictionary_page: true, data_pages: [0, 1])  (1856 bytes, 1 requests) [data]",
             "Read Multi:",
-            "  Row Group 1, column 'b': DictionaryPage   (1617 bytes, 1 requests) [data]",
-            "  Row Group 1, column 'b': DataPage(0)      (113 bytes , 1 requests) [data]",
-            "  Row Group 1, column 'b': DataPage(1)      (126 bytes , 1 requests) [data]",
+            "  Row Group 1, column 'b': MultiPage(dictionary_page: true, data_pages: [0, 1])  (1856 bytes, 1 requests) [data]",
             "Read Multi:",
             "  Row Group 1, column 'c': DictionaryPage   (7217 bytes, 1 requests) [data]",
             "  Row Group 1, column 'c': DataPage(0)      (113 bytes , 1 requests) [data]",
@@ -318,7 +317,9 @@ async fn async_builder(
     test_file: &TestParquetFile,
     options: ArrowReaderOptions,
 ) -> ParquetRecordBatchStreamBuilder<RecordingAsyncFileReader> {
-    let parquet_meta_data = if options.page_index() {
+    let parquet_meta_data = if options.offset_index_policy() != PageIndexPolicy::Skip
+        || options.column_index_policy() != PageIndexPolicy::Skip
+    {
         Arc::clone(test_file.parquet_metadata())
     } else {
         // strip out the page index from the metadata
@@ -327,8 +328,7 @@ async fn async_builder(
             .as_ref()
             .clone()
             .into_builder()
-            .set_column_index(None)
-            .set_offset_index(None)
+            .set_page_index(None)
             .build();
         Arc::new(metadata)
     };
@@ -391,7 +391,7 @@ impl AsyncFileReader for RecordingAsyncFileReader {
 
     fn get_byte_ranges(&mut self, ranges: Vec<Range<u64>>) -> BoxFuture<'_, Result<Vec<Bytes>>> {
         let ops = Arc::clone(&self.ops);
-        let datas = ranges
+        let data_ranges = ranges
             .iter()
             .map(|range| {
                 self.bytes
@@ -410,7 +410,7 @@ impl AsyncFileReader for RecordingAsyncFileReader {
 
         async move {
             ops.add_entry_for_ranges(&logged_ranges);
-            Ok(datas)
+            Ok(data_ranges)
         }
         .boxed()
     }

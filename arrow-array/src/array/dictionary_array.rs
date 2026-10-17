@@ -25,7 +25,7 @@ use crate::{
 };
 use arrow_buffer::bit_util::set_bit;
 use arrow_buffer::buffer::NullBuffer;
-use arrow_buffer::{ArrowNativeType, BooleanBuffer, BooleanBufferBuilder};
+use arrow_buffer::{ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, ScalarBuffer};
 use arrow_data::ArrayData;
 use arrow_schema::{ArrowError, DataType};
 use std::any::Any;
@@ -292,17 +292,20 @@ impl<K: ArrowDictionaryKeyType> DictionaryArray<K> {
             Box::new(values.data_type().clone()),
         );
 
-        let zero = K::Native::usize_as(0);
-        let values_len = values.len();
+        // // we can skip the validating the keys if they are all null
+        let all_null = keys.null_count() == keys.len();
 
-        if let Some((idx, v)) =
-            keys.values().iter().enumerate().find(|(idx, v)| {
+        if !all_null {
+            let zero = K::Native::usize_as(0);
+            let values_len = values.len();
+
+            if let Some((idx, v)) = keys.values().iter().enumerate().find(|(idx, v)| {
                 (v.is_lt(zero) || v.as_usize() >= values_len) && keys.is_valid(*idx)
-            })
-        {
-            return Err(ArrowError::InvalidArgumentError(format!(
-                "Invalid dictionary key {v:?} at index {idx}, expected 0 <= key < {values_len}",
-            )));
+            }) {
+                return Err(ArrowError::InvalidArgumentError(format!(
+                    "Invalid dictionary key {v:?} at index {idx}, expected 0 <= key < {values_len}",
+                )));
+            }
         }
 
         Ok(Self {
@@ -358,6 +361,7 @@ impl<K: ArrowDictionaryKeyType> DictionaryArray<K> {
     /// returns the corresponding key (index into the `values`
     /// array). Otherwise returns `None`.
     ///
+    /// # Panics
     /// Panics if `values` is not a [`StringArray`].
     pub fn lookup_key(&self, value: &str) -> Option<K::Native> {
         let rd_buf: &StringArray = self.values.as_any().downcast_ref::<StringArray>().unwrap();
@@ -399,11 +403,17 @@ impl<K: ArrowDictionaryKeyType> DictionaryArray<K> {
 
     /// Return the value of `keys` (the dictionary key) at index `i`,
     /// cast to `usize`, `None` if the value at `i` is `NULL`.
+    ///
+    /// # Panics
+    /// Panics if `i >= self.len()`
     pub fn key(&self, i: usize) -> Option<usize> {
         self.keys.is_valid(i).then(|| self.keys.value(i).as_usize())
     }
 
     /// Returns a zero-copy slice of this array with the indicated offset and length.
+    ///
+    /// # Panics
+    /// Panics if `offset + length > self.len()`
     pub fn slice(&self, offset: usize, length: usize) -> Self {
         Self {
             data_type: self.data_type.clone(),
@@ -485,7 +495,7 @@ impl<K: ArrowDictionaryKeyType> DictionaryArray<K> {
 
     /// Returns `PrimitiveDictionaryBuilder` of this dictionary array for mutating
     /// its keys and values if the underlying data buffer is not shared by others.
-    #[allow(clippy::result_large_err)]
+    #[expect(clippy::result_large_err)]
     pub fn into_primitive_dict_builder<V>(self) -> Result<PrimitiveDictionaryBuilder<K, V>, Self>
     where
         V: ArrowPrimitiveType,
@@ -542,7 +552,7 @@ impl<K: ArrowDictionaryKeyType> DictionaryArray<K> {
     /// assert_eq!(typed.value(1), 11);
     /// assert_eq!(typed.value(2), 21);
     /// ```
-    #[allow(clippy::result_large_err)]
+    #[expect(clippy::result_large_err)]
     pub fn unary_mut<F, V>(self, op: F) -> Result<DictionaryArray<K>, DictionaryArray<K>>
     where
         V: ArrowPrimitiveType,
@@ -580,21 +590,25 @@ impl<K: ArrowDictionaryKeyType> DictionaryArray<K> {
     }
 }
 
-/// Constructs a `DictionaryArray` from an array data reference.
+/// Constructs a `DictionaryArray` from an `ArrayData`
 impl<T: ArrowDictionaryKeyType> From<ArrayData> for DictionaryArray<T> {
     fn from(data: ArrayData) -> Self {
+        let (data_type, len, nulls, offset, mut buffers, mut child_data) = data.into_parts();
+
         assert_eq!(
-            data.buffers().len(),
+            buffers.len(),
             1,
             "DictionaryArray data should contain a single buffer only (keys)."
         );
+        let buffer = buffers.pop().expect("checked above");
         assert_eq!(
-            data.child_data().len(),
+            child_data.len(),
             1,
             "DictionaryArray should contain a single child array (values)."
         );
+        let cd = child_data.pop().expect("checked above");
 
-        if let DataType::Dictionary(key_data_type, _) = data.data_type() {
+        if let DataType::Dictionary(key_data_type, _) = &data_type {
             assert_eq!(
                 &T::DATA_TYPE,
                 key_data_type.as_ref(),
@@ -603,19 +617,10 @@ impl<T: ArrowDictionaryKeyType> From<ArrayData> for DictionaryArray<T> {
                 key_data_type
             );
 
-            let values = make_array(data.child_data()[0].clone());
-            let data_type = data.data_type().clone();
+            let values = make_array(cd);
 
             // create a zero-copy of the keys' data
-            // SAFETY:
-            // ArrayData is valid and verified type above
-
-            let keys = PrimitiveArray::<T>::from(unsafe {
-                data.into_builder()
-                    .data_type(T::DATA_TYPE)
-                    .child_data(vec![])
-                    .build_unchecked()
-            });
+            let keys = PrimitiveArray::<T>::new(ScalarBuffer::new(buffer, offset, len), nulls);
 
             Self {
                 data_type,
@@ -697,7 +702,8 @@ impl<'a, T: ArrowDictionaryKeyType> FromIterator<&'a str> for DictionaryArray<T>
     }
 }
 
-impl<T: ArrowDictionaryKeyType> Array for DictionaryArray<T> {
+/// SAFETY: Correctly implements the contract of Arrow Arrays
+unsafe impl<T: ArrowDictionaryKeyType> Array for DictionaryArray<T> {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -793,6 +799,12 @@ impl<T: ArrowDictionaryKeyType> Array for DictionaryArray<T> {
             + self.keys.get_buffer_memory_size()
             + self.values.get_array_memory_size()
     }
+
+    #[cfg(feature = "pool")]
+    fn claim(&self, pool: &dyn arrow_buffer::MemoryPool) {
+        self.keys.claim(pool);
+        self.values.claim(pool);
+    }
 }
 
 impl<T: ArrowDictionaryKeyType> std::fmt::Debug for DictionaryArray<T> {
@@ -856,7 +868,7 @@ impl<'a, K: ArrowDictionaryKeyType, V> TypedDictionaryArray<'a, K, V> {
     }
 }
 
-impl<K: ArrowDictionaryKeyType, V: Sync> Array for TypedDictionaryArray<'_, K, V> {
+unsafe impl<K: ArrowDictionaryKeyType, V: Sync> Array for TypedDictionaryArray<'_, K, V> {
     fn as_any(&self) -> &dyn Any {
         self.dictionary
     }
@@ -911,6 +923,11 @@ impl<K: ArrowDictionaryKeyType, V: Sync> Array for TypedDictionaryArray<'_, K, V
 
     fn get_array_memory_size(&self) -> usize {
         self.dictionary.get_array_memory_size()
+    }
+
+    #[cfg(feature = "pool")]
+    fn claim(&self, pool: &dyn arrow_buffer::MemoryPool) {
+        self.dictionary.claim(pool);
     }
 }
 
@@ -1015,7 +1032,7 @@ pub trait AnyDictionaryArray: Array {
     /// The values for nulls will be arbitrary, but are guaranteed
     /// to be in the range `0..self.values.len()`
     ///
-    /// # Panic
+    /// # Panics
     ///
     /// Panics if `values.len() == 0`
     fn normalized_keys(&self) -> Vec<usize>;
@@ -1051,7 +1068,7 @@ impl<K: ArrowDictionaryKeyType> AnyDictionaryArray for DictionaryArray<K> {
 mod tests {
     use super::*;
     use crate::cast::as_dictionary_array;
-    use crate::{Int8Array, Int16Array, Int32Array, RunArray};
+    use crate::{Decimal128Array, Int8Array, Int16Array, Int32Array, RunArray, UInt8Array};
     use arrow_buffer::{Buffer, ToByteSlice};
 
     #[test]
@@ -1376,7 +1393,7 @@ mod tests {
     #[should_panic(expected = "Invalid dictionary key -100 at index 0, expected 0 <= key < 2")]
     fn test_try_new_index_too_small() {
         let values: StringArray = [Some("foo"), Some("bar")].into_iter().collect();
-        let keys: Int32Array = [Some(-100)].into_iter().collect();
+        let keys: Int32Array = std::iter::once(Some(-100)).collect();
         DictionaryArray::new(keys, Arc::new(values));
     }
 
@@ -1436,6 +1453,26 @@ mod tests {
 
         let expected = DictionaryArray::new(keys, Arc::new(values));
         assert_eq!(expected, returned);
+    }
+
+    #[test]
+    fn test_unary_mut_keeps_value_type() {
+        let values = || {
+            Decimal128Array::from(vec![123, 456])
+                .with_precision_and_scale(5, 2)
+                .unwrap()
+        };
+        let keys = Int8Array::from_iter_values([0, 1, 0]);
+        let dict = DictionaryArray::new(keys, Arc::new(values()));
+        let data_type = dict.data_type().clone();
+        let updated = dict.unary_mut::<_, Decimal128Type>(|x| x + 1).unwrap();
+        assert_eq!(updated.data_type(), &data_type);
+
+        // When the keys are shared, the original array is returned
+        let keys = Int8Array::from_iter_values([0, 1, 0]);
+        let dict = DictionaryArray::new(keys.clone(), Arc::new(values()));
+        let returned = dict.unary_mut::<_, Decimal128Type>(|x| x + 1).unwrap_err();
+        assert_eq!(returned, DictionaryArray::new(keys, Arc::new(values())));
     }
 
     #[test]
@@ -1531,5 +1568,14 @@ mod tests {
         let keys = Int32Array::new(values, Some(nulls));
         let dictionary = DictionaryArray::new(keys, Arc::new(Int32Array::new_null(2)));
         assert_eq!(&dictionary.normalized_keys(), &[1, 0, 1])
+    }
+
+    #[test]
+    fn test_all_null_dict() {
+        let all_null_dict_arr = DictionaryArray::try_new(
+            UInt8Array::new_null(10),
+            Arc::new(StringArray::from_iter_values(["a"])),
+        );
+        assert!(all_null_dict_arr.is_ok())
     }
 }

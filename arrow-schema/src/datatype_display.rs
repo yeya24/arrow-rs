@@ -15,18 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{collections::HashMap, fmt};
-
 use crate::DataType;
+use crate::Field;
+use crate::Metadata;
+use std::fmt;
+use std::fmt::Display;
 
-impl fmt::Display for DataType {
+impl Display for DataType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fn format_metadata(metadata: &HashMap<String, String>) -> String {
-            if metadata.is_empty() {
-                String::new()
-            } else {
-                format!(", metadata: {metadata:?}")
-            }
+        fn format_metadata(metadata: &Metadata) -> String {
+            format!("{}", FormatMetadata(metadata))
+        }
+
+        fn format_nullability(field: &crate::Field) -> &str {
+            if field.is_nullable() { "" } else { "non-null " }
+        }
+
+        fn format_field(field: &crate::Field) -> String {
+            let name = field.name();
+            let maybe_nullable = format_nullability(field);
+            let data_type = field.data_type();
+            let metadata_str = format_metadata(field.metadata());
+            format!("{name:?}: {maybe_nullable}{data_type}{metadata_str}")
         }
 
         // A lot of these can still be improved a lot.
@@ -86,7 +96,7 @@ impl fmt::Display for DataType {
                 };
 
                 let name = field.name();
-                let maybe_nullable = if field.is_nullable() { "nullable " } else { "" };
+                let maybe_nullable = format_nullability(field);
                 let data_type = field.data_type();
                 let field_name_str = if name == "item" {
                     String::default()
@@ -95,7 +105,7 @@ impl fmt::Display for DataType {
                 };
                 let metadata_str = format_metadata(field.metadata());
 
-                // e.g. `LargeList(nullable Uint32)
+                // e.g. `LargeList(non-null Uint32)
                 write!(
                     f,
                     "{type_name}({maybe_nullable}{data_type}{field_name_str}{metadata_str})"
@@ -103,7 +113,7 @@ impl fmt::Display for DataType {
             }
             Self::FixedSizeList(field, size) => {
                 let name = field.name();
-                let maybe_nullable = if field.is_nullable() { "nullable " } else { "" };
+                let maybe_nullable = format_nullability(field);
                 let data_type = field.data_type();
                 let field_name_str = if name == "item" {
                     String::default()
@@ -122,13 +132,7 @@ impl fmt::Display for DataType {
                 if !fields.is_empty() {
                     let fields_str = fields
                         .iter()
-                        .map(|field| {
-                            let name = field.name();
-                            let maybe_nullable = if field.is_nullable() { "nullable " } else { "" };
-                            let data_type = field.data_type();
-                            let metadata_str = format_metadata(field.metadata());
-                            format!("{name:?}: {maybe_nullable}{data_type}{metadata_str}")
-                        })
+                        .map(|field| format_field(field))
                         .collect::<Vec<_>>()
                         .join(", ");
                     write!(f, "{fields_str}")?;
@@ -137,17 +141,15 @@ impl fmt::Display for DataType {
                 Ok(())
             }
             Self::Union(union_fields, union_mode) => {
-                write!(f, "Union({union_mode:?}, ")?;
+                write!(f, "Union({union_mode:?}")?;
                 if !union_fields.is_empty() {
+                    write!(f, ", ")?;
                     let fields_str = union_fields
                         .iter()
                         .map(|v| {
                             let type_id = v.0;
-                            let field = v.1;
-                            let maybe_nullable = if field.is_nullable() { "nullable " } else { "" };
-                            let data_type = field.data_type();
-                            let metadata_str = format_metadata(field.metadata());
-                            format!("{type_id:?}: {maybe_nullable}{data_type}{metadata_str}")
+                            let field_str = format_field(v.1);
+                            format!("{type_id:?}: ({field_str})")
                         })
                         .collect::<Vec<_>>()
                         .join(", ");
@@ -165,21 +167,50 @@ impl fmt::Display for DataType {
             Self::Decimal256(precision, scale) => write!(f, "Decimal256({precision}, {scale})"),
             Self::Map(field, sorted) => {
                 write!(f, "Map(")?;
-                let name = field.name();
-                let maybe_nullable = if field.is_nullable() { "nullable " } else { "" };
-                let data_type = field.data_type();
-                let metadata_str = format_metadata(field.metadata());
+                let map_field_str = format_field(field);
                 let keys_are_sorted = if *sorted { "sorted" } else { "unsorted" };
 
-                write!(
-                    f,
-                    "\"{name}\": {maybe_nullable}{data_type}{metadata_str}, {keys_are_sorted})"
-                )?;
+                write!(f, "{map_field_str}, {keys_are_sorted})")?;
                 Ok(())
             }
             Self::RunEndEncoded(run_ends_field, values_field) => {
-                write!(f, "RunEndEncoded({run_ends_field}, {values_field})")
+                let default_names = run_ends_field.name() == Field::REE_RUN_ENDS_FIELD_DEFAULT_NAME
+                    && values_field.name() == Field::REE_VALUES_FIELD_DEFAULT_NAME;
+                let no_metadata =
+                    run_ends_field.metadata().is_empty() && values_field.metadata().is_empty();
+                write!(f, "RunEndEncoded(")?;
+                if default_names && no_metadata {
+                    let re_null = format_nullability(run_ends_field);
+                    let v_null = format_nullability(values_field);
+                    write!(
+                        f,
+                        "{re_null}{}, {v_null}{})",
+                        run_ends_field.data_type(),
+                        values_field.data_type(),
+                    )?;
+                } else {
+                    let run_ends_str = format_field(run_ends_field);
+                    let values_str = format_field(values_field);
+                    write!(f, "{run_ends_str}, {values_str})")?;
+                }
+                Ok(())
             }
+        }
+    }
+}
+
+/// Adapter to format [`Metadata`] consistently.
+struct FormatMetadata<'a>(&'a Metadata);
+
+impl fmt::Display for FormatMetadata<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let metadata = self.0;
+        if metadata.is_empty() {
+            Ok(())
+        } else {
+            // `Metadata` iterates in sorted key order
+            write!(f, ", metadata: ")?;
+            f.debug_map().entries(metadata.iter()).finish()
         }
     }
 }
@@ -187,6 +218,7 @@ impl fmt::Display for DataType {
 #[cfg(test)]
 mod tests {
 
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use crate::Field;
@@ -197,7 +229,7 @@ mod tests {
     fn test_display_list() {
         let list_data_type = DataType::List(Arc::new(Field::new_list_field(DataType::Int32, true)));
         let list_data_type_string = list_data_type.to_string();
-        let expected_string = "List(nullable Int32)";
+        let expected_string = "List(Int32)";
         assert_eq!(list_data_type_string, expected_string);
     }
 
@@ -206,7 +238,7 @@ mod tests {
         let list_view_data_type =
             DataType::ListView(Arc::new(Field::new("item", DataType::Int32, true)));
         let list_view_data_type_string = list_view_data_type.to_string();
-        let expected_string = "ListView(nullable Int32)";
+        let expected_string = "ListView(Int32)";
         assert_eq!(list_view_data_type_string, expected_string);
     }
 
@@ -214,7 +246,7 @@ mod tests {
     fn test_display_list_with_named_field() {
         let list_data_type = DataType::List(Arc::new(Field::new("foo", DataType::UInt64, false)));
         let list_data_type_string = list_data_type.to_string();
-        let expected_string = "List(UInt64, field: 'foo')";
+        let expected_string = "List(non-null UInt64, field: 'foo')";
         assert_eq!(list_data_type_string, expected_string);
     }
 
@@ -223,7 +255,7 @@ mod tests {
         let list_view_data_type =
             DataType::ListView(Arc::new(Field::new("bar", DataType::UInt64, false)));
         let list_view_data_type_string = list_view_data_type.to_string();
-        let expected_string = "ListView(UInt64, field: 'bar')";
+        let expected_string = "ListView(non-null UInt64, field: 'bar')";
         assert_eq!(list_view_data_type_string, expected_string);
     }
 
@@ -234,7 +266,7 @@ mod tests {
             false,
         )));
         let nested_data_type_string = nested_data_type.to_string();
-        let nested_expected_string = "List(List(UInt64))";
+        let nested_expected_string = "List(non-null List(non-null UInt64))";
         assert_eq!(nested_data_type_string, nested_expected_string);
     }
 
@@ -245,7 +277,7 @@ mod tests {
             false,
         )));
         let nested_view_data_type_string = nested_view_data_type.to_string();
-        let nested_view_expected_string = "ListView(ListView(UInt64))";
+        let nested_view_expected_string = "ListView(non-null ListView(non-null UInt64))";
         assert_eq!(nested_view_data_type_string, nested_view_expected_string);
     }
 
@@ -256,7 +288,7 @@ mod tests {
         field.set_metadata(metadata);
         let list_data_type = DataType::List(Arc::new(field));
         let list_data_type_string = list_data_type.to_string();
-        let expected_string = "List(nullable Int32, metadata: {\"foo1\": \"value1\"})";
+        let expected_string = "List(Int32, metadata: {\"foo1\": \"value1\"})";
 
         assert_eq!(list_data_type_string, expected_string);
     }
@@ -268,7 +300,7 @@ mod tests {
         field.set_metadata(metadata);
         let list_view_data_type = DataType::ListView(Arc::new(field));
         let list_view_data_type_string = list_view_data_type.to_string();
-        let expected_string = "ListView(nullable Int32, metadata: {\"foo2\": \"value2\"})";
+        let expected_string = "ListView(Int32, metadata: {\"foo2\": \"value2\"})";
         assert_eq!(list_view_data_type_string, expected_string);
     }
 
@@ -277,14 +309,14 @@ mod tests {
         let large_list_data_type =
             DataType::LargeList(Arc::new(Field::new_list_field(DataType::Int32, true)));
         let large_list_data_type_string = large_list_data_type.to_string();
-        let expected_string = "LargeList(nullable Int32)";
+        let expected_string = "LargeList(Int32)";
         assert_eq!(large_list_data_type_string, expected_string);
 
         // Test with named field
         let large_list_named =
             DataType::LargeList(Arc::new(Field::new("bar", DataType::UInt64, false)));
         let large_list_named_string = large_list_named.to_string();
-        let expected_named_string = "LargeList(UInt64, field: 'bar')";
+        let expected_named_string = "LargeList(non-null UInt64, field: 'bar')";
         assert_eq!(large_list_named_string, expected_named_string);
 
         // Test with metadata
@@ -293,8 +325,7 @@ mod tests {
         field.set_metadata(metadata);
         let large_list_metadata = DataType::LargeList(Arc::new(field));
         let large_list_metadata_string = large_list_metadata.to_string();
-        let expected_metadata_string =
-            "LargeList(nullable Int32, metadata: {\"key1\": \"value1\"})";
+        let expected_metadata_string = "LargeList(Int32, metadata: {\"key1\": \"value1\"})";
         assert_eq!(large_list_metadata_string, expected_metadata_string);
     }
 
@@ -303,14 +334,14 @@ mod tests {
         let large_list_view_data_type =
             DataType::LargeListView(Arc::new(Field::new("item", DataType::Int32, true)));
         let large_list_view_data_type_string = large_list_view_data_type.to_string();
-        let expected_string = "LargeListView(nullable Int32)";
+        let expected_string = "LargeListView(Int32)";
         assert_eq!(large_list_view_data_type_string, expected_string);
 
         // Test with named field
         let large_list_view_named =
             DataType::LargeListView(Arc::new(Field::new("bar", DataType::UInt64, false)));
         let large_list_view_named_string = large_list_view_named.to_string();
-        let expected_named_string = "LargeListView(UInt64, field: 'bar')";
+        let expected_named_string = "LargeListView(non-null UInt64, field: 'bar')";
         assert_eq!(large_list_view_named_string, expected_named_string);
 
         // Test with metadata
@@ -319,8 +350,7 @@ mod tests {
         field.set_metadata(metadata);
         let large_list_view_metadata = DataType::LargeListView(Arc::new(field));
         let large_list_view_metadata_string = large_list_view_metadata.to_string();
-        let expected_metadata_string =
-            "LargeListView(nullable Int32, metadata: {\"key1\": \"value1\"})";
+        let expected_metadata_string = "LargeListView(Int32, metadata: {\"key1\": \"value1\"})";
         assert_eq!(large_list_view_metadata_string, expected_metadata_string);
     }
 
@@ -329,14 +359,14 @@ mod tests {
         let fixed_size_list =
             DataType::FixedSizeList(Arc::new(Field::new_list_field(DataType::Int32, true)), 5);
         let fixed_size_list_string = fixed_size_list.to_string();
-        let expected_string = "FixedSizeList(5 x nullable Int32)";
+        let expected_string = "FixedSizeList(5 x Int32)";
         assert_eq!(fixed_size_list_string, expected_string);
 
         // Test with named field
         let fixed_size_named =
             DataType::FixedSizeList(Arc::new(Field::new("baz", DataType::UInt64, false)), 3);
         let fixed_size_named_string = fixed_size_named.to_string();
-        let expected_named_string = "FixedSizeList(3 x UInt64, field: 'baz')";
+        let expected_named_string = "FixedSizeList(3 x non-null UInt64, field: 'baz')";
         assert_eq!(fixed_size_named_string, expected_named_string);
 
         // Test with metadata
@@ -345,8 +375,7 @@ mod tests {
         field.set_metadata(metadata);
         let fixed_size_metadata = DataType::FixedSizeList(Arc::new(field), 4);
         let fixed_size_metadata_string = fixed_size_metadata.to_string();
-        let expected_metadata_string =
-            "FixedSizeList(4 x nullable Int32, metadata: {\"key2\": \"value2\"})";
+        let expected_metadata_string = "FixedSizeList(4 x Int32, metadata: {\"key2\": \"value2\"})";
         assert_eq!(fixed_size_metadata_string, expected_metadata_string);
     }
 
@@ -358,19 +387,21 @@ mod tests {
         ];
         let struct_data_type = DataType::Struct(fields.into());
         let struct_data_type_string = struct_data_type.to_string();
-        let expected_string = "Struct(\"a\": Int32, \"b\": nullable Utf8)";
+        let expected_string = "Struct(\"a\": non-null Int32, \"b\": Utf8)";
         assert_eq!(struct_data_type_string, expected_string);
 
         // Test with metadata
         let mut field_with_metadata = Field::new("b", DataType::Utf8, true);
-        let metadata = HashMap::from([("key".to_string(), "value".to_string())]);
+        let metadata = HashMap::from([
+            ("key".to_string(), "value".to_string()),
+            ("key2".to_string(), "value2".to_string()),
+        ]);
         field_with_metadata.set_metadata(metadata);
         let struct_fields_with_metadata =
             vec![Field::new("a", DataType::Int32, false), field_with_metadata];
         let struct_data_type_with_metadata = DataType::Struct(struct_fields_with_metadata.into());
         let struct_data_type_with_metadata_string = struct_data_type_with_metadata.to_string();
-        let expected_string_with_metadata =
-            "Struct(\"a\": Int32, \"b\": nullable Utf8, metadata: {\"key\": \"value\"})";
+        let expected_string_with_metadata = "Struct(\"a\": non-null Int32, \"b\": Utf8, metadata: {\"key\": \"value\", \"key2\": \"value2\"})";
         assert_eq!(
             struct_data_type_with_metadata_string,
             expected_string_with_metadata
@@ -391,7 +422,7 @@ mod tests {
 
         let union_data_type = DataType::Union(union_fields, crate::UnionMode::Sparse);
         let union_data_type_string = union_data_type.to_string();
-        let expected_string = "Union(Sparse, 0: Int32, 1: nullable Utf8)";
+        let expected_string = "Union(Sparse, 0: (\"a\": non-null Int32), 1: (\"b\": Utf8))";
         assert_eq!(union_data_type_string, expected_string);
 
         // Test with metadata
@@ -407,8 +438,7 @@ mod tests {
         let union_data_type_with_metadata =
             DataType::Union(union_fields_with_metadata, crate::UnionMode::Sparse);
         let union_data_type_with_metadata_string = union_data_type_with_metadata.to_string();
-        let expected_string_with_metadata =
-            "Union(Sparse, 0: Int32, 1: nullable Utf8, metadata: {\"key\": \"value\"})";
+        let expected_string_with_metadata = "Union(Sparse, 0: (\"a\": non-null Int32), 1: (\"b\": Utf8, metadata: {\"key\": \"value\"}))";
         assert_eq!(
             union_data_type_with_metadata_string,
             expected_string_with_metadata
@@ -418,11 +448,11 @@ mod tests {
     #[test]
     fn test_display_map() {
         let entry_field = Field::new(
-            "entries",
+            Field::MAP_ENTRIES_FIELD_DEFAULT_NAME,
             DataType::Struct(
                 vec![
-                    Field::new("key", DataType::Utf8, false),
-                    Field::new("value", DataType::Int32, true),
+                    Field::new(Field::MAP_KEY_FIELD_DEFAULT_NAME, DataType::Utf8, false),
+                    Field::new(Field::MAP_VALUE_FIELD_DEFAULT_NAME, DataType::Int32, true),
                 ]
                 .into(),
             ),
@@ -431,16 +461,16 @@ mod tests {
         let map_data_type = DataType::Map(Arc::new(entry_field), true);
         let map_data_type_string = map_data_type.to_string();
         let expected_string =
-            "Map(\"entries\": Struct(\"key\": Utf8, \"value\": nullable Int32), sorted)";
+            "Map(\"entries\": non-null Struct(\"key\": non-null Utf8, \"value\": Int32), sorted)";
         assert_eq!(map_data_type_string, expected_string);
 
         // Test with metadata
         let mut entry_field_with_metadata = Field::new(
-            "entries",
+            Field::MAP_ENTRIES_FIELD_DEFAULT_NAME,
             DataType::Struct(
                 vec![
-                    Field::new("key", DataType::Utf8, false),
-                    Field::new("value", DataType::Int32, true),
+                    Field::new(Field::MAP_KEY_FIELD_DEFAULT_NAME, DataType::Utf8, false),
+                    Field::new(Field::MAP_VALUE_FIELD_DEFAULT_NAME, DataType::Int32, true),
                 ]
                 .into(),
             ),
@@ -450,10 +480,165 @@ mod tests {
         entry_field_with_metadata.set_metadata(metadata);
         let map_data_type_with_metadata = DataType::Map(Arc::new(entry_field_with_metadata), true);
         let map_data_type_with_metadata_string = map_data_type_with_metadata.to_string();
-        let expected_string_with_metadata = "Map(\"entries\": Struct(\"key\": Utf8, \"value\": nullable Int32), metadata: {\"key\": \"value\"}, sorted)";
+        let expected_string_with_metadata = "Map(\"entries\": non-null Struct(\"key\": non-null Utf8, \"value\": Int32), metadata: {\"key\": \"value\"}, sorted)";
         assert_eq!(
             map_data_type_with_metadata_string,
             expected_string_with_metadata
         );
+    }
+
+    #[test]
+    fn test_display_run_end_encoded() {
+        // Compact form: default field names
+        let run_ends_field = Arc::new(Field::new(
+            Field::REE_RUN_ENDS_FIELD_DEFAULT_NAME,
+            DataType::UInt32,
+            false,
+        ));
+        let values_field = Arc::new(Field::new(
+            Field::REE_VALUES_FIELD_DEFAULT_NAME,
+            DataType::Int32,
+            true,
+        ));
+        let ree = DataType::RunEndEncoded(run_ends_field.clone(), values_field.clone());
+        assert_eq!(ree.to_string(), "RunEndEncoded(non-null UInt32, Int32)");
+
+        // Compact form: non-null values
+        let run_ends_field = Arc::new(Field::new(
+            Field::REE_RUN_ENDS_FIELD_DEFAULT_NAME,
+            DataType::Int32,
+            false,
+        ));
+        let values_field_str = Arc::new(Field::new(
+            Field::REE_VALUES_FIELD_DEFAULT_NAME,
+            DataType::Utf8,
+            false,
+        ));
+        let ree2 = DataType::RunEndEncoded(run_ends_field, values_field_str);
+        assert_eq!(
+            ree2.to_string(),
+            "RunEndEncoded(non-null Int32, non-null Utf8)"
+        );
+
+        // Verbose form: metadata on values field triggers verbose form
+        let run_ends_field = Arc::new(Field::new(
+            Field::REE_RUN_ENDS_FIELD_DEFAULT_NAME,
+            DataType::Int32,
+            false,
+        ));
+        let mut values_with_meta =
+            Field::new(Field::REE_VALUES_FIELD_DEFAULT_NAME, DataType::Utf8, true);
+        values_with_meta.set_metadata(HashMap::from([("k".to_string(), "v".to_string())]));
+        let ree_meta = DataType::RunEndEncoded(run_ends_field, Arc::new(values_with_meta));
+        assert_eq!(
+            ree_meta.to_string(),
+            "RunEndEncoded(\"run_ends\": non-null Int32, \"values\": Utf8, metadata: {\"k\": \"v\"})"
+        );
+
+        // Verbose form: non-default field name on values
+        let run_ends_field = Arc::new(Field::new(
+            Field::REE_RUN_ENDS_FIELD_DEFAULT_NAME,
+            DataType::Int32,
+            false,
+        ));
+        let named_values = Arc::new(Field::new("named_values", DataType::Utf8, false));
+        let ree3 = DataType::RunEndEncoded(run_ends_field, named_values);
+        assert_eq!(
+            ree3.to_string(),
+            "RunEndEncoded(\"run_ends\": non-null Int32, \"named_values\": non-null Utf8)"
+        );
+
+        // Verbose form: non-default field name on run_ends
+        let custom_re = Arc::new(Field::new("re", DataType::Int32, false));
+        let values_field = Arc::new(Field::new(
+            Field::REE_VALUES_FIELD_DEFAULT_NAME,
+            DataType::Int32,
+            true,
+        ));
+        let ree4 = DataType::RunEndEncoded(custom_re, values_field);
+        assert_eq!(
+            ree4.to_string(),
+            "RunEndEncoded(\"re\": non-null Int32, \"values\": Int32)"
+        );
+
+        // Verbose form: metadata on both fields
+        let mut run_ends_with_meta = Field::new(
+            Field::REE_RUN_ENDS_FIELD_DEFAULT_NAME,
+            DataType::Int32,
+            false,
+        );
+        run_ends_with_meta.set_metadata(HashMap::from([(
+            "source".to_string(),
+            "encoder".to_string(),
+        )]));
+        let mut values_with_meta2 =
+            Field::new(Field::REE_VALUES_FIELD_DEFAULT_NAME, DataType::Utf8, true);
+        values_with_meta2.set_metadata(HashMap::from([("locale".to_string(), "en".to_string())]));
+        let ree5 =
+            DataType::RunEndEncoded(Arc::new(run_ends_with_meta), Arc::new(values_with_meta2));
+        assert_eq!(
+            ree5.to_string(),
+            "RunEndEncoded(\"run_ends\": non-null Int32, metadata: {\"source\": \"encoder\"}, \"values\": Utf8, metadata: {\"locale\": \"en\"})"
+        );
+    }
+
+    #[test]
+    fn test_display_dictionary() {
+        let dict_data_type =
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let dict_data_type_string = dict_data_type.to_string();
+        let expected_string = "Dictionary(Int8, Utf8)";
+        assert_eq!(dict_data_type_string, expected_string);
+
+        // Test with complex index and value types
+        let complex_dict_data_type = DataType::Dictionary(
+            Box::new(DataType::Int16),
+            Box::new(DataType::Struct(
+                vec![
+                    Field::new("a", DataType::Int32, false),
+                    Field::new("b", DataType::Utf8, true),
+                ]
+                .into(),
+            )),
+        );
+        let complex_dict_data_type_string = complex_dict_data_type.to_string();
+        let expected_complex_string =
+            "Dictionary(Int16, Struct(\"a\": non-null Int32, \"b\": Utf8))";
+        assert_eq!(complex_dict_data_type_string, expected_complex_string);
+    }
+
+    #[test]
+    fn test_display_interval() {
+        let interval_year_month = DataType::Interval(crate::IntervalUnit::YearMonth);
+        let interval_year_month_string = interval_year_month.to_string();
+        let expected_year_month_string = "Interval(YearMonth)";
+        assert_eq!(interval_year_month_string, expected_year_month_string);
+
+        let interval_day_time = DataType::Interval(crate::IntervalUnit::DayTime);
+        let interval_day_time_string = interval_day_time.to_string();
+        let expected_day_time_string = "Interval(DayTime)";
+        assert_eq!(interval_day_time_string, expected_day_time_string);
+
+        let interval_month_day_nano = DataType::Interval(crate::IntervalUnit::MonthDayNano);
+        let interval_month_day_nano_string = interval_month_day_nano.to_string();
+        let expected_month_day_nano_string = "Interval(MonthDayNano)";
+        assert_eq!(
+            interval_month_day_nano_string,
+            expected_month_day_nano_string
+        );
+    }
+
+    #[test]
+    fn test_display_timestamp() {
+        let timestamp_without_tz = DataType::Timestamp(crate::TimeUnit::Microsecond, None);
+        let timestamp_without_tz_string = timestamp_without_tz.to_string();
+        let expected_without_tz_string = "Timestamp(µs)";
+        assert_eq!(timestamp_without_tz_string, expected_without_tz_string);
+
+        let timestamp_with_tz =
+            DataType::Timestamp(crate::TimeUnit::Nanosecond, Some(Arc::from("UTC")));
+        let timestamp_with_tz_string = timestamp_with_tz.to_string();
+        let expected_with_tz_string = "Timestamp(ns, \"UTC\")";
+        assert_eq!(timestamp_with_tz_string, expected_with_tz_string);
     }
 }

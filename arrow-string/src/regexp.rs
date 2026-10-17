@@ -25,8 +25,8 @@ use arrow_array::builder::{
 };
 use arrow_array::cast::AsArray;
 use arrow_array::*;
-use arrow_buffer::NullBuffer;
-use arrow_data::{ArrayData, ArrayDataBuilder};
+use arrow_buffer::{BooleanBuffer, NullBuffer};
+use arrow_data::ArrayDataBuilder;
 use arrow_schema::{ArrowError, DataType, Field};
 use regex::Regex;
 
@@ -180,7 +180,6 @@ pub fn regexp_is_match_scalar<'a, S>(
 where
     &'a S: StringArrayType<'a>,
 {
-    let null_bit_buffer = array.nulls().map(|x| x.inner().sliced());
     let mut result = BooleanBufferBuilder::new(array.len());
 
     let pattern = match flag {
@@ -200,20 +199,12 @@ where
         }
     }
 
-    let buffer = result.into();
-    let data = unsafe {
-        ArrayData::new_unchecked(
-            DataType::Boolean,
-            array.len(),
-            None,
-            null_bit_buffer,
-            0,
-            vec![buffer],
-            vec![],
-        )
-    };
-
-    Ok(BooleanArray::from(data))
+    let values = BooleanBuffer::from(result);
+    let nulls = array
+        .nulls()
+        .map(|n| n.inner().sliced())
+        .and_then(|b| NullBuffer::from_unsliced_buffer(b, array.len()));
+    Ok(BooleanArray::new(values, nulls))
 }
 
 macro_rules! process_regexp_array_match {
@@ -341,6 +332,8 @@ fn get_scalar_pattern_flag_utf8view<'a>(
 
 macro_rules! process_regexp_match {
     ($array:expr, $regex:expr, $list_builder:expr) => {
+        // Reuse capture location storage across matches
+        let mut capture_locations = None;
         $array
             .iter()
             .map(|value| {
@@ -351,19 +344,25 @@ macro_rules! process_regexp_match {
                         $list_builder.values().append_value("");
                         $list_builder.append(true);
                     }
-                    Some(value) => match $regex.captures(value) {
-                        Some(caps) => {
-                            let mut iter = caps.iter();
-                            if caps.len() > 1 {
-                                iter.next();
+                    Some(value) => {
+                        let locations =
+                            capture_locations.get_or_insert_with(|| $regex.capture_locations());
+                        match $regex.captures_read(locations, value) {
+                            Some(_) => {
+                                let mut groups = 0..locations.len();
+                                if locations.len() > 1 {
+                                    // Skip group 0 (the whole match) when explicit capture groups exist.
+                                    groups.next();
+                                }
+                                let iter = groups.map(|group| locations.get(group));
+                                for (start, end) in iter.flatten() {
+                                    $list_builder.values().append_value(&value[start..end]);
+                                }
+                                $list_builder.append(true);
                             }
-                            for m in iter.flatten() {
-                                $list_builder.values().append_value(m.as_str());
-                            }
-                            $list_builder.append(true);
+                            None => $list_builder.append(false),
                         }
-                        None => $list_builder.append(false),
-                    },
+                    }
                     None => $list_builder.append(false),
                 }
                 Ok(())
@@ -442,14 +441,14 @@ pub fn regexp_match(
         None => (None, None),
     };
 
-    if is_flags_scalar.is_some() && is_rhs_scalar != is_flags_scalar.unwrap() {
+    if is_flags_scalar.is_some_and(|is_flags_scalar| is_rhs_scalar != is_flags_scalar) {
         return Err(ArrowError::ComputeError(
             "regexp_match() requires both pattern and flags to be either scalar or array"
                 .to_string(),
         ));
     }
 
-    if flags_array.is_some() && rhs.data_type() != flags.unwrap().data_type() {
+    if flags.is_some_and(|flags| rhs.data_type() != flags.data_type()) {
         return Err(ArrowError::ComputeError(
             "regexp_match() requires both pattern and flags to be either Utf8, Utf8View or LargeUtf8"
                 .to_string(),
@@ -470,7 +469,7 @@ pub fn regexp_match(
             }
         };
 
-        if regex.is_none() {
+        let Some(regex) = regex else {
             return Ok(new_null_array(
                 &DataType::List(Arc::new(Field::new_list_field(
                     array.data_type().clone(),
@@ -478,9 +477,7 @@ pub fn regexp_match(
                 ))),
                 array.len(),
             ));
-        }
-
-        let regex = regex.unwrap();
+        };
 
         let pattern = if let Some(flag) = flag {
             format!("(?{flag}){regex}")
@@ -529,6 +526,47 @@ pub fn regexp_match(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn match_scalar_pattern_capture_groups() {
+        macro_rules! check {
+            ($array_type:ty, $builder_type:ty) => {{
+                // "β" follows "aβ" to check that an optional group matched in
+                // one row is not reported for the next row.
+                let array = <$array_type>::from(vec![Some("aβ"), Some("β"), Some("none"), None]);
+                let cases: [(&str, [Option<&[&str]>; 4]); 4] = [
+                    // Optional groups that did not match are omitted.
+                    ("(a)?(β)", [Some(&["a", "β"]), Some(&["β"]), None, None]),
+                    // Without explicit groups, the whole match is returned.
+                    ("β", [Some(&["β"]), Some(&["β"]), None, None]),
+                    ("()", [Some(&[""]), Some(&[""]), Some(&[""]), None]),
+                    ("", [Some(&[""]), Some(&[""]), Some(&[""]), None]),
+                ];
+                for (pattern, rows) in cases {
+                    let mut expected = ListBuilder::new(<$builder_type>::new());
+                    for row in rows {
+                        match row {
+                            Some(values) => {
+                                for value in values {
+                                    expected.values().append_value(value);
+                                }
+                                expected.append(true);
+                            }
+                            None => expected.append(false),
+                        }
+                    }
+                    let expected = expected.finish();
+
+                    let pattern_scalar = Scalar::new(<$array_type>::from(vec![pattern]));
+                    let actual = regexp_match(&array, &pattern_scalar, None).unwrap();
+                    assert_eq!(actual.as_list::<i32>(), &expected, "{pattern}");
+                }
+            }};
+        }
+        check!(StringArray, GenericStringBuilder<i32>);
+        check!(LargeStringArray, GenericStringBuilder<i64>);
+        check!(StringViewArray, StringViewBuilder);
+    }
 
     macro_rules! test_match_single_group {
         ($test_name:ident, $values:expr, $patterns:expr, $arr_type:ty, $builder_type:ty, $expected:expr) => {

@@ -17,9 +17,8 @@
 
 use crate::bit_iterator::BitSliceIterator;
 use crate::contains_nulls;
-use crate::data::ArrayData;
+use crate::data::{ArrayData, get_fixed_size_binary_width};
 use crate::equal::primitive::NULL_SLICES_SELECTIVITY_THRESHOLD;
-use arrow_schema::DataType;
 
 use super::utils::equal_len;
 
@@ -30,10 +29,7 @@ pub(super) fn fixed_binary_equal(
     rhs_start: usize,
     len: usize,
 ) -> bool {
-    let size = match lhs.data_type() {
-        DataType::FixedSizeBinary(i) => *i as usize,
-        _ => unreachable!(),
-    };
+    let size = get_fixed_size_binary_width(lhs.data_type());
 
     let lhs_values = &lhs.buffers()[0].as_slice()[lhs.offset() * size..];
     let rhs_values = &rhs.buffers()[0].as_slice()[rhs.offset() * size..];
@@ -51,10 +47,11 @@ pub(super) fn fixed_binary_equal(
     } else {
         let selectivity_frac = lhs.null_count() as f64 / lhs.len() as f64;
 
+        // get a ref of the null buffer bytes, to use in testing for nullness
+        let lhs_nulls = lhs.nulls().unwrap();
+        let rhs_nulls = rhs.nulls().unwrap();
+
         if selectivity_frac >= NULL_SLICES_SELECTIVITY_THRESHOLD {
-            // get a ref of the null buffer bytes, to use in testing for nullness
-            let lhs_nulls = lhs.nulls().unwrap();
-            let rhs_nulls = rhs.nulls().unwrap();
             // with nulls, we need to compare item by item whenever it is not null
             (0..len).all(|i| {
                 let lhs_pos = lhs_start + i;
@@ -74,10 +71,8 @@ pub(super) fn fixed_binary_equal(
                         )
             })
         } else {
-            let lhs_nulls = lhs.nulls().unwrap();
             let lhs_slices_iter =
                 BitSliceIterator::new(lhs_nulls.validity(), lhs_start + lhs_nulls.offset(), len);
-            let rhs_nulls = rhs.nulls().unwrap();
             let rhs_slices_iter =
                 BitSliceIterator::new(rhs_nulls.validity(), rhs_start + rhs_nulls.offset(), len);
 

@@ -20,7 +20,7 @@
 mod binary_array;
 
 use crate::types::*;
-use arrow_buffer::{ArrowNativeType, NullBuffer, OffsetBuffer, ScalarBuffer};
+use arrow_buffer::{ArrowNativeType, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, IntervalUnit, TimeUnit};
 use std::any::Any;
@@ -78,8 +78,26 @@ pub use list_view_array::*;
 
 use crate::iterator::ArrayIter;
 
-/// An array in the [arrow columnar format](https://arrow.apache.org/docs/format/Columnar.html)
-pub trait Array: std::fmt::Debug + Send + Sync {
+/// An array in the [Arrow Columnar Format](https://arrow.apache.org/docs/format/Columnar.html)
+///
+/// # Safety
+///
+/// Implementations of this trait must ensure that all methods implementations comply with
+/// the Arrow specification. No safety guards are placed and failing to comply with it can
+/// translate into panics or undefined behavior. For example, a value computed based on `len`
+/// may be used as a direct index into memory regions without checks.
+///
+/// Note that it is likely impossible to correctly implement the trait for a
+/// third party type, as substantial arrow-rs functionality is based on the
+/// return values of [`Array::data_type`] and third party types cannot extend
+/// the [`DataType`] enum. So any code that attempts casting based on data type
+/// (including internal arrow library code) risks a panic or undefined behavior.
+/// See [this discussion] for more details.
+///
+/// This trait might be sealed in the future. Use at your own risk.
+///
+/// [this discussion]: https://github.com/apache/arrow-rs/pull/9234#pullrequestreview-3708950936
+pub unsafe trait Array: std::fmt::Debug + Send + Sync {
     /// Returns the array as [`Any`] so that it can be
     /// downcasted to a specific implementation.
     ///
@@ -139,6 +157,9 @@ pub trait Array: std::fmt::Debug + Send + Sync {
     ///
     /// assert_eq!(&array_slice, &Int32Array::from(vec![2, 3, 4]));
     /// ```
+    ///
+    /// # Panics
+    /// Panics if `offset + length > self.len()`
     fn slice(&self, offset: usize, length: usize) -> ArrayRef;
 
     /// Returns the length (i.e., number of elements) of this array.
@@ -247,8 +268,15 @@ pub trait Array: std::fmt::Debug + Send + Sync {
     /// let array = NullArray::new(1);
     /// assert_eq!(array.is_null(0), false);
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index >= self.len()`.
+    ///
+    /// Note: arrays without a null buffer currently return `false` instead of
+    /// panicking, but callers must not rely on this.
     fn is_null(&self, index: usize) -> bool {
-        self.nulls().map(|n| n.is_null(index)).unwrap_or_default()
+        self.nulls().is_some_and(|n| n.is_null(index))
     }
 
     /// Returns whether the element at `index` is *not* null, the
@@ -264,6 +292,13 @@ pub trait Array: std::fmt::Debug + Send + Sync {
     /// assert_eq!(array.is_valid(0), true);
     /// assert_eq!(array.is_valid(1), false);
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index >= self.len()`.
+    ///
+    /// Note: arrays without a null buffer currently return `true` instead of
+    /// panicking, but callers must not rely on this.
     fn is_valid(&self, index: usize) -> bool {
         !self.is_null(index)
     }
@@ -336,13 +371,82 @@ pub trait Array: std::fmt::Debug + Send + Sync {
     /// This value will always be greater than returned by `get_buffer_memory_size()` and
     /// includes the overhead of the data structures that contain the pointers to the various buffers.
     fn get_array_memory_size(&self) -> usize;
+
+    /// Claim memory used by this array in the provided memory pool.
+    ///
+    /// This recursively claims memory for:
+    /// - All data buffers in this array
+    /// - All child arrays (for nested types like List, Struct, etc.)
+    /// - The null bitmap buffer if present
+    ///
+    /// This method guarantees that the memory pool will only compute occupied memory
+    /// exactly once. For example, if this array is derived from operations like `slice`,
+    /// calling `claim` on it would not change the memory pool's usage if the underlying buffers
+    /// are already counted before.
+    ///
+    /// # Example
+    /// ```
+    /// # use arrow_array::{Int32Array, Array};
+    /// # use arrow_buffer::TrackingMemoryPool;
+    /// # use arrow_buffer::MemoryPool;
+    ///
+    /// let pool = TrackingMemoryPool::default();
+    ///
+    /// let small_array = Int32Array::from(vec![1, 2, 3, 4, 5]);
+    /// let small_array_size = small_array.get_buffer_memory_size();
+    ///
+    /// // Claim the array's memory in the pool
+    /// small_array.claim(&pool);
+    ///
+    /// // Create and claim slices of `small_array`; should not increase memory usage
+    /// let slice1 = small_array.slice(0, 2);
+    /// let slice2 = small_array.slice(2, 2);
+    /// slice1.claim(&pool);
+    /// slice2.claim(&pool);
+    ///
+    /// assert_eq!(pool.used(), small_array_size);
+    ///
+    /// // Create a `large_array` which does not derive from the original `small_array`
+    ///
+    /// let large_array = Int32Array::from((0..1000).collect::<Vec<i32>>());
+    /// let large_array_size = large_array.get_buffer_memory_size();
+    ///
+    /// large_array.claim(&pool);
+    ///
+    /// // Trying to claim more than once is a no-op
+    /// large_array.claim(&pool);
+    /// large_array.claim(&pool);
+    ///
+    /// assert_eq!(pool.used(), small_array_size + large_array_size);
+    ///
+    /// let sum_of_all_sizes = small_array_size + large_array_size + slice1.get_buffer_memory_size() + slice2.get_buffer_memory_size();
+    ///
+    /// // `get_buffer_memory_size` works independently of the memory pool, so a sum of all the
+    /// // arrays in scope will always be >= the memory used reported by the memory pool.
+    /// assert_ne!(pool.used(), sum_of_all_sizes);
+    ///
+    /// // Until the final claim is dropped the buffer size remains accounted for
+    /// drop(small_array);
+    /// drop(slice1);
+    ///
+    /// assert_eq!(pool.used(), small_array_size + large_array_size);
+    ///
+    /// // Dropping this finally releases the buffer that was backing `small_array`
+    /// drop(slice2);
+    ///
+    /// assert_eq!(pool.used(), large_array_size);
+    /// ```
+    #[cfg(feature = "pool")]
+    fn claim(&self, pool: &dyn arrow_buffer::MemoryPool) {
+        self.to_data().claim(pool)
+    }
 }
 
 /// A reference-counted reference to a generic `Array`
 pub type ArrayRef = Arc<dyn Array>;
 
 /// Ergonomics: Allow use of an ArrayRef as an `&dyn Array`
-impl Array for ArrayRef {
+unsafe impl Array for ArrayRef {
     fn as_any(&self) -> &dyn Any {
         self.as_ref().as_any()
     }
@@ -419,9 +523,14 @@ impl Array for ArrayRef {
     fn get_array_memory_size(&self) -> usize {
         self.as_ref().get_array_memory_size()
     }
+
+    #[cfg(feature = "pool")]
+    fn claim(&self, pool: &dyn arrow_buffer::MemoryPool) {
+        self.as_ref().claim(pool)
+    }
 }
 
-impl<T: Array> Array for &T {
+unsafe impl<T: Array> Array for &T {
     fn as_any(&self) -> &dyn Any {
         T::as_any(self)
     }
@@ -488,6 +597,11 @@ impl<T: Array> Array for &T {
 
     fn get_array_memory_size(&self) -> usize {
         T::get_array_memory_size(self)
+    }
+
+    #[cfg(feature = "pool")]
+    fn claim(&self, pool: &dyn arrow_buffer::MemoryPool) {
+        T::claim(self, pool)
     }
 }
 
@@ -620,10 +734,11 @@ impl<'a> StringArrayType<'a> for &'a StringViewArray {
     }
 }
 
-/// A trait for Arrow String Arrays, currently three types are supported:
+/// A trait for Arrow Binary Arrays, currently four types are supported:
 /// - `BinaryArray`
 /// - `LargeBinaryArray`
 /// - `BinaryViewArray`
+/// - `FixedSizeBinaryArray`
 ///
 /// This trait helps to abstract over the different types of binary arrays
 /// so that we don't need to duplicate the implementation for each type.
@@ -641,6 +756,26 @@ impl<'a> BinaryArrayType<'a> for &'a BinaryViewArray {
     fn iter(&self) -> ArrayIter<Self> {
         BinaryViewArray::iter(self)
     }
+}
+impl<'a> BinaryArrayType<'a> for &'a FixedSizeBinaryArray {
+    fn iter(&self) -> ArrayIter<Self> {
+        FixedSizeBinaryArray::iter(self)
+    }
+}
+
+/// A trait for Arrow list-like arrays, abstracting over
+/// [`GenericListArray`], [`GenericListViewArray`], and [`FixedSizeListArray`].
+///
+/// This trait provides a uniform interface for accessing the child values and
+/// computing the element range for a given index, regardless of the underlying
+/// list layout (offsets, offsets+sizes, or fixed-size).
+pub trait ListLikeArray: Array {
+    /// Returns the child values array.
+    fn values(&self) -> &ArrayRef;
+
+    /// Returns the start and end indices into the values array for the list
+    /// element at `index`.
+    fn element_range(&self, index: usize) -> std::ops::Range<usize>;
 }
 
 impl PartialEq for dyn Array + '_ {
@@ -739,8 +874,36 @@ impl<R: RunEndIndexType> PartialEq for RunArray<R> {
     }
 }
 
-/// Constructs an array using the input `data`.
-/// Returns a reference-counted `Array` instance.
+/// Constructs an [`ArrayRef`] from an [`ArrayData`].
+///
+/// # Notes:
+///
+/// It is more efficient to directly construct the concrete array type rather
+/// than using this function as creating an `ArrayData` requires at least one
+/// additional allocation (the Vec of buffers).
+///
+/// # Example:
+/// ```
+/// # use std::sync::Arc;
+/// # use arrow_data::ArrayData;
+/// # use arrow_array::{make_array, ArrayRef, Int32Array};
+/// # use arrow_buffer::{Buffer, ScalarBuffer};
+/// # use arrow_schema::DataType;
+/// // Create an Int32Array with values [1, 2, 3]
+/// let values_buffer = Buffer::from_slice_ref(&[1, 2, 3]);
+/// // ArrayData can be constructed using ArrayDataBuilder
+///  let builder = ArrayData::builder(DataType::Int32)
+///    .len(3)
+///    .add_buffer(values_buffer.clone());
+/// let array_data = builder.build().unwrap();
+/// // Create the ArrayRef from the ArrayData
+/// let array = make_array(array_data);
+///
+/// // It is equivalent to directly constructing the Int32Array
+/// let scalar_buffer = ScalarBuffer::from(values_buffer);
+/// let int32_array: ArrayRef = Arc::new(Int32Array::new(scalar_buffer, None));
+/// assert_eq!(&array, &int32_array);
+/// ```
 pub fn make_array(data: ArrayData) -> ArrayRef {
     match data.data_type() {
         DataType::Boolean => Arc::new(BooleanArray::from(data)) as ArrayRef,
@@ -824,20 +987,20 @@ pub fn make_array(data: ArrayData) -> ArrayRef {
             DataType::UInt16 => Arc::new(DictionaryArray::<UInt16Type>::from(data)) as ArrayRef,
             DataType::UInt32 => Arc::new(DictionaryArray::<UInt32Type>::from(data)) as ArrayRef,
             DataType::UInt64 => Arc::new(DictionaryArray::<UInt64Type>::from(data)) as ArrayRef,
-            dt => panic!("Unexpected dictionary key type {dt}"),
+            dt => unimplemented!("Unexpected dictionary key type {dt}"),
         },
         DataType::RunEndEncoded(run_ends_type, _) => match run_ends_type.data_type() {
             DataType::Int16 => Arc::new(RunArray::<Int16Type>::from(data)) as ArrayRef,
             DataType::Int32 => Arc::new(RunArray::<Int32Type>::from(data)) as ArrayRef,
             DataType::Int64 => Arc::new(RunArray::<Int64Type>::from(data)) as ArrayRef,
-            dt => panic!("Unexpected data type for run_ends array {dt}"),
+            dt => unimplemented!("Unexpected data type for run_ends array {dt}"),
         },
         DataType::Null => Arc::new(NullArray::from(data)) as ArrayRef,
         DataType::Decimal32(_, _) => Arc::new(Decimal32Array::from(data)) as ArrayRef,
         DataType::Decimal64(_, _) => Arc::new(Decimal64Array::from(data)) as ArrayRef,
         DataType::Decimal128(_, _) => Arc::new(Decimal128Array::from(data)) as ArrayRef,
         DataType::Decimal256(_, _) => Arc::new(Decimal256Array::from(data)) as ArrayRef,
-        dt => panic!("Unexpected data type {dt}"),
+        dt => unimplemented!("Unexpected data type {dt}"),
     }
 }
 
@@ -875,30 +1038,38 @@ pub fn new_null_array(data_type: &DataType, length: usize) -> ArrayRef {
     make_array(ArrayData::new_null(data_type, length))
 }
 
-/// Helper function that gets offset from an [`ArrayData`]
+/// Helper function that creates an [`OffsetBuffer`] from a buffer and array offset/ length
 ///
 /// # Safety
 ///
-/// - ArrayData must contain a valid [`OffsetBuffer`] as its first buffer
-unsafe fn get_offsets<O: ArrowNativeType>(data: &ArrayData) -> OffsetBuffer<O> {
-    match data.is_empty() && data.buffers()[0].is_empty() {
-        true => OffsetBuffer::new_empty(),
-        false => {
-            let buffer =
-                ScalarBuffer::new(data.buffers()[0].clone(), data.offset(), data.len() + 1);
-            // Safety:
-            // ArrayData is valid
-            unsafe { OffsetBuffer::new_unchecked(buffer) }
-        }
+/// - buffer must contain valid arrow offsets ( [`OffsetBuffer`] ) for the
+///   given length and offset.
+unsafe fn get_offsets_from_buffer<O: ArrowNativeType>(
+    buffer: Buffer,
+    offset: usize,
+    len: usize,
+) -> OffsetBuffer<O> {
+    if len == 0 && buffer.is_empty() {
+        return OffsetBuffer::new_empty();
     }
+
+    let scalar_buffer = ScalarBuffer::new(buffer, offset, len + 1);
+    // Safety:
+    // Arguments were valid
+    unsafe { OffsetBuffer::new_unchecked(scalar_buffer) }
 }
 
 /// Helper function for printing potentially long arrays.
-fn print_long_array<A, F>(array: &A, f: &mut std::fmt::Formatter, print_item: F) -> std::fmt::Result
-where
-    A: Array,
-    F: Fn(&A, usize, &mut std::fmt::Formatter) -> std::fmt::Result,
-{
+///
+/// Note this function is deliberately not generic over the array or closure
+/// type: it is called from `Debug` impls that are instantiated for many
+/// concrete array types, and using dynamic dispatch here avoids duplicating
+/// this function's code in each of those instantiations
+fn print_long_array(
+    array: &dyn Array,
+    f: &mut std::fmt::Formatter,
+    print_item: &mut dyn FnMut(usize, &mut std::fmt::Formatter) -> std::fmt::Result,
+) -> std::fmt::Result {
     let head = std::cmp::min(10, array.len());
 
     for i in 0..head {
@@ -906,7 +1077,7 @@ where
             writeln!(f, "  null,")?;
         } else {
             write!(f, "  ")?;
-            print_item(array, i, f)?;
+            print_item(i, f)?;
             writeln!(f, ",")?;
         }
     }
@@ -922,7 +1093,7 @@ where
                 writeln!(f, "  null,")?;
             } else {
                 write!(f, "  ")?;
-                print_item(array, i, f)?;
+                print_item(i, f)?;
                 writeln!(f, ",")?;
             }
         }
@@ -1029,10 +1200,10 @@ mod tests {
     fn test_null_map() {
         let data_type = DataType::Map(
             Arc::new(Field::new(
-                "entry",
+                Field::MAP_ENTRIES_FIELD_DEFAULT_NAME,
                 DataType::Struct(Fields::from(vec![
-                    Field::new("key", DataType::Utf8, false),
-                    Field::new("value", DataType::Int32, true),
+                    Field::new(Field::MAP_KEY_FIELD_DEFAULT_NAME, DataType::Utf8, false),
+                    Field::new(Field::MAP_VALUE_FIELD_DEFAULT_NAME, DataType::Int32, true),
                 ])),
                 false,
             )),
@@ -1067,13 +1238,14 @@ mod tests {
     fn test_null_union() {
         for mode in [UnionMode::Sparse, UnionMode::Dense] {
             let data_type = DataType::Union(
-                UnionFields::new(
+                UnionFields::try_new(
                     vec![2, 1],
                     vec![
                         Field::new("foo", DataType::Int32, true),
                         Field::new("bar", DataType::Int64, true),
                     ],
-                ),
+                )
+                .unwrap(),
                 mode,
             );
             let array = new_null_array(&data_type, 4);
@@ -1096,12 +1268,15 @@ mod tests {
     }
 
     #[test]
-    #[allow(unused_parens)]
     fn test_null_runs() {
         for r in [DataType::Int16, DataType::Int32, DataType::Int64] {
             let data_type = DataType::RunEndEncoded(
-                Arc::new(Field::new("run_ends", r, false)),
-                Arc::new(Field::new("values", DataType::Utf8, true)),
+                Arc::new(Field::new(Field::REE_RUN_ENDS_FIELD_DEFAULT_NAME, r, false)),
+                Arc::new(Field::new(
+                    Field::REE_VALUES_FIELD_DEFAULT_NAME,
+                    DataType::Utf8,
+                    true,
+                )),
             );
 
             let array = new_null_array(&data_type, 4);

@@ -215,24 +215,10 @@ pub(crate) fn split_second(v: i64, base: i64) -> (i64, u32) {
     (v.div_euclid(base), v.rem_euclid(base) as u32)
 }
 
-/// converts a `i64` representing a `duration(s)` to [`Duration`]
-#[inline]
-#[deprecated(since = "55.2.0", note = "Use `try_duration_s_to_duration` instead")]
-pub fn duration_s_to_duration(v: i64) -> Duration {
-    Duration::try_seconds(v).unwrap()
-}
-
 /// converts a `i64` representing a `duration(s)` to [`Option<Duration>`]
 #[inline]
 pub fn try_duration_s_to_duration(v: i64) -> Option<Duration> {
     Duration::try_seconds(v)
-}
-
-/// converts a `i64` representing a `duration(ms)` to [`Duration`]
-#[inline]
-#[deprecated(since = "55.2.0", note = "Use `try_duration_ms_to_duration` instead")]
-pub fn duration_ms_to_duration(v: i64) -> Duration {
-    Duration::try_seconds(v).unwrap()
 }
 
 /// converts a `i64` representing a `duration(ms)` to [`Option<Duration>`]
@@ -255,7 +241,17 @@ pub fn duration_ns_to_duration(v: i64) -> Duration {
 
 /// Converts an [`ArrowPrimitiveType`] to [`NaiveDateTime`]
 pub fn as_datetime<T: ArrowPrimitiveType>(v: i64) -> Option<NaiveDateTime> {
-    match T::DATA_TYPE {
+    as_datetime_with_data_type(&T::DATA_TYPE, v)
+}
+
+/// Converts a value of the given [`DataType`] to [`NaiveDateTime`]
+///
+/// Non-generic counterpart of [`as_datetime`], driven by the runtime
+/// [`DataType`] so callers that already dispatch on the data type (e.g. `Debug`
+/// impls) do not monomorphize this logic for every primitive type
+#[inline]
+pub(crate) fn as_datetime_with_data_type(data_type: &DataType, v: i64) -> Option<NaiveDateTime> {
+    match data_type {
         DataType::Date32 => date32_to_datetime(v as i32),
         DataType::Date64 => date64_to_datetime(v),
         DataType::Time32(_) | DataType::Time64(_) => None,
@@ -273,7 +269,20 @@ pub fn as_datetime<T: ArrowPrimitiveType>(v: i64) -> Option<NaiveDateTime> {
 
 /// Converts an [`ArrowPrimitiveType`] to [`DateTime<Tz>`]
 pub fn as_datetime_with_timezone<T: ArrowPrimitiveType>(v: i64, tz: Tz) -> Option<DateTime<Tz>> {
-    let naive = as_datetime::<T>(v)?;
+    as_datetime_with_timezone_and_data_type(&T::DATA_TYPE, v, tz)
+}
+
+/// Converts a value of the given [`DataType`] to [`DateTime<Tz>`]
+///
+/// Non-generic counterpart of [`as_datetime_with_timezone`], see
+/// [`as_datetime_with_data_type`]
+#[inline]
+pub(crate) fn as_datetime_with_timezone_and_data_type(
+    data_type: &DataType,
+    v: i64,
+    tz: Tz,
+) -> Option<DateTime<Tz>> {
+    let naive = as_datetime_with_data_type(data_type, v)?;
     Some(Utc.from_utc_datetime(&naive).with_timezone(&tz))
 }
 
@@ -284,7 +293,15 @@ pub fn as_date<T: ArrowPrimitiveType>(v: i64) -> Option<NaiveDate> {
 
 /// Converts an [`ArrowPrimitiveType`] to [`NaiveTime`]
 pub fn as_time<T: ArrowPrimitiveType>(v: i64) -> Option<NaiveTime> {
-    match T::DATA_TYPE {
+    as_time_with_data_type(&T::DATA_TYPE, v)
+}
+
+/// Converts a value of the given [`DataType`] to [`NaiveTime`]
+///
+/// Non-generic counterpart of [`as_time`], see [`as_datetime_with_data_type`]
+#[inline]
+pub(crate) fn as_time_with_data_type(data_type: &DataType, v: i64) -> Option<NaiveTime> {
+    match data_type {
         DataType::Time32(unit) => {
             // safe to immediately cast to u32 as `self.value(i)` is positive i32
             let v = v as u32;
@@ -299,7 +316,9 @@ pub fn as_time<T: ArrowPrimitiveType>(v: i64) -> Option<NaiveTime> {
             TimeUnit::Nanosecond => time64ns_to_time(v),
             _ => None,
         },
-        DataType::Timestamp(_, _) => as_datetime::<T>(v).map(|datetime| datetime.time()),
+        DataType::Timestamp(_, _) => {
+            as_datetime_with_data_type(data_type, v).map(|datetime| datetime.time())
+        }
         DataType::Date32 | DataType::Date64 => NaiveTime::from_hms_opt(0, 0, 0),
         DataType::Interval(_) => None,
         _ => None,

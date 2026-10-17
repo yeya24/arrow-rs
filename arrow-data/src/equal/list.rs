@@ -21,7 +21,7 @@ use num_integer::Integer;
 
 use super::equal_range;
 
-fn lengths_equal<T: ArrowNativeType + Integer>(lhs: &[T], rhs: &[T]) -> bool {
+pub(super) fn lengths_equal<T: ArrowNativeType + Integer>(lhs: &[T], rhs: &[T]) -> bool {
     // invariant from `base_equal`
     debug_assert_eq!(lhs.len(), rhs.len());
 
@@ -31,7 +31,7 @@ fn lengths_equal<T: ArrowNativeType + Integer>(lhs: &[T], rhs: &[T]) -> bool {
 
     if lhs[0] == T::zero() && rhs[0] == T::zero() {
         return lhs == rhs;
-    };
+    }
 
     // The expensive case, e.g.
     // [0, 2, 4, 6, 9] == [4, 6, 8, 10, 13]

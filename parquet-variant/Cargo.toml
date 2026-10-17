@@ -17,12 +17,9 @@
 
 [package]
 name = "parquet-variant"
-# This package is still in development and thus the version does
-# not follow the versions of the rest of the crates in this repo.
-version = "0.2.0"
+version = { workspace = true }
 license = { workspace = true }
 description = "Apache Parquet Variant implementation in Rust"
-homepage = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
 keywords = ["arrow", "parquet", "variant"]
@@ -35,18 +32,21 @@ arrow-schema = { workspace = true }
 chrono = { workspace = true }
 half = { version = "2.1", default-features = false }
 indexmap = "2.10.0"
-uuid = { version = "1.18.0", features = ["v4"]}
+uuid = { version = "1.18.0", features = ["v4"] }
+simdutf8 = { workspace = true, optional = true }
 
-simdutf8 = { workspace = true , optional = true }
+# uuid requires the `js` feature to run on wasm
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+uuid = { version = "1.18.0", features = ["v4", "js"] }
 
 [lib]
 name = "parquet_variant"
 bench = false
 
 [dev-dependencies]
-paste = { version = "1.0" }
-criterion = { version = "0.6", default-features = false }
-rand = { version = "0.9", default-features = false, features = [
+proptest = { version = "1.0", default-features = false, features = ["std"] }
+criterion = { workspace = true, default-features = false }
+rand = { version = "0.10", default-features = false, features = [
     "std",
     "std_rng",
     "thread_rng",
@@ -64,3 +64,10 @@ harness = false
 [[bench]]
 name = "variant_validation"
 harness = false
+
+[[bench]]
+name = "variant_path"
+harness = false
+
+[lints]
+workspace = true

@@ -19,7 +19,6 @@
 name = "arrow-row"
 version = { workspace = true }
 description = "Arrow row format"
-homepage = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
 license = { workspace = true }
@@ -46,4 +45,8 @@ half = { version = "2.1", default-features = false }
 [dev-dependencies]
 arrow-cast = { workspace = true }
 arrow-ord = { workspace = true }
-rand = { version = "0.9", default-features = false, features = ["std", "std_rng", "thread_rng"] }
+arrow-select = { workspace = true }
+rand = { version = "0.10", default-features = false, features = ["std", "std_rng", "thread_rng"] }
+
+[lints]
+workspace = true

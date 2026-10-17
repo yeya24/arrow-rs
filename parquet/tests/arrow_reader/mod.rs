@@ -38,13 +38,25 @@ use parquet::file::properties::{
 use std::sync::Arc;
 use tempfile::NamedTempFile;
 
+#[cfg(feature = "async")]
+mod async_reader;
 mod bad_data;
+mod bloom_filter;
 #[cfg(feature = "crc")]
 mod checksum;
+mod custom_page_index_provider;
 mod int96_stats_roundtrip;
+mod invalid_utf8;
 mod io;
+mod large_string_overflow;
+mod legacy_fixed_len_byte_array;
+mod page_index;
+mod parquet_testing;
+mod partial_offset_index;
 #[cfg(feature = "async")]
 mod predicate_cache;
+mod push_decoder_equivalence;
+mod row_filter;
 mod statistics;
 
 // returns a struct array with columns "int32_col", "float32_col" and "float64_col" with the specified values
@@ -555,7 +567,8 @@ fn make_bytearray_batch(
         .iter()
         .map(|value| Some(value.as_slice()))
         .collect::<Vec<_>>()
-        .into();
+        .try_into()
+        .unwrap();
     let service_large_binary: LargeBinaryArray = large_binary_values.iter().map(Some).collect();
 
     let schema = Schema::new(vec![
@@ -669,8 +682,8 @@ fn make_dict_batch() -> RecordBatch {
         Some("fffff"),
         Some("aaa"),
     ];
-    let dict_i8_array = DictionaryArray::<Int8Type>::from_iter(values.iter().cloned());
-    let dict_i32_array = DictionaryArray::<Int32Type>::from_iter(values.iter().cloned());
+    let dict_i8_array = DictionaryArray::<Int8Type>::from_iter(values.iter().copied());
+    let dict_i32_array = DictionaryArray::<Int32Type>::from_iter(values.iter().copied());
 
     // Dictionary array of integers
     let int64_values = Int64Array::from(vec![0, -100, 100]);
@@ -1128,7 +1141,7 @@ async fn make_test_file_rg(scenario: Scenario, row_per_group: usize) -> NamedTem
         .expect("tempfile creation");
 
     let mut builder = WriterProperties::builder()
-        .set_max_row_group_size(row_per_group)
+        .set_max_row_group_row_count(Some(row_per_group))
         .set_bloom_filter_enabled(true)
         .set_statistics_enabled(EnabledStatistics::Page);
     if scenario.truncate_stats() {

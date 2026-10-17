@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::ValueIter;
 use arrow_schema::{ArrowError, DataType, Field, Fields, Schema};
 use indexmap::map::IndexMap as HashMap;
 use indexmap::set::IndexSet as HashSet;
@@ -93,9 +94,8 @@ fn coerce_data_type(dt: Vec<&DataType>) -> DataType {
         (DataType::Null, o) | (o, DataType::Null) => o,
         (DataType::Boolean, DataType::Boolean) => DataType::Boolean,
         (DataType::Int64, DataType::Int64) => DataType::Int64,
-        (DataType::Float64, DataType::Float64)
-        | (DataType::Float64, DataType::Int64)
-        | (DataType::Int64, DataType::Float64) => DataType::Float64,
+        (DataType::Float64 | DataType::Int64, DataType::Float64)
+        | (DataType::Float64, DataType::Int64) => DataType::Float64,
         (DataType::List(l), DataType::List(r)) => {
             list_type_of(coerce_data_type(vec![l.data_type(), r.data_type()]))
         }
@@ -125,83 +125,6 @@ fn generate_fields(spec: &HashMap<String, InferredType>) -> Result<Fields, Arrow
 /// Generate schema from JSON field names and inferred data types
 fn generate_schema(spec: HashMap<String, InferredType>) -> Result<Schema, ArrowError> {
     Ok(Schema::new(generate_fields(&spec)?))
-}
-
-/// JSON file reader that produces a serde_json::Value iterator from a Read trait
-///
-/// # Example
-///
-/// ```
-/// use std::fs::File;
-/// use std::io::BufReader;
-/// use arrow_json::reader::ValueIter;
-///
-/// let mut reader =
-///     BufReader::new(File::open("test/data/mixed_arrays.json").unwrap());
-/// let mut value_reader = ValueIter::new(&mut reader, None);
-/// for value in value_reader {
-///     println!("JSON value: {}", value.unwrap());
-/// }
-/// ```
-#[derive(Debug)]
-pub struct ValueIter<R: BufRead> {
-    reader: R,
-    max_read_records: Option<usize>,
-    record_count: usize,
-    // reuse line buffer to avoid allocation on each record
-    line_buf: String,
-}
-
-impl<R: BufRead> ValueIter<R> {
-    /// Creates a new `ValueIter`
-    pub fn new(reader: R, max_read_records: Option<usize>) -> Self {
-        Self {
-            reader,
-            max_read_records,
-            record_count: 0,
-            line_buf: String::new(),
-        }
-    }
-}
-
-impl<R: BufRead> Iterator for ValueIter<R> {
-    type Item = Result<Value, ArrowError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(max) = self.max_read_records {
-            if self.record_count >= max {
-                return None;
-            }
-        }
-
-        loop {
-            self.line_buf.truncate(0);
-            match self.reader.read_line(&mut self.line_buf) {
-                Ok(0) => {
-                    // read_line returns 0 when stream reached EOF
-                    return None;
-                }
-                Err(e) => {
-                    return Some(Err(ArrowError::JsonError(format!(
-                        "Failed to read JSON record: {e}"
-                    ))));
-                }
-                _ => {
-                    let trimmed_s = self.line_buf.trim();
-                    if trimmed_s.is_empty() {
-                        // ignore empty lines
-                        continue;
-                    }
-
-                    self.record_count += 1;
-                    return Some(
-                        serde_json::from_str(trimmed_s)
-                            .map_err(|e| ArrowError::JsonError(format!("Not valid JSON: {e}"))),
-                    );
-                }
-            }
-        }
-    }
 }
 
 /// Infer the fields of a JSON file by reading the first n records of the file, with
@@ -250,6 +173,15 @@ pub fn infer_json_schema_from_seekable<R: BufRead + Seek>(
 /// original file's cursor. This function is useful when the `reader`'s cursor is not available
 /// (does not implement [`Seek`]), such is the case for compressed streams decoders.
 ///
+///
+/// Note that JSON is not able to represent all Arrow data types exactly. So the inferred schema
+/// might be different from the schema of the original data that was encoded as JSON. For example,
+/// JSON does not have different integer types, so all integers are inferred as `Int64`. Another
+/// example is binary data, which is encoded as a [Base16] string in JSON and therefore inferred
+/// as String type by this function.
+///
+/// [Base16]: https://en.wikipedia.org/wiki/Base16#Base16
+///
 /// # Examples
 /// ```
 /// use std::fs::File;
@@ -273,7 +205,7 @@ pub fn infer_json_schema<R: BufRead>(
 ) -> Result<(Schema, usize), ArrowError> {
     let mut values = ValueIter::new(reader, max_read_records);
     let schema = infer_json_schema_from_iterator(&mut values)?;
-    Ok((schema, values.record_count))
+    Ok((schema, values.record_count()))
 }
 
 fn set_object_scalar_field_type(
@@ -396,13 +328,13 @@ fn collect_field_types_from_object(
                     match ele_type {
                         InferredType::Scalar(_) => {
                             field_types.insert(
-                                k.to_string(),
+                                k.clone(),
                                 InferredType::Array(Box::new(InferredType::Scalar(HashSet::new()))),
                             );
                         }
                         InferredType::Object(_) => {
                             field_types.insert(
-                                k.to_string(),
+                                k.clone(),
                                 InferredType::Array(Box::new(InferredType::Object(HashMap::new()))),
                             );
                         }
@@ -410,7 +342,7 @@ fn collect_field_types_from_object(
                             // set inner type to any for nested array as well
                             // so it can be updated properly from subsequent type merges
                             field_types.insert(
-                                k.to_string(),
+                                k.clone(),
                                 InferredType::Array(Box::new(InferredType::Any)),
                             );
                         }
@@ -441,7 +373,7 @@ fn collect_field_types_from_object(
                 // we treat json as nullable by default when inferring, so just
                 // mark existence of a field if it wasn't known before
                 if !field_types.contains_key(k) {
-                    field_types.insert(k.to_string(), InferredType::Any);
+                    field_types.insert(k.clone(), InferredType::Any);
                 }
             }
             Value::Number(n) => {
@@ -455,8 +387,11 @@ fn collect_field_types_from_object(
                 set_object_scalar_field_type(field_types, k, DataType::Utf8)?;
             }
             Value::Object(inner_map) => {
-                if let InferredType::Any = field_types.get(k).unwrap_or(&InferredType::Any) {
-                    field_types.insert(k.to_string(), InferredType::Object(HashMap::new()));
+                if matches!(
+                    field_types.get(k).unwrap_or(&InferredType::Any),
+                    InferredType::Any
+                ) {
+                    field_types.insert(k.clone(), InferredType::Object(HashMap::new()));
                 }
                 match field_types.get_mut(k).unwrap() {
                     InferredType::Object(inner_field_types) => {
@@ -505,7 +440,7 @@ where
                     "Expected JSON record to be an object, found {value:?}"
                 )));
             }
-        };
+        }
     }
 
     generate_schema(field_types)
@@ -729,11 +664,7 @@ mod tests {
             infer_json_schema_from_seekable(Cursor::new(data), None).expect("infer");
         let schema = Schema::new(vec![Field::new(
             "obj",
-            DataType::Struct(
-                [Field::new("foo", DataType::Int64, true)]
-                    .into_iter()
-                    .collect(),
-            ),
+            DataType::Struct(std::iter::once(Field::new("foo", DataType::Int64, true)).collect()),
             true,
         )]);
         assert_eq!(inferred_schema, schema);

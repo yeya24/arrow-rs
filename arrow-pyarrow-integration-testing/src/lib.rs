@@ -31,8 +31,8 @@ use arrow::array::{Array, ArrayData, ArrayRef, Int64Array, make_array};
 use arrow::compute::kernels;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::error::ArrowError;
-use arrow::ffi_stream::ArrowArrayStreamReader;
-use arrow::pyarrow::{FromPyArrow, PyArrowException, PyArrowType, ToPyArrow};
+use arrow::ffi_stream::RecordBatchStreamReader;
+use arrow::pyarrow::{FromPyArrow, PyArrowException, PyArrowType, Table, ToPyArrow};
 use arrow::record_batch::RecordBatch;
 
 fn to_py_err(err: ArrowError) -> PyErr {
@@ -135,13 +135,33 @@ fn round_trip_record_batch(obj: PyArrowType<RecordBatch>) -> PyResult<PyArrowTyp
 
 #[pyfunction]
 fn round_trip_record_batch_reader(
-    obj: PyArrowType<ArrowArrayStreamReader>,
-) -> PyResult<PyArrowType<ArrowArrayStreamReader>> {
+    obj: PyArrowType<RecordBatchStreamReader>,
+) -> PyResult<PyArrowType<RecordBatchStreamReader>> {
     Ok(obj)
 }
 
 #[pyfunction]
-fn reader_return_errors(obj: PyArrowType<ArrowArrayStreamReader>) -> PyResult<()> {
+fn round_trip_table(obj: PyArrowType<Table>) -> PyResult<PyArrowType<Table>> {
+    Ok(obj)
+}
+
+/// Builds a Table from a list of RecordBatches and a Schema.
+#[pyfunction]
+pub fn build_table(
+    record_batches: Vec<PyArrowType<RecordBatch>>,
+    schema: PyArrowType<Schema>,
+) -> PyResult<PyArrowType<Table>> {
+    Ok(PyArrowType(
+        Table::try_new(
+            record_batches.into_iter().map(|rb| rb.0).collect(),
+            Arc::new(schema.0),
+        )
+        .map_err(to_py_err)?,
+    ))
+}
+
+#[pyfunction]
+fn reader_return_errors(obj: PyArrowType<RecordBatchStreamReader>) -> PyResult<()> {
     // This makes sure we can correctly consume a RBR and return the error,
     // ensuring the error can live beyond the lifetime of the RBR.
     let batches = obj.0.collect::<Result<Vec<RecordBatch>, ArrowError>>();
@@ -153,7 +173,7 @@ fn reader_return_errors(obj: PyArrowType<ArrowArrayStreamReader>) -> PyResult<()
 
 #[pyfunction]
 fn boxed_reader_roundtrip(
-    obj: PyArrowType<ArrowArrayStreamReader>,
+    obj: PyArrowType<RecordBatchStreamReader>,
 ) -> PyArrowType<Box<dyn RecordBatchReader + Send>> {
     let schema = obj.0.schema();
     let batches = obj
@@ -178,6 +198,8 @@ fn arrow_pyarrow_integration_testing(_py: Python, m: &Bound<PyModule>) -> PyResu
     m.add_wrapped(wrap_pyfunction!(round_trip_array))?;
     m.add_wrapped(wrap_pyfunction!(round_trip_record_batch))?;
     m.add_wrapped(wrap_pyfunction!(round_trip_record_batch_reader))?;
+    m.add_wrapped(wrap_pyfunction!(round_trip_table))?;
+    m.add_wrapped(wrap_pyfunction!(build_table))?;
     m.add_wrapped(wrap_pyfunction!(reader_return_errors))?;
     m.add_wrapped(wrap_pyfunction!(boxed_reader_roundtrip))?;
     Ok(())

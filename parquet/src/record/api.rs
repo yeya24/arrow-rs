@@ -50,7 +50,7 @@ pub struct Row {
     fields: Vec<(String, Field)>,
 }
 
-#[allow(clippy::len_without_is_empty)]
+#[expect(clippy::len_without_is_empty)]
 impl Row {
     /// Constructs a `Row` from the list of `fields` and returns it.
     pub fn new(fields: Vec<(String, Field)>) -> Row {
@@ -140,6 +140,8 @@ impl<'a> Iterator for RowColumnIter<'a> {
 
 /// Trait for type-safe convenient access to fields within a Row.
 pub trait RowAccessor {
+    /// Check if the field at the index is null.
+    fn is_null(&self, i: usize) -> Result<bool>;
     /// Try to get a boolean value at the given index.
     fn get_bool(&self, i: usize) -> Result<bool>;
     /// Try to get a byte value at the given index.
@@ -210,11 +212,12 @@ pub trait RowFormatter {
 macro_rules! row_primitive_accessor {
     ($METHOD:ident, $VARIANT:ident, $TY:ty) => {
         fn $METHOD(&self, i: usize) -> Result<$TY> {
-            match self.fields[i].1 {
-                Field::$VARIANT(v) => Ok(v),
+            match self.fields.get(i) {
+                Some((_, Field::$VARIANT(v))) => Ok(*v),
+                None => Err(ParquetError::IndexOutOfBound(i, self.fields.len())),
                 _ => Err(general_err!(
                     "Cannot access {} as {}",
-                    self.fields[i].1.get_type_name(),
+                    self.fields[i].1.get_type_name(), // Safe access as None is
                     stringify!($VARIANT)
                 )),
             }
@@ -227,11 +230,13 @@ macro_rules! row_primitive_accessor {
 macro_rules! row_complex_accessor {
     ($METHOD:ident, $VARIANT:ident, $TY:ty) => {
         fn $METHOD(&self, i: usize) -> Result<&$TY> {
-            match self.fields[i].1 {
-                Field::$VARIANT(ref v) => Ok(v),
+            match self.fields.get(i) {
+                Some((_, Field::$VARIANT(v))) => Ok(v),
+                None => Err(ParquetError::IndexOutOfBound(i, self.fields.len())),
                 _ => Err(general_err!(
                     "Cannot access {} as {}",
-                    self.fields[i].1.get_type_name(),
+                    self.fields[i].1.get_type_name(), // Safe access as None is
+                    // just checked.
                     stringify!($VARIANT)
                 )),
             }
@@ -242,11 +247,23 @@ macro_rules! row_complex_accessor {
 impl RowFormatter for Row {
     /// Get Display reference for a given field.
     fn fmt(&self, i: usize) -> &dyn fmt::Display {
-        &self.fields[i].1
+        if let Some((_, v)) = self.fields.get(i) {
+            v
+        } else {
+            &"<IndexOutOfBound>"
+        }
     }
 }
 
 impl RowAccessor for Row {
+    fn is_null(&self, i: usize) -> Result<bool> {
+        match self.fields.get(i) {
+            Some((_, Field::Null)) => Ok(true),
+            None => Err(ParquetError::IndexOutOfBound(i, self.len())),
+            _ => Ok(false),
+        }
+    }
+
     row_primitive_accessor!(get_bool, Bool, bool);
 
     row_primitive_accessor!(get_byte, Byte, i8);
@@ -309,7 +326,7 @@ pub struct List {
     elements: Vec<Field>,
 }
 
-#[allow(clippy::len_without_is_empty)]
+#[expect(clippy::len_without_is_empty)]
 impl List {
     /// Get the number of fields in this row
     pub fn len(&self) -> usize {
@@ -457,7 +474,7 @@ pub struct Map {
     entries: Vec<(Field, Field)>,
 }
 
-#[allow(clippy::len_without_is_empty)]
+#[expect(clippy::len_without_is_empty)]
 impl Map {
     /// Get the number of fields in this row
     pub fn len(&self) -> usize {
@@ -756,7 +773,7 @@ impl Field {
                     descr.type_precision(),
                     descr.type_scale(),
                 )),
-                ConvertedType::NONE if descr.logical_type() == Some(LogicalType::Float16) => {
+                ConvertedType::NONE if descr.logical_type_ref() == Some(&LogicalType::Float16) => {
                     if value.len() != 2 {
                         return Err(general_err!(
                             "Error reading FIXED_LEN_BYTE_ARRAY as FLOAT16. Length must be 2, got {}",
@@ -973,11 +990,11 @@ fn convert_time_micros_to_string(value: i64) -> String {
 }
 
 /// Helper method to convert Parquet decimal into a string.
-/// We assert that `scale >= 0` and `precision > scale`, but this will be enforced
-/// when constructing Parquet schema.
+/// We assert that `scale >= 0` and `precision >= scale`, which is enforced when
+/// constructing a Parquet schema.
 #[inline]
 fn convert_decimal_to_string(decimal: &Decimal) -> String {
-    assert!(decimal.scale() >= 0 && decimal.precision() > decimal.scale());
+    assert!(decimal.scale() >= 0 && decimal.precision() >= decimal.scale());
 
     // Specify as signed bytes to resolve sign as part of conversion.
     let num = BigInt::from_signed_bytes_be(decimal.data());
@@ -1005,7 +1022,7 @@ fn convert_decimal_to_string(decimal: &Decimal) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::many_single_char_names)]
+#[expect(clippy::many_single_char_names)]
 mod tests {
     use super::*;
 
@@ -1017,19 +1034,19 @@ mod tests {
     /// Creates test column descriptor based on provided type parameters.
     macro_rules! make_column_descr {
         ($physical_type:expr, $logical_type:expr) => {{
-            let tpe = PrimitiveTypeBuilder::new("col", $physical_type)
+            let type_ = PrimitiveTypeBuilder::new("col", $physical_type)
                 .with_converted_type($logical_type)
                 .build()
                 .unwrap();
             Arc::new(ColumnDescriptor::new(
-                Arc::new(tpe),
+                Arc::new(type_),
                 0,
                 0,
                 ColumnPath::from("col"),
             ))
         }};
         ($physical_type:expr, $logical_type:expr, $len:expr, $prec:expr, $scale:expr) => {{
-            let tpe = PrimitiveTypeBuilder::new("col", $physical_type)
+            let type_ = PrimitiveTypeBuilder::new("col", $physical_type)
                 .with_converted_type($logical_type)
                 .with_length($len)
                 .with_precision($prec)
@@ -1037,7 +1054,7 @@ mod tests {
                 .build()
                 .unwrap();
             Arc::new(ColumnDescriptor::new(
-                Arc::new(tpe),
+                Arc::new(type_),
                 0,
                 0,
                 ColumnPath::from("col"),
@@ -1219,13 +1236,13 @@ mod tests {
 
         // FLOAT16
         let descr = {
-            let tpe = PrimitiveTypeBuilder::new("col", PhysicalType::FIXED_LEN_BYTE_ARRAY)
+            let type_ = PrimitiveTypeBuilder::new("col", PhysicalType::FIXED_LEN_BYTE_ARRAY)
                 .with_logical_type(Some(LogicalType::Float16))
                 .with_length(2)
                 .build()
                 .unwrap();
             Arc::new(ColumnDescriptor::new(
-                Arc::new(tpe),
+                Arc::new(type_),
                 0,
                 0,
                 ColumnPath::from("col"),
@@ -1343,6 +1360,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // inline assembly is not supported
     fn test_convert_float16_to_string() {
         assert_eq!(format!("{}", Field::Float16(f16::ONE)), "1.0");
         assert_eq!(format!("{}", Field::Float16(f16::PI)), "3.140625");
@@ -1411,9 +1429,13 @@ mod tests {
         check_decimal(vec![0, 0, 0, 0, 1, 201, 195, 140], 18, 2, "300000.12");
         check_decimal(vec![207, 200], 10, 2, "-123.44");
         check_decimal(vec![207, 200], 10, 8, "-0.00012344");
+        check_decimal(vec![48, 57], 5, 5, "0.12345");
+        check_decimal(vec![207, 199], 5, 5, "-0.12345");
+        check_decimal(vec![45], 5, 5, "0.00045");
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // inline assembly is not supported
     fn test_row_display() {
         // Primitive types
         assert_eq!(format!("{}", Field::Null), "null");
@@ -1537,6 +1559,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // inline assembly is not supported
     fn test_row_primitive_field_fmt() {
         // Primitives types
         let row = Row::new(vec![
@@ -1627,6 +1650,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // inline assembly is not supported
     fn test_row_primitive_accessors() {
         // primitives
         let row = Row::new(vec![
@@ -1651,6 +1675,8 @@ mod tests {
             ("p".to_string(), Field::Float16(f16::from_f32(9.1))),
         ]);
 
+        assert!(row.is_null(0).unwrap());
+        assert!(!row.is_null(1).unwrap());
         assert!(!row.get_bool(1).unwrap());
         assert_eq!(3, row.get_byte(2).unwrap());
         assert_eq!(4, row.get_short(3).unwrap());
@@ -1666,9 +1692,75 @@ mod tests {
         assert_eq!(5, row.get_bytes(13).unwrap().len());
         assert_eq!(7, row.get_decimal(14).unwrap().precision());
         assert!((f16::from_f32(9.1) - row.get_float16(15).unwrap()).abs() < f16::EPSILON);
+
+        assert!(matches!(
+            row.is_null(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
+        assert!(matches!(
+            row.get_bool(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
+        assert!(matches!(
+            row.get_byte(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
+        assert!(matches!(
+            row.get_short(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
+        assert!(matches!(
+            row.get_int(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
+        assert!(matches!(
+            row.get_long(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
+        assert!(matches!(
+            row.get_ubyte(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
+        assert!(matches!(
+            row.get_ushort(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
+        assert!(matches!(
+            row.get_uint(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
+        assert!(matches!(
+            row.get_ulong(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
+        assert!(matches!(
+            row.get_float(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
+        assert!(matches!(
+            row.get_double(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
+        assert!(matches!(
+            row.get_string(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
+        assert!(matches!(
+            row.get_bytes(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
+        assert!(matches!(
+            row.get_decimal(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
+        assert!(matches!(
+            row.get_float16(16).unwrap_err(),
+            ParquetError::IndexOutOfBound(16, 16),
+        ));
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // inline assembly is not supported
     fn test_row_primitive_invalid_accessors() {
         // primitives
         let row = Row::new(vec![
@@ -1776,6 +1868,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // inline assembly is not supported
     fn test_list_primitive_accessors() {
         // primitives
         let list = make_list(vec![Field::Bool(false)]);
@@ -1960,6 +2053,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // inline assembly is not supported
     fn test_to_json_value() {
         assert_eq!(Field::Null.to_json_value(), Value::Null);
         assert_eq!(Field::Bool(true).to_json_value(), Value::Bool(true));
@@ -2077,7 +2171,6 @@ mod tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::many_single_char_names)]
 mod api_tests {
     use super::{Row, make_list, make_map};
     use crate::record::Field;

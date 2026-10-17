@@ -20,17 +20,26 @@
 use crate::array::*;
 use crate::datatypes::*;
 use crate::util::test_util::seedable_rng;
-use arrow_buffer::{Buffer, IntervalMonthDayNano};
+use arrow_buffer::{Buffer, IntervalMonthDayNano, NullBuffer};
+use arrow_schema::Field;
 use half::f16;
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use rand::distr::uniform::SampleUniform;
 use rand::rng;
 use rand::{
-    distr::{Alphanumeric, Distribution, StandardUniform},
+    distr::{Alphanumeric, Distribution, SampleString, StandardUniform},
     prelude::StdRng,
 };
 use std::ops::Range;
+use std::sync::Arc;
+
+fn f16_random(rng: &mut StdRng) -> f16 {
+    // Otherwise it can round up to 1.0 even though we should generate in [0, 1)
+    // See: https://github.com/VoidStarKat/half-rs/issues/152
+    let one_next_down = f16::from_bits(0x3BFFu16); // 0.9995117
+    f16::from_f32(rng.random::<f32>()).clamp(f16::ZERO, one_next_down)
+}
 
 /// Creates an random (but fixed-seeded) array of a given size and null density
 pub fn create_primitive_array<T>(size: usize, null_density: f32) -> PrimitiveArray<T>
@@ -46,6 +55,50 @@ where
                 None
             } else {
                 Some(rng.random())
+            }
+        })
+        .collect()
+}
+
+/// Same as [`create_primitive_array`] but specialized for f16 since it doesn't
+/// implement the required rand traits.
+///
+/// This may be deprecated/removed in the future if half updates to the required
+/// rand version.
+pub fn create_nullable_f16_array(size: usize, null_density: f32) -> Float16Array {
+    let mut rng = seedable_rng();
+
+    (0..size)
+        .map(|_| {
+            if rng.random::<f32>() < null_density {
+                None
+            } else {
+                Some(f16_random(&mut rng))
+            }
+        })
+        .collect()
+}
+
+/// Creates an random (but fixed-seeded) array of a given size and null density,
+/// all the values located in the given range
+pub fn create_primitive_array_range<T>(
+    size: usize,
+    null_density: f32,
+    value_range: Range<T::Native>,
+) -> PrimitiveArray<T>
+where
+    T: ArrowPrimitiveType,
+    StandardUniform: Distribution<T::Native>,
+    T::Native: SampleUniform,
+{
+    let mut rng = seedable_rng();
+
+    (0..size)
+        .map(|_| {
+            if rng.random::<f32>() < null_density {
+                None
+            } else {
+                Some(rng.random_range(value_range.clone()))
             }
         })
         .collect()
@@ -117,6 +170,29 @@ where
         .collect()
 }
 
+/// Creates a random array of a given size and null density based on the provided seed
+pub fn create_boolean_array_with_seed(
+    size: usize,
+    null_density: f32,
+    true_density: f32,
+    seed: u64,
+) -> BooleanArray
+where
+    StandardUniform: Distribution<bool>,
+{
+    let mut rng = StdRng::seed_from_u64(seed);
+    (0..size)
+        .map(|_| {
+            if rng.random::<f32>() < null_density {
+                None
+            } else {
+                let value = rng.random::<f32>() < true_density;
+                Some(value)
+            }
+        })
+        .collect()
+}
+
 /// Creates a random (but fixed-seeded) string array of a given size and null density.
 ///
 /// Strings have a random length
@@ -156,6 +232,31 @@ fn create_string_array_with_len_range_and_prefix<Offset: OffsetSizeTrait>(
     max_str_len: usize,
     prefix: &str,
 ) -> GenericStringArray<Offset> {
+    create_string_array_with_len_range_and_prefix_and_seed(
+        size,
+        null_density,
+        min_str_len,
+        max_str_len,
+        prefix,
+        42,
+    )
+}
+
+/// Creates a random [`GenericStringArray`] of a given `size` and `null_density`
+/// filling it with random strings with lengths in the specified range,
+/// all starting with the provided `prefix`, generated using the provided `seed`.
+///
+/// # Panics
+///
+/// Panics if `min_str_len > max_str_len` or `prefix.len() > max_str_len`
+pub fn create_string_array_with_len_range_and_prefix_and_seed<Offset: OffsetSizeTrait>(
+    size: usize,
+    null_density: f32,
+    min_str_len: usize,
+    max_str_len: usize,
+    prefix: &str,
+    seed: u64,
+) -> GenericStringArray<Offset> {
     assert!(
         min_str_len <= max_str_len,
         "min_str_len must be <= max_str_len"
@@ -165,7 +266,7 @@ fn create_string_array_with_len_range_and_prefix<Offset: OffsetSizeTrait>(
         "Prefix length must be <= max_str_len"
     );
 
-    let rng = &mut seedable_rng();
+    let rng = &mut StdRng::seed_from_u64(seed);
     (0..size)
         .map(|_| {
             if rng.random::<f32>() < null_density {
@@ -182,6 +283,33 @@ fn create_string_array_with_len_range_and_prefix<Offset: OffsetSizeTrait>(
                         .map(char::from),
                 );
 
+                Some(value)
+            }
+        })
+        .collect()
+}
+/// Creates a string view array of a given range, null density and length
+///
+/// Arguments:
+/// - `size`: number of  string view array
+/// - `null_density`: density of nulls in the string view array
+/// - `range`: range size of each string in the string view array
+/// - `seed`: seed for the random number generator
+pub fn create_string_view_array_with_len_range_and_seed(
+    size: usize,
+    null_density: f32,
+    range: Range<usize>,
+    seed: u64,
+) -> StringViewArray {
+    let rng = &mut StdRng::seed_from_u64(seed);
+    (0..size)
+        .map(|_| {
+            if rng.random::<f32>() < null_density {
+                None
+            } else {
+                let str_len = rng.random_range(range.clone());
+                let value = rng.sample_iter(&Alphanumeric).take(str_len).collect();
+                let value = String::from_utf8(value).unwrap();
                 Some(value)
             }
         })
@@ -377,7 +505,128 @@ pub fn create_string_dict_array<K: ArrowDictionaryKeyType>(
     data.iter().map(|x| x.as_deref()).collect()
 }
 
+/// Create a List/LargeList Array  of primitive values
+///
+/// Arguments:
+/// - `size`: number of lists in the array
+/// - `null_density`: density of nulls in the list array
+/// - `list_null_density`: density of nulls in the primitive arrays inside the lists
+/// - `max_list_size`: maximum size of each list (actual size is random between 0 and max_list_size)
+/// - `seed`: seed for the random number generator
+pub fn create_primitive_list_array_with_seed<O, T>(
+    size: usize,
+    null_density: f32,
+    list_null_density: f32,
+    max_list_size: usize,
+    seed: u64,
+) -> GenericListArray<O>
+where
+    O: OffsetSizeTrait,
+    T: ArrowPrimitiveType,
+    StandardUniform: Distribution<T::Native>,
+{
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    let values = (0..size).map(|_| {
+        if rng.random::<f32>() < null_density {
+            None
+        } else {
+            let list_size = rng.random_range(0..=max_list_size);
+            let list_values: Vec<Option<T::Native>> = (0..list_size)
+                .map(|_| {
+                    if rng.random::<f32>() < list_null_density {
+                        None
+                    } else {
+                        Some(rng.random())
+                    }
+                })
+                .collect();
+            Some(list_values)
+        }
+    });
+
+    GenericListArray::<O>::from_iter_primitive::<T, _, _>(values)
+}
+
+/// Create a List/LargeList Array of primitive values using a fixed seed
+///
+/// See [`create_primitive_list_array_with_seed`] for details on arguments.
+pub fn create_primitive_list_array<O, T>(
+    size: usize,
+    null_density: f32,
+    list_null_density: f32,
+    max_list_size: usize,
+) -> GenericListArray<O>
+where
+    O: OffsetSizeTrait,
+    T: ArrowPrimitiveType,
+    StandardUniform: Distribution<T::Native>,
+{
+    let mut rng = seedable_rng();
+
+    let values = (0..size).map(|_| {
+        if rng.random::<f32>() < null_density {
+            None
+        } else {
+            let list_size = rng.random_range(0..=max_list_size);
+            let list_values: Vec<Option<T::Native>> = (0..list_size)
+                .map(|_| {
+                    if rng.random::<f32>() < list_null_density {
+                        None
+                    } else {
+                        Some(rng.random())
+                    }
+                })
+                .collect();
+            Some(list_values)
+        }
+    });
+
+    GenericListArray::<O>::from_iter_primitive::<T, _, _>(values)
+}
+
+/// Create a ListViewArray of primitive values using a fixed seed
+///
+/// See [`create_primitive_list_array_with_seed`] for details on arguments.
+pub fn create_primitive_list_view_array<O, T>(
+    size: usize,
+    null_density: f32,
+    list_null_density: f32,
+    max_list_size: usize,
+) -> GenericListViewArray<O>
+where
+    T: ArrowPrimitiveType,
+    StandardUniform: Distribution<T::Native>,
+    O: OffsetSizeTrait,
+{
+    let mut rng = seedable_rng();
+
+    let values = (0..size).map(|_| {
+        if rng.random::<f32>() < null_density {
+            None
+        } else {
+            let list_size = rng.random_range(0..=max_list_size);
+            let list_values: Vec<Option<T::Native>> = (0..list_size)
+                .map(|_| {
+                    if rng.random::<f32>() < list_null_density {
+                        None
+                    } else {
+                        Some(rng.random())
+                    }
+                })
+                .collect();
+            Some(list_values)
+        }
+    });
+
+    GenericListViewArray::<O>::from_iter_primitive::<T, _, _>(values)
+}
+
 /// Create primitive run array for given logical and physical array lengths
+///
+/// # Panics
+///
+/// Panics if `logical_array_len < physical_array_len`
 pub fn create_primitive_run_array<R: RunEndIndexType, V: ArrowPrimitiveType>(
     logical_array_len: usize,
     physical_array_len: usize,
@@ -412,6 +661,10 @@ pub fn create_primitive_run_array<R: RunEndIndexType, V: ArrowPrimitiveType>(
 /// Create string array to be used by run array builder. The string array
 /// will result in run array with physical length of `physical_array_len`
 /// and logical length of `logical_array_len`
+///
+/// # Panics
+///
+/// Panics if `logical_array_len < physical_array_len`
 pub fn create_string_array_for_runs(
     physical_array_len: usize,
     logical_array_len: usize,
@@ -449,8 +702,29 @@ pub fn create_binary_array<Offset: OffsetSizeTrait>(
     size: usize,
     null_density: f32,
 ) -> GenericBinaryArray<Offset> {
-    let rng = &mut seedable_rng();
-    let range_rng = &mut seedable_rng();
+    create_binary_array_with_seed(
+        size,
+        null_density,
+        42, // bytes_seed
+        42, // bytes_length_seed
+    )
+}
+
+/// Creates a random [`GenericBinaryArray`] of a given `size` and `null_density`
+/// filling it with random bytes, generated using the provided `seed`s.
+///
+/// the `bytes_seed` is used to seed the RNG for generating the byte values,
+/// while the `bytes_length_seed` is used to seed the RNG for generating the length of an array item
+///
+/// These values can be the same as they are used to seed different RNGs internally.
+pub fn create_binary_array_with_seed<Offset: OffsetSizeTrait>(
+    size: usize,
+    null_density: f32,
+    bytes_seed: u64,
+    bytes_length_seed: u64,
+) -> GenericBinaryArray<Offset> {
+    let rng = &mut StdRng::seed_from_u64(bytes_seed);
+    let range_rng = &mut StdRng::seed_from_u64(bytes_length_seed);
 
     (0..size)
         .map(|_| {
@@ -461,6 +735,45 @@ pub fn create_binary_array<Offset: OffsetSizeTrait>(
                     .sample_iter::<u8, _>(StandardUniform)
                     .take(range_rng.random_range(0..8))
                     .collect::<Vec<u8>>();
+                Some(value)
+            }
+        })
+        .collect()
+}
+
+/// Creates a random [`GenericBinaryArray`] of a given `size` and `null_density`
+/// filling it with random bytes with lengths in the specified range,
+/// all starting with the provided `prefix`, generated using the provided `seed`.
+///
+///
+/// # Panics
+///
+/// Panics if `min_len > max_len` or `prefix.len() > max_len`
+pub fn create_binary_array_with_len_range_and_prefix_and_seed<Offset: OffsetSizeTrait>(
+    size: usize,
+    null_density: f32,
+    min_len: usize,
+    max_len: usize,
+    prefix: &[u8],
+    seed: u64,
+) -> GenericBinaryArray<Offset> {
+    assert!(min_len <= max_len, "min_len must be <= max_len");
+    assert!(prefix.len() <= max_len, "Prefix length must be <= max_len");
+
+    let rng = &mut StdRng::seed_from_u64(seed);
+    (0..size)
+        .map(|_| {
+            if rng.random::<f32>() < null_density {
+                None
+            } else {
+                let remaining_len = rng
+                    .random_range(min_len.saturating_sub(prefix.len())..=(max_len - prefix.len()));
+
+                let remaining = rng
+                    .sample_iter::<u8, _>(StandardUniform)
+                    .take(remaining_len);
+
+                let value = prefix.iter().copied().chain(remaining).collect::<Vec<u8>>();
                 Some(value)
             }
         })
@@ -528,7 +841,7 @@ where
 
     let nulls: Option<Buffer> = (null_density != 0.).then(|| {
         (0..size)
-            .map(|_| rng.random_bool(null_density as _))
+            .map(|_| rng.random_bool((1.0 - null_density) as _))
             .collect()
     });
 
@@ -552,7 +865,7 @@ pub fn create_f16_array(size: usize, nan_density: f32) -> Float16Array {
             if rng.random::<f32>() < nan_density {
                 Some(f16::NAN)
             } else {
-                Some(f16::from_f32(rng.random()))
+                Some(f16_random(&mut rng))
             }
         })
         .collect()
@@ -586,4 +899,124 @@ pub fn create_f64_array(size: usize, nan_density: f32) -> Float64Array {
             }
         })
         .collect()
+}
+
+/// Creates a random f64 array of a given size and nan-value density based on a given seed
+pub fn create_f64_array_with_seed(size: usize, nan_density: f32, seed: u64) -> Float64Array {
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    (0..size)
+        .map(|_| {
+            if rng.random::<f32>() < nan_density {
+                Some(f64::NAN)
+            } else {
+                Some(rng.random())
+            }
+        })
+        .collect()
+}
+
+/// Create a FixedSizeList array of primitive values
+///
+/// Arguments:
+/// - `size`: number of fixed-size lists in the array
+/// - `null_density`: density of nulls in the fixed-size list array (row-level nulls)
+/// - `value_null_density`: density of nulls in the primitive values inside each list
+/// - `list_size`: fixed size of each list element
+pub fn create_primitive_fixed_size_list_array<T>(
+    size: usize,
+    null_density: f32,
+    value_null_density: f32,
+    list_size: i32,
+) -> FixedSizeListArray
+where
+    T: ArrowPrimitiveType,
+    StandardUniform: Distribution<T::Native>,
+{
+    let mut rng = seedable_rng();
+    let list_size_usize = usize::try_from(list_size).expect("list_size must be non-negative");
+    let values: PrimitiveArray<T> = (0..size * list_size_usize)
+        .map(|_| {
+            if rng.random::<f32>() < value_null_density {
+                None
+            } else {
+                Some(rng.random())
+            }
+        })
+        .collect();
+    let field = Arc::new(Field::new("item", T::DATA_TYPE, value_null_density > 0.0));
+    let nulls = (null_density > 0.0).then(|| {
+        NullBuffer::new(arrow_buffer::BooleanBuffer::collect_bool(size, |_| {
+            rng.random::<f32>() >= null_density
+        }))
+    });
+    FixedSizeListArray::new(field, list_size, Arc::new(values), nulls)
+}
+
+/// Create a Map array with string keys and primitive values
+///
+/// Arguments:
+/// - `size`: number of map entries in the array
+/// - `null_density`: density of nulls in the map array (row-level nulls)
+/// - `max_map_size`: maximum number of key-value pairs per map entry
+///   (actual size is random between 0 and max_map_size)
+/// - `key_len`: length of each random string key
+pub fn create_string_map_array<T>(
+    size: usize,
+    null_density: f32,
+    max_map_size: usize,
+    key_len: usize,
+) -> MapArray
+where
+    T: ArrowPrimitiveType,
+    StandardUniform: Distribution<T::Native>,
+{
+    let mut rng = seedable_rng();
+    let mut builder = MapBuilder::new(None, StringBuilder::new(), PrimitiveBuilder::<T>::new());
+    for _ in 0..size {
+        if rng.random::<f32>() < null_density {
+            builder.append(false).unwrap();
+        } else {
+            let n = rng.random_range(0..=max_map_size);
+            for _ in 0..n {
+                builder
+                    .keys()
+                    .append_value(Alphanumeric.sample_string(&mut rng, key_len));
+                builder.values().append_value(rng.random());
+            }
+            builder.append(true).unwrap();
+        }
+    }
+    builder.finish()
+}
+
+/// Creates a random array for the given [`DataType`], `size`, and `null_density`.
+///
+/// Useful for building arrays and record batches in benchmarks without
+/// repeating per-type construction logic. Panics on unsupported types.
+///
+/// # Panics
+///
+/// Panics if `data_type` is not supported
+pub fn create_array_for_type(data_type: &DataType, size: usize, null_density: f32) -> ArrayRef {
+    match data_type {
+        DataType::Boolean => Arc::new(create_boolean_array(size, null_density, 0.5)),
+        DataType::Int8 => Arc::new(create_primitive_array::<Int8Type>(size, null_density)),
+        DataType::Int16 => Arc::new(create_primitive_array::<Int16Type>(size, null_density)),
+        DataType::Int32 => Arc::new(create_primitive_array::<Int32Type>(size, null_density)),
+        DataType::Int64 => Arc::new(create_primitive_array::<Int64Type>(size, null_density)),
+        DataType::UInt8 => Arc::new(create_primitive_array::<UInt8Type>(size, null_density)),
+        DataType::UInt16 => Arc::new(create_primitive_array::<UInt16Type>(size, null_density)),
+        DataType::UInt32 => Arc::new(create_primitive_array::<UInt32Type>(size, null_density)),
+        DataType::UInt64 => Arc::new(create_primitive_array::<UInt64Type>(size, null_density)),
+        DataType::Float32 => Arc::new(create_primitive_array::<Float32Type>(size, null_density)),
+        DataType::Float64 => Arc::new(create_primitive_array::<Float64Type>(size, null_density)),
+        DataType::Utf8 => Arc::new(create_string_array::<i32>(size, null_density)),
+        DataType::LargeUtf8 => Arc::new(create_string_array::<i64>(size, null_density)),
+        DataType::Utf8View => Arc::new(create_string_view_array(size, null_density)),
+        DataType::Binary => Arc::new(create_binary_array::<i32>(size, null_density)),
+        DataType::LargeBinary => Arc::new(create_binary_array::<i64>(size, null_density)),
+        DataType::FixedSizeBinary(n) => Arc::new(create_fsb_array(size, null_density, *n as usize)),
+        other => panic!("unsupported data type for create_array_for_type: {other}"),
+    }
 }

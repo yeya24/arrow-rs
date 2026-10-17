@@ -28,9 +28,12 @@ pub use crate::compression::{BrotliLevel, GzipLevel, ZstdLevel};
 use crate::file::metadata::HeapSize;
 use crate::parquet_thrift::{
     ElementType, FieldType, ReadThrift, ThriftCompactInputProtocol, ThriftCompactOutputProtocol,
-    WriteThrift, WriteThriftField,
+    WriteThrift, WriteThriftField, validate_list_type,
 };
-use crate::{thrift_enum, thrift_struct, thrift_union_all_empty};
+use crate::{
+    thrift_enum, thrift_struct, thrift_union_all_empty, thrift_union_with_unknown,
+    write_thrift_field,
+};
 
 use crate::errors::{ParquetError, Result};
 
@@ -61,13 +64,10 @@ enum Type {
 
 // ----------------------------------------------------------------------
 // Mirrors thrift enum `ConvertedType`
-//
-// Cannot use macros because of added field `None`
 
 // TODO(ets): Adding the `NONE` variant to this enum is a bit awkward. We should
-// look into removing it and using `Option<ConvertedType>` instead. Then all of this
-// handwritten code could go away.
-
+// look into removing it and using `Option<ConvertedType>` instead.
+thrift_enum!(
 /// Common types (converted types) used by frameworks when using Parquet.
 ///
 /// This helps map between types in those frameworks to the base types in Parquet.
@@ -75,153 +75,101 @@ enum Type {
 ///
 /// This struct was renamed from `LogicalType` in version 4.0.0.
 /// If targeting Parquet format 2.4.0 or above, please use [LogicalType] instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(non_camel_case_types)]
-pub enum ConvertedType {
-    /// No type conversion.
-    NONE,
-    /// A BYTE_ARRAY actually contains UTF8 encoded chars.
-    UTF8,
+enum ConvertedType {
+  /// Not defined in the spec, used internally to indicate no type conversion
+  NONE = -1;
 
-    /// A map is converted as an optional field containing a repeated key/value pair.
-    MAP,
+  /// A BYTE_ARRAY actually contains UTF8 encoded chars.
+  UTF8 = 0;
 
-    /// A key/value pair is converted into a group of two fields.
-    MAP_KEY_VALUE,
+  /// A map is converted as an optional field containing a repeated key/value pair.
+  MAP = 1;
 
-    /// A list is converted into an optional field containing a repeated field for its
-    /// values.
-    LIST,
+  /// A key/value pair is converted into a group of two fields.
+  MAP_KEY_VALUE = 2;
 
-    /// An enum is converted into a binary field
-    ENUM,
+  /// A list is converted into an optional field containing a repeated field for its
+  /// values.
+  LIST = 3;
 
-    /// A decimal value.
-    /// This may be used to annotate binary or fixed primitive types. The
-    /// underlying byte array stores the unscaled value encoded as two's
-    /// complement using big-endian byte order (the most significant byte is the
-    /// zeroth element).
-    ///
-    /// This must be accompanied by a (maximum) precision and a scale in the
-    /// SchemaElement. The precision specifies the number of digits in the decimal
-    /// and the scale stores the location of the decimal point. For example 1.23
-    /// would have precision 3 (3 total digits) and scale 2 (the decimal point is
-    /// 2 digits over).
-    DECIMAL,
+  /// An enum is converted into a BYTE_ARRAY field
+  ENUM = 4;
 
-    /// A date stored as days since Unix epoch, encoded as the INT32 physical type.
-    DATE,
+  /// A decimal value.
+  ///
+  /// This may be used to annotate BYTE_ARRAY or FIXED_LEN_BYTE_ARRAY primitive
+  /// types. The underlying byte array stores the unscaled value encoded as two's
+  /// complement using big-endian byte order (the most significant byte is the
+  /// zeroth element). The value of the decimal is the value * 10^{-scale}.
+  ///
+  /// This must be accompanied by a (maximum) precision and a scale in the
+  /// SchemaElement. The precision specifies the number of digits in the decimal
+  /// and the scale stores the location of the decimal point. For example 1.23
+  /// would have precision 3 (3 total digits) and scale 2 (the decimal point is
+  /// 2 digits over).
+  DECIMAL = 5;
 
-    /// The total number of milliseconds since midnight. The value is stored as an INT32
-    /// physical type.
-    TIME_MILLIS,
+  /// A date stored as days since Unix epoch, encoded as the INT32 physical type.
+  DATE = 6;
 
-    /// The total number of microseconds since midnight. The value is stored as an INT64
-    /// physical type.
-    TIME_MICROS,
+  /// The total number of milliseconds since midnight. The value is stored as an INT32
+  /// physical type.
+  TIME_MILLIS = 7;
 
-    /// Date and time recorded as milliseconds since the Unix epoch.
-    /// Recorded as a physical type of INT64.
-    TIMESTAMP_MILLIS,
+  /// The total number of microseconds since midnight. The value is stored as an INT64
+  /// physical type.
+  TIME_MICROS = 8;
 
-    /// Date and time recorded as microseconds since the Unix epoch.
-    /// The value is stored as an INT64 physical type.
-    TIMESTAMP_MICROS,
+  /// Date and time recorded as milliseconds since the Unix epoch.
+  /// Recorded as a physical type of INT64.
+  TIMESTAMP_MILLIS = 9;
 
-    /// An unsigned 8 bit integer value stored as INT32 physical type.
-    UINT_8,
+  /// Date and time recorded as microseconds since the Unix epoch.
+  /// The value is stored as an INT64 physical type.
+  TIMESTAMP_MICROS = 10;
 
-    /// An unsigned 16 bit integer value stored as INT32 physical type.
-    UINT_16,
+  /// An unsigned 8 bit integer value stored as INT32 physical type.
+  UINT_8 = 11;
 
-    /// An unsigned 32 bit integer value stored as INT32 physical type.
-    UINT_32,
+  /// An unsigned 16 bit integer value stored as INT32 physical type.
+  UINT_16 = 12;
 
-    /// An unsigned 64 bit integer value stored as INT64 physical type.
-    UINT_64,
+  /// An unsigned 32 bit integer value stored as INT32 physical type.
+  UINT_32 = 13;
 
-    /// A signed 8 bit integer value stored as INT32 physical type.
-    INT_8,
+  /// An unsigned 64 bit integer value stored as INT64 physical type.
+  UINT_64 = 14;
 
-    /// A signed 16 bit integer value stored as INT32 physical type.
-    INT_16,
+  /// A signed 8 bit integer value stored as INT32 physical type.
+  INT_8 = 15;
 
-    /// A signed 32 bit integer value stored as INT32 physical type.
-    INT_32,
+  /// A signed 16 bit integer value stored as INT32 physical type.
+  INT_16 = 16;
 
-    /// A signed 64 bit integer value stored as INT64 physical type.
-    INT_64,
+  /// A signed 32 bit integer value stored as INT32 physical type.
+  INT_32 = 17;
 
-    /// A JSON document embedded within a single UTF8 column.
-    JSON,
+  /// A signed 64 bit integer value stored as INT64 physical type.
+  INT_64 = 18;
 
-    /// A BSON document embedded within a single BINARY column.
-    BSON,
+  /// A JSON document embedded within a single UTF8 column.
+  JSON = 19;
 
-    /// An interval of time.
-    ///
-    /// This type annotates data stored as a FIXED_LEN_BYTE_ARRAY of length 12.
-    /// This data is composed of three separate little endian unsigned integers.
-    /// Each stores a component of a duration of time. The first integer identifies
-    /// the number of months associated with the duration, the second identifies
-    /// the number of days associated with the duration and the third identifies
-    /// the number of milliseconds associated with the provided duration.
-    /// This duration of time is independent of any particular timezone or date.
-    INTERVAL,
+   /// A BSON document embedded within a single BINARY column.
+  BSON = 20;
+
+  /// An interval of time
+  ///
+  /// This type annotates data stored as a FIXED_LEN_BYTE_ARRAY of length 12.
+  /// This data is composed of three separate little endian unsigned integers.
+  /// Each stores a component of a duration of time. The first integer identifies
+  /// the number of months associated with the duration, the second identifies
+  /// the number of days associated with the duration and the third identifies
+  /// the number of milliseconds associated with the provided duration.
+  /// This duration of time is independent of any particular timezone or date.
+  INTERVAL = 21;
 }
-
-impl<'a, R: ThriftCompactInputProtocol<'a>> ReadThrift<'a, R> for ConvertedType {
-    fn read_thrift(prot: &mut R) -> Result<Self> {
-        let val = prot.read_i32()?;
-        Ok(match val {
-            0 => Self::UTF8,
-            1 => Self::MAP,
-            2 => Self::MAP_KEY_VALUE,
-            3 => Self::LIST,
-            4 => Self::ENUM,
-            5 => Self::DECIMAL,
-            6 => Self::DATE,
-            7 => Self::TIME_MILLIS,
-            8 => Self::TIME_MICROS,
-            9 => Self::TIMESTAMP_MILLIS,
-            10 => Self::TIMESTAMP_MICROS,
-            11 => Self::UINT_8,
-            12 => Self::UINT_16,
-            13 => Self::UINT_32,
-            14 => Self::UINT_64,
-            15 => Self::INT_8,
-            16 => Self::INT_16,
-            17 => Self::INT_32,
-            18 => Self::INT_64,
-            19 => Self::JSON,
-            20 => Self::BSON,
-            21 => Self::INTERVAL,
-            _ => return Err(general_err!("Unexpected ConvertedType {}", val)),
-        })
-    }
-}
-
-impl WriteThrift for ConvertedType {
-    const ELEMENT_TYPE: ElementType = ElementType::I32;
-
-    fn write_thrift<W: Write>(&self, writer: &mut ThriftCompactOutputProtocol<W>) -> Result<()> {
-        // because we've added NONE, the variant values are off by 1, so correct that here
-        writer.write_i32(*self as i32 - 1)
-    }
-}
-
-impl WriteThriftField for ConvertedType {
-    fn write_thrift_field<W: Write>(
-        &self,
-        writer: &mut ThriftCompactOutputProtocol<W>,
-        field_id: i16,
-        last_field_id: i16,
-    ) -> Result<i16> {
-        writer.write_field_begin(FieldType::I32, field_id, last_field_id)?;
-        self.write_thrift(writer)?;
-        Ok(field_id)
-    }
-}
+);
 
 // ----------------------------------------------------------------------
 // Mirrors thrift union `TimeUnit`
@@ -238,362 +186,165 @@ union TimeUnit {
 // ----------------------------------------------------------------------
 // Mirrors thrift union `LogicalType`
 
-// private structs for decoding logical type
-
 thrift_struct!(
-struct DecimalType {
+pub struct DecimalType {
+  /// The number of digits in the decimal.
   1: required i32 scale
+  /// The location of the decimal point.
   2: required i32 precision
 }
 );
 
 thrift_struct!(
-struct TimestampType {
+pub struct TimestampType {
+  /// Whether the timestamp is adjusted to UTC.
   1: required bool is_adjusted_to_u_t_c
+  /// The unit of time.
   2: required TimeUnit unit
 }
 );
 
-// they are identical
-use TimestampType as TimeType;
+/// Identical to [`TimestampType`]
+pub use TimestampType as TimeType;
 
 thrift_struct!(
-struct IntType {
+pub struct IntType {
+  /// The number of bits in the integer.
   1: required i8 bit_width
+  /// Whether the integer is signed.
   2: required bool is_signed
 }
 );
 
 thrift_struct!(
-struct VariantType {
-  // The version of the variant specification that the variant was
-  // written with.
+pub struct VariantType {
+  /// The version of the variant specification that the variant was
+  /// written with.
   1: optional i8 specification_version
 }
 );
 
 thrift_struct!(
-struct GeometryType<'a> {
-  1: optional string<'a> crs;
+pub struct GeometryType {
+  /// A custom CRS. If unset the CRS `OGC:CRS84` should be used, which means that the geometries
+  /// must be stored in longitude, latitude based on the WGS84 datum.
+  1: optional string crs;
 }
 );
 
 thrift_struct!(
-struct GeographyType<'a> {
-  1: optional string<'a> crs;
+pub struct GeographyType {
+  /// A custom CRS. If unset the CRS `OGC:CRS84` should be used.
+  1: optional string crs;
+  /// An optional algorithm can be set to correctly interpret edges interpolation
+  /// of the geometries. If unset, the `SPHERICAL` algorithm should be used.
   2: optional EdgeInterpolationAlgorithm algorithm;
 }
 );
 
-// TODO(ets): should we switch to tuple variants so we can use
-// the thrift macros?
+impl GeographyType {
+    /// Accessor for the `GeographyType::algorithm` field. If this field is not set, this
+    /// function returns the default value (currently [`EdgeInterpolationAlgorithm::SPHERICAL`]
+    /// per the Parquet [specification]).
+    ///
+    /// [specification]: https://github.com/apache/parquet-format/blob/master/LogicalTypes.md#geography
+    pub fn algorithm(&self) -> Option<EdgeInterpolationAlgorithm> {
+        Some(self.algorithm.unwrap_or_default())
+    }
+}
 
+thrift_union_with_unknown!(
 /// Logical types used by version 2.4.0+ of the Parquet format.
 ///
 /// This is an *entirely new* struct as of version
 /// 4.0.0. The struct previously named `LogicalType` was renamed to
 /// [`ConvertedType`]. Please see the README.md for more details.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LogicalType {
-    /// A UTF8 encoded string.
-    String,
-    /// A map of key-value pairs.
-    Map,
-    /// A list of elements.
-    List,
-    /// A set of predefined values.
-    Enum,
-    /// A decimal value with a specified scale and precision.
-    Decimal {
-        /// The number of digits in the decimal.
-        scale: i32,
-        /// The location of the decimal point.
-        precision: i32,
-    },
-    /// A date stored as days since Unix epoch.
-    Date,
-    /// A time stored as [`TimeUnit`] since midnight.
-    Time {
-        /// Whether the time is adjusted to UTC.
-        is_adjusted_to_u_t_c: bool,
-        /// The unit of time.
-        unit: TimeUnit,
-    },
-    /// A timestamp stored as [`TimeUnit`] since Unix epoch.
-    Timestamp {
-        /// Whether the timestamp is adjusted to UTC.
-        is_adjusted_to_u_t_c: bool,
-        /// The unit of time.
-        unit: TimeUnit,
-    },
-    /// An integer with a specified bit width and signedness.
-    Integer {
-        /// The number of bits in the integer.
-        bit_width: i8,
-        /// Whether the integer is signed.
-        is_signed: bool,
-    },
-    /// An unknown logical type.
-    Unknown,
-    /// A JSON document.
-    Json,
-    /// A BSON document.
-    Bson,
-    /// A UUID.
-    Uuid,
-    /// A 16-bit floating point number.
-    Float16,
-    /// A Variant value.
-    Variant {
-        /// The version of the variant specification that the variant was written with.
-        specification_version: Option<i8>,
-    },
-    /// A geospatial feature in the Well-Known Binary (WKB) format with linear/planar edges interpolation.
-    Geometry {
-        /// A custom CRS. If unset the defaults to `OGC:CRS84`, which means that the geometries
-        /// must be stored in longitude, latitude based on the WGS84 datum.
-        crs: Option<String>,
-    },
-    /// A geospatial feature in the WKB format with an explicit (non-linear/non-planar) edges interpolation.
-    Geography {
-        /// A custom CRS. If unset the defaults to `OGC:CRS84`.
-        crs: Option<String>,
-        /// An optional algorithm can be set to correctly interpret edges interpolation
-        /// of the geometries. If unset, the algorithm defaults to `SPHERICAL`.
-        algorithm: Option<EdgeInterpolationAlgorithm>,
-    },
-    /// For forward compatibility; used when an unknown union value is encountered.
-    _Unknown {
-        /// The field id encountered when parsing the unknown logical type.
-        field_id: i16,
-    },
+union LogicalType {
+   /// A UTF8 encoded string.
+   1:  String
+   /// A map of key-value pairs.
+   2:  Map
+   /// A list of elements.
+   3:  List
+   /// A set of predefined values.
+   4:  Enum
+   /// A decimal value with a specified scale and precision.
+   5:  (DecimalType) Decimal
+   /// A date stored as days since Unix epoch.
+   6:  Date
+   /// A time stored as [`TimeUnit`] since midnight.
+   7:  (TimeType) Time
+   /// A timestamp stored as [`TimeUnit`] since Unix epoch.
+   8:  (TimestampType) Timestamp
+   // 9: reserved for INTERVAL
+   /// An integer with a specified bit width and signedness.
+   10: (IntType) Integer
+   /// An unknown logical type.
+   11: Unknown
+   /// A JSON document.
+   12: Json
+   /// A BSON document.
+   13: Bson
+   /// A UUID.
+   14: Uuid
+   /// A 16-bit floating point number.
+   15: Float16
+   /// A Variant value.
+   16: (VariantType) Variant
+   /// A geospatial feature in the Well-Known Binary (WKB) format with linear/planar edges interpolation.
+   17: (GeometryType) Geometry
+   /// A geospatial feature in the WKB format with an explicit (non-linear/non-planar) edges interpolation.
+   18: (GeographyType) Geography
+   /// A reference to a range of bytes, stored inline or in an external file.
+   19: File
 }
+);
 
-impl<'a, R: ThriftCompactInputProtocol<'a>> ReadThrift<'a, R> for LogicalType {
-    fn read_thrift(prot: &mut R) -> Result<Self> {
-        let field_ident = prot.read_field_begin(0)?;
-        if field_ident.field_type == FieldType::Stop {
-            return Err(general_err!("received empty union from remote LogicalType"));
-        }
-        let ret = match field_ident.id {
-            1 => {
-                prot.skip_empty_struct()?;
-                Self::String
-            }
-            2 => {
-                prot.skip_empty_struct()?;
-                Self::Map
-            }
-            3 => {
-                prot.skip_empty_struct()?;
-                Self::List
-            }
-            4 => {
-                prot.skip_empty_struct()?;
-                Self::Enum
-            }
-            5 => {
-                let val = DecimalType::read_thrift(&mut *prot)?;
-                Self::Decimal {
-                    scale: val.scale,
-                    precision: val.precision,
-                }
-            }
-            6 => {
-                prot.skip_empty_struct()?;
-                Self::Date
-            }
-            7 => {
-                let val = TimeType::read_thrift(&mut *prot)?;
-                Self::Time {
-                    is_adjusted_to_u_t_c: val.is_adjusted_to_u_t_c,
-                    unit: val.unit,
-                }
-            }
-            8 => {
-                let val = TimestampType::read_thrift(&mut *prot)?;
-                Self::Timestamp {
-                    is_adjusted_to_u_t_c: val.is_adjusted_to_u_t_c,
-                    unit: val.unit,
-                }
-            }
-            10 => {
-                let val = IntType::read_thrift(&mut *prot)?;
-                Self::Integer {
-                    is_signed: val.is_signed,
-                    bit_width: val.bit_width,
-                }
-            }
-            11 => {
-                prot.skip_empty_struct()?;
-                Self::Unknown
-            }
-            12 => {
-                prot.skip_empty_struct()?;
-                Self::Json
-            }
-            13 => {
-                prot.skip_empty_struct()?;
-                Self::Bson
-            }
-            14 => {
-                prot.skip_empty_struct()?;
-                Self::Uuid
-            }
-            15 => {
-                prot.skip_empty_struct()?;
-                Self::Float16
-            }
-            16 => {
-                let val = VariantType::read_thrift(&mut *prot)?;
-                Self::Variant {
-                    specification_version: val.specification_version,
-                }
-            }
-            17 => {
-                let val = GeometryType::read_thrift(&mut *prot)?;
-                Self::Geometry {
-                    crs: val.crs.map(|s| s.to_owned()),
-                }
-            }
-            18 => {
-                let val = GeographyType::read_thrift(&mut *prot)?;
-                // unset algorithm means SPHERICAL, per the spec:
-                // https://github.com/apache/parquet-format/blob/master/LogicalTypes.md#geography
-                let algorithm = val
-                    .algorithm
-                    .unwrap_or(EdgeInterpolationAlgorithm::SPHERICAL);
-                Self::Geography {
-                    crs: val.crs.map(|s| s.to_owned()),
-                    algorithm: Some(algorithm),
-                }
-            }
-            _ => {
-                prot.skip(field_ident.field_type)?;
-                Self::_Unknown {
-                    field_id: field_ident.id,
-                }
-            }
-        };
-        let field_ident = prot.read_field_begin(field_ident.id)?;
-        if field_ident.field_type != FieldType::Stop {
-            return Err(general_err!(
-                "Received multiple fields for union from remote LogicalType"
-            ));
-        }
-        Ok(ret)
+impl LogicalType {
+    /// Create a [`LogicalType::Integer`] variant with the given `bit_width` and `is_signed`
+    pub fn integer(bit_width: i8, is_signed: bool) -> Self {
+        Self::Integer(IntType {
+            bit_width,
+            is_signed,
+        })
     }
-}
 
-impl WriteThrift for LogicalType {
-    const ELEMENT_TYPE: ElementType = ElementType::Struct;
-
-    fn write_thrift<W: Write>(&self, writer: &mut ThriftCompactOutputProtocol<W>) -> Result<()> {
-        match self {
-            Self::String => {
-                writer.write_empty_struct(1, 0)?;
-            }
-            Self::Map => {
-                writer.write_empty_struct(2, 0)?;
-            }
-            Self::List => {
-                writer.write_empty_struct(3, 0)?;
-            }
-            Self::Enum => {
-                writer.write_empty_struct(4, 0)?;
-            }
-            Self::Decimal { scale, precision } => {
-                DecimalType {
-                    scale: *scale,
-                    precision: *precision,
-                }
-                .write_thrift_field(writer, 5, 0)?;
-            }
-            Self::Date => {
-                writer.write_empty_struct(6, 0)?;
-            }
-            Self::Time {
-                is_adjusted_to_u_t_c,
-                unit,
-            } => {
-                TimeType {
-                    is_adjusted_to_u_t_c: *is_adjusted_to_u_t_c,
-                    unit: *unit,
-                }
-                .write_thrift_field(writer, 7, 0)?;
-            }
-            Self::Timestamp {
-                is_adjusted_to_u_t_c,
-                unit,
-            } => {
-                TimestampType {
-                    is_adjusted_to_u_t_c: *is_adjusted_to_u_t_c,
-                    unit: *unit,
-                }
-                .write_thrift_field(writer, 8, 0)?;
-            }
-            Self::Integer {
-                bit_width,
-                is_signed,
-            } => {
-                IntType {
-                    bit_width: *bit_width,
-                    is_signed: *is_signed,
-                }
-                .write_thrift_field(writer, 10, 0)?;
-            }
-            Self::Unknown => {
-                writer.write_empty_struct(11, 0)?;
-            }
-            Self::Json => {
-                writer.write_empty_struct(12, 0)?;
-            }
-            Self::Bson => {
-                writer.write_empty_struct(13, 0)?;
-            }
-            Self::Uuid => {
-                writer.write_empty_struct(14, 0)?;
-            }
-            Self::Float16 => {
-                writer.write_empty_struct(15, 0)?;
-            }
-            Self::Variant {
-                specification_version,
-            } => {
-                VariantType {
-                    specification_version: *specification_version,
-                }
-                .write_thrift_field(writer, 16, 0)?;
-            }
-            Self::Geometry { crs } => {
-                GeometryType {
-                    crs: crs.as_ref().map(|s| s.as_str()),
-                }
-                .write_thrift_field(writer, 17, 0)?;
-            }
-            Self::Geography { crs, algorithm } => {
-                GeographyType {
-                    crs: crs.as_ref().map(|s| s.as_str()),
-                    algorithm: *algorithm,
-                }
-                .write_thrift_field(writer, 18, 0)?;
-            }
-            _ => return Err(nyi_err!("logical type")),
-        }
-        writer.write_struct_end()
+    /// Create a [`LogicalType::Decimal`] variant with the given `scale` and `precision`
+    pub fn decimal(scale: i32, precision: i32) -> Self {
+        Self::Decimal(DecimalType { scale, precision })
     }
-}
 
-impl WriteThriftField for LogicalType {
-    fn write_thrift_field<W: Write>(
-        &self,
-        writer: &mut ThriftCompactOutputProtocol<W>,
-        field_id: i16,
-        last_field_id: i16,
-    ) -> Result<i16> {
-        writer.write_field_begin(FieldType::Struct, field_id, last_field_id)?;
-        self.write_thrift(writer)?;
-        Ok(field_id)
+    /// Create a [`LogicalType::Time`] variant with the given `is_adjusted_to_u_t_c` and `unit`
+    pub fn time(is_adjusted_to_u_t_c: bool, unit: TimeUnit) -> Self {
+        Self::Time(TimeType {
+            is_adjusted_to_u_t_c,
+            unit,
+        })
+    }
+
+    /// Create a [`LogicalType::Timestamp`] variant with the given `is_adjusted_to_u_t_c` and `unit`
+    pub fn timestamp(is_adjusted_to_u_t_c: bool, unit: TimeUnit) -> Self {
+        Self::Timestamp(TimestampType {
+            is_adjusted_to_u_t_c,
+            unit,
+        })
+    }
+
+    /// Create a [`LogicalType::Variant`] variant with the given `specification_version`
+    pub fn variant(specification_version: Option<i8>) -> Self {
+        Self::Variant(VariantType {
+            specification_version,
+        })
+    }
+
+    /// Create a [`LogicalType::Geometry`] variant with the given `crs`
+    pub fn geometry(crs: Option<String>) -> Self {
+        Self::Geometry(GeometryType { crs })
+    }
+
+    /// Create a [`LogicalType::Geography`] variant with the given `crs` and `algorithm`
+    pub fn geography(crs: Option<String>, algorithm: Option<EdgeInterpolationAlgorithm>) -> Self {
+        Self::Geography(GeographyType { crs, algorithm })
     }
 }
 
@@ -700,6 +451,10 @@ enum Encoding {
   /// afterwards. Note that the use of this encoding with FIXED_LEN_BYTE_ARRAY(N) data may
   /// perform poorly for large values of N.
   BYTE_STREAM_SPLIT = 9;
+  /// Adaptive Lossless floating-Point encoding (ALP).
+  ///
+  /// Currently specified for FLOAT and DOUBLE.
+  ALP = 10;
 }
 );
 
@@ -711,7 +466,7 @@ impl FromStr for Encoding {
             "PLAIN" | "plain" => Ok(Encoding::PLAIN),
             "PLAIN_DICTIONARY" | "plain_dictionary" => Ok(Encoding::PLAIN_DICTIONARY),
             "RLE" | "rle" => Ok(Encoding::RLE),
-            #[allow(deprecated)]
+            #[expect(deprecated)]
             "BIT_PACKED" | "bit_packed" => Ok(Encoding::BIT_PACKED),
             "DELTA_BINARY_PACKED" | "delta_binary_packed" => Ok(Encoding::DELTA_BINARY_PACKED),
             "DELTA_LENGTH_BYTE_ARRAY" | "delta_length_byte_array" => {
@@ -720,6 +475,7 @@ impl FromStr for Encoding {
             "DELTA_BYTE_ARRAY" | "delta_byte_array" => Ok(Encoding::DELTA_BYTE_ARRAY),
             "RLE_DICTIONARY" | "rle_dictionary" => Ok(Encoding::RLE_DICTIONARY),
             "BYTE_STREAM_SPLIT" | "byte_stream_split" => Ok(Encoding::BYTE_STREAM_SPLIT),
+            "ALP" | "alp" => Ok(Encoding::ALP),
             _ => Err(general_err!("unknown encoding: {}", s)),
         }
     }
@@ -763,11 +519,11 @@ pub struct EncodingMask(i32);
 
 impl EncodingMask {
     /// Highest valued discriminant in the [`Encoding`] enum
-    const MAX_ENCODING: i32 = Encoding::BYTE_STREAM_SPLIT as i32;
+    const MAX_ENCODING: i32 = Encoding::MAX_DISCRIMINANT;
     /// A mask consisting of unused bit positions, used for validation. This includes the never
     /// used GROUP_VAR_INT encoding value of `1`.
     const ALLOWED_MASK: u32 =
-        !(1u32 << (EncodingMask::MAX_ENCODING as u32 + 1)).wrapping_sub(1) | 1 << 1;
+        !(1u32 << (EncodingMask::MAX_ENCODING as u32 + 1)).wrapping_sub(1) | (1 << 1);
 
     /// Attempt to create a new `EncodingMask` from an integer.
     ///
@@ -793,9 +549,19 @@ impl EncodingMask {
         Self(mask)
     }
 
+    /// Mark the given [`Encoding`] as present in this mask.
+    pub fn insert(&mut self, val: Encoding) {
+        self.0 |= 1 << (val as i32);
+    }
+
     /// Test if a given [`Encoding`] is present in this mask.
     pub fn is_set(&self, val: Encoding) -> bool {
         self.0 & (1 << (val as i32)) != 0
+    }
+
+    /// Test if this mask has only the bit for the given [`Encoding`] set.
+    pub fn is_only(&self, val: Encoding) -> bool {
+        self.0 == (1 << (val as i32))
     }
 
     /// Test if all [`Encoding`]s in a given set are present in this mask.
@@ -827,6 +593,8 @@ impl<'a, R: ThriftCompactInputProtocol<'a>> ReadThrift<'a, R> for EncodingMask {
 
         // This reads a Thrift `list<Encoding>` and turns it into a bitmask
         let list_ident = prot.read_list_begin()?;
+        // check for enum (encoded as I32)
+        validate_list_type(ElementType::I32, &list_ident)?;
         for _ in 0..list_ident.size {
             let val = Encoding::read_thrift(prot)?;
             mask |= 1 << val as i32;
@@ -835,7 +603,7 @@ impl<'a, R: ThriftCompactInputProtocol<'a>> ReadThrift<'a, R> for EncodingMask {
     }
 }
 
-#[allow(deprecated)]
+#[expect(deprecated)]
 fn i32_to_encoding(val: i32) -> Encoding {
     match val {
         0 => Encoding::PLAIN,
@@ -847,12 +615,40 @@ fn i32_to_encoding(val: i32) -> Encoding {
         7 => Encoding::DELTA_BYTE_ARRAY,
         8 => Encoding::RLE_DICTIONARY,
         9 => Encoding::BYTE_STREAM_SPLIT,
+        10 => Encoding::ALP,
         _ => panic!("Impossible encoding {val}"),
     }
 }
 
 // ----------------------------------------------------------------------
 // Mirrors thrift enum `CompressionCodec`
+
+thrift_enum!(
+/// Supported compression algorithms.
+///
+/// Codecs added in format version X.Y can be read by readers based on X.Y and later.
+/// Codec support may vary between readers based on the format version and
+/// libraries available at runtime.
+///
+/// See [Compression.md] for a detailed specification of these algorithms.
+///
+/// [Compression.md]: https://github.com/apache/parquet-format/blob/master/Compression.md
+enum CompressionCodec {
+  UNCOMPRESSED = 0;
+  SNAPPY = 1;
+  GZIP = 2;
+  LZO = 3;
+  BROTLI = 4;  // Added in 2.4
+  LZ4 = 5;     // DEPRECATED (Added in 2.4)
+  ZSTD = 6;    // Added in 2.4
+  LZ4_RAW = 7; // Added in 2.9
+}
+);
+
+// NOTE: This enum likely belongs in file::properties now, but moving it there would be a
+// breaking API change, that's probably not worth the pain. If a new codec is added to the
+// Parquet specification, or any other breaking changes are made to this enum, this can be
+// revisited.
 
 /// Supported block compression algorithms.
 ///
@@ -870,7 +666,7 @@ fn i32_to_encoding(val: i32) -> Encoding {
 /// worse compression ratios. However, it is not as widely supported by the ecosystem, with the
 /// Hadoop ecosystem historically favoring the non-standard and now deprecated [`Compression::LZ4`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(non_camel_case_types)]
+#[expect(non_camel_case_types)]
 pub enum Compression {
     /// No compression.
     UNCOMPRESSED,
@@ -890,72 +686,43 @@ pub enum Compression {
     LZ4_RAW,
 }
 
-impl<'a, R: ThriftCompactInputProtocol<'a>> ReadThrift<'a, R> for Compression {
-    fn read_thrift(prot: &mut R) -> Result<Self> {
-        let val = prot.read_i32()?;
-        Ok(match val {
-            0 => Self::UNCOMPRESSED,
-            1 => Self::SNAPPY,
-            2 => Self::GZIP(Default::default()),
-            3 => Self::LZO,
-            4 => Self::BROTLI(Default::default()),
-            5 => Self::LZ4,
-            6 => Self::ZSTD(Default::default()),
-            7 => Self::LZ4_RAW,
-            _ => return Err(general_err!("Unexpected CompressionCodec {}", val)),
-        })
+impl From<CompressionCodec> for Compression {
+    fn from(value: CompressionCodec) -> Self {
+        match value {
+            CompressionCodec::UNCOMPRESSED => Compression::UNCOMPRESSED,
+            CompressionCodec::SNAPPY => Compression::SNAPPY,
+            CompressionCodec::GZIP => Compression::GZIP(Default::default()),
+            CompressionCodec::LZO => Compression::LZO,
+            CompressionCodec::BROTLI => Compression::BROTLI(Default::default()),
+            CompressionCodec::LZ4 => Compression::LZ4,
+            CompressionCodec::ZSTD => Compression::ZSTD(Default::default()),
+            CompressionCodec::LZ4_RAW => Compression::LZ4_RAW,
+        }
     }
 }
 
-// TODO(ets): explore replacing this with a thrift_enum!(ThriftCompression) for the serialization
-// and then provide `From` impls to convert back and forth. This is necessary due to the addition
-// of compression level to some variants.
-impl WriteThrift for Compression {
-    const ELEMENT_TYPE: ElementType = ElementType::I32;
-
-    fn write_thrift<W: Write>(&self, writer: &mut ThriftCompactOutputProtocol<W>) -> Result<()> {
-        let id: i32 = match *self {
-            Self::UNCOMPRESSED => 0,
-            Self::SNAPPY => 1,
-            Self::GZIP(_) => 2,
-            Self::LZO => 3,
-            Self::BROTLI(_) => 4,
-            Self::LZ4 => 5,
-            Self::ZSTD(_) => 6,
-            Self::LZ4_RAW => 7,
-        };
-        writer.write_i32(id)
+impl From<Compression> for CompressionCodec {
+    fn from(value: Compression) -> Self {
+        match value {
+            Compression::UNCOMPRESSED => CompressionCodec::UNCOMPRESSED,
+            Compression::SNAPPY => CompressionCodec::SNAPPY,
+            Compression::GZIP(_) => CompressionCodec::GZIP,
+            Compression::LZO => CompressionCodec::LZO,
+            Compression::BROTLI(_) => CompressionCodec::BROTLI,
+            Compression::LZ4 => CompressionCodec::LZ4,
+            Compression::ZSTD(_) => CompressionCodec::ZSTD,
+            Compression::LZ4_RAW => CompressionCodec::LZ4_RAW,
+        }
     }
 }
 
-impl WriteThriftField for Compression {
-    fn write_thrift_field<W: Write>(
-        &self,
-        writer: &mut ThriftCompactOutputProtocol<W>,
-        field_id: i16,
-        last_field_id: i16,
-    ) -> Result<i16> {
-        writer.write_field_begin(FieldType::I32, field_id, last_field_id)?;
-        self.write_thrift(writer)?;
-        Ok(field_id)
-    }
-}
-
-impl Compression {
-    /// Returns the codec type of this compression setting as a string, without the compression
-    /// level.
-    pub(crate) fn codec_to_string(self) -> String {
-        format!("{self:?}").split('(').next().unwrap().to_owned()
-    }
-}
-
-fn split_compression_string(str_setting: &str) -> Result<(&str, Option<u32>), ParquetError> {
+fn split_compression_string(str_setting: &str) -> Result<(&str, Option<i32>), ParquetError> {
     let split_setting = str_setting.split_once('(');
 
     match split_setting {
         Some((codec, level_str)) => {
             let level = &level_str[..level_str.len() - 1]
-                .parse::<u32>()
+                .parse::<i32>()
                 .map_err(|_| {
                     ParquetError::General(format!("invalid compression level: {level_str}"))
                 })?;
@@ -965,7 +732,7 @@ fn split_compression_string(str_setting: &str) -> Result<(&str, Option<u32>), Pa
     }
 }
 
-fn check_level_is_none(level: &Option<u32>) -> Result<(), ParquetError> {
+fn check_level_is_none(level: Option<i32>) -> Result<(), ParquetError> {
     if level.is_some() {
         return Err(ParquetError::General(
             "compression level is not supported".to_string(),
@@ -975,7 +742,7 @@ fn check_level_is_none(level: &Option<u32>) -> Result<(), ParquetError> {
     Ok(())
 }
 
-fn require_level(codec: &str, level: Option<u32>) -> Result<u32, ParquetError> {
+fn require_level(codec: &str, level: Option<i32>) -> Result<i32, ParquetError> {
     level.ok_or(ParquetError::General(format!(
         "{codec} requires a compression level",
     )))
@@ -989,40 +756,40 @@ impl FromStr for Compression {
 
         let c = match codec {
             "UNCOMPRESSED" | "uncompressed" => {
-                check_level_is_none(&level)?;
+                check_level_is_none(level)?;
                 Compression::UNCOMPRESSED
             }
             "SNAPPY" | "snappy" => {
-                check_level_is_none(&level)?;
+                check_level_is_none(level)?;
                 Compression::SNAPPY
             }
             "GZIP" | "gzip" => {
                 let level = require_level(codec, level)?;
-                Compression::GZIP(GzipLevel::try_new(level)?)
+                Compression::GZIP(GzipLevel::try_new(level.try_into()?)?)
             }
             "LZO" | "lzo" => {
-                check_level_is_none(&level)?;
+                check_level_is_none(level)?;
                 Compression::LZO
             }
             "BROTLI" | "brotli" => {
                 let level = require_level(codec, level)?;
-                Compression::BROTLI(BrotliLevel::try_new(level)?)
+                Compression::BROTLI(BrotliLevel::try_new(level.try_into()?)?)
             }
             "LZ4" | "lz4" => {
-                check_level_is_none(&level)?;
+                check_level_is_none(level)?;
                 Compression::LZ4
             }
             "ZSTD" | "zstd" => {
                 let level = require_level(codec, level)?;
-                Compression::ZSTD(ZstdLevel::try_new(level as i32)?)
+                Compression::ZSTD(ZstdLevel::try_new(level)?)
             }
             "LZ4_RAW" | "lz4_raw" => {
-                check_level_is_none(&level)?;
+                check_level_is_none(level)?;
                 Compression::LZ4_RAW
             }
             _ => {
                 return Err(ParquetError::General(format!(
-                    "unsupport compression {codec}"
+                    "unsupported compression {codec}"
                 )));
             }
         };
@@ -1066,8 +833,10 @@ enum BoundaryOrder {
 /// Edge interpolation algorithm for [`LogicalType::Geography`]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(i32)]
+#[derive(Default)]
 pub enum EdgeInterpolationAlgorithm {
     /// Edges are interpolated as geodesics on a sphere.
+    #[default]
     SPHERICAL = 0,
     /// <https://en.wikipedia.org/wiki/Vincenty%27s_formulae>
     VINCENTY = 1,
@@ -1081,9 +850,62 @@ pub enum EdgeInterpolationAlgorithm {
     _Unknown(i32),
 }
 
+#[cfg(feature = "geospatial")]
+impl EdgeInterpolationAlgorithm {
+    /// Converts an [`EdgeInterpolationAlgorithm`] into its corresponding algorithm defined by
+    /// [`parquet_geospatial::WkbEdges`].
+    ///
+    /// This method will only return an Err if the [`EdgeInterpolationAlgorithm`] is the `_Unknown`
+    /// variant.
+    pub fn try_as_edges(&self) -> Result<parquet_geospatial::WkbEdges> {
+        match &self {
+            Self::SPHERICAL => Ok(parquet_geospatial::WkbEdges::Spherical),
+            Self::VINCENTY => Ok(parquet_geospatial::WkbEdges::Vincenty),
+            Self::THOMAS => Ok(parquet_geospatial::WkbEdges::Thomas),
+            Self::ANDOYER => Ok(parquet_geospatial::WkbEdges::Andoyer),
+            Self::KARNEY => Ok(parquet_geospatial::WkbEdges::Karney),
+            unknown @ Self::_Unknown(_) => Err(general_err!(
+                "Unknown edge interpolation algorithm: {}",
+                unknown
+            )),
+        }
+    }
+}
+
 impl fmt::Display for EdgeInterpolationAlgorithm {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_fmt(format_args!("{0:?}", self))
+        f.write_fmt(format_args!("{self:?}"))
+    }
+}
+
+#[cfg(feature = "geospatial")]
+impl From<parquet_geospatial::WkbEdges> for EdgeInterpolationAlgorithm {
+    fn from(value: parquet_geospatial::WkbEdges) -> Self {
+        match value {
+            parquet_geospatial::WkbEdges::Spherical => Self::SPHERICAL,
+            parquet_geospatial::WkbEdges::Vincenty => Self::VINCENTY,
+            parquet_geospatial::WkbEdges::Thomas => Self::THOMAS,
+            parquet_geospatial::WkbEdges::Andoyer => Self::ANDOYER,
+            parquet_geospatial::WkbEdges::Karney => Self::KARNEY,
+        }
+    }
+}
+
+impl FromStr for EdgeInterpolationAlgorithm {
+    type Err = ParquetError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_ascii_uppercase().as_str() {
+            "SPHERICAL" => Ok(EdgeInterpolationAlgorithm::SPHERICAL),
+            "VINCENTY" => Ok(EdgeInterpolationAlgorithm::VINCENTY),
+            "THOMAS" => Ok(EdgeInterpolationAlgorithm::THOMAS),
+            "ANDOYER" => Ok(EdgeInterpolationAlgorithm::ANDOYER),
+            "KARNEY" => Ok(EdgeInterpolationAlgorithm::KARNEY),
+            unknown => Err(general_err!(
+                "Unknown edge interpolation algorithm: {}",
+                unknown
+            )),
+        }
     }
 }
 
@@ -1116,24 +938,7 @@ impl WriteThrift for EdgeInterpolationAlgorithm {
     }
 }
 
-impl WriteThriftField for EdgeInterpolationAlgorithm {
-    fn write_thrift_field<W: Write>(
-        &self,
-        writer: &mut ThriftCompactOutputProtocol<W>,
-        field_id: i16,
-        last_field_id: i16,
-    ) -> Result<i16> {
-        writer.write_field_begin(FieldType::I32, field_id, last_field_id)?;
-        self.write_thrift(writer)?;
-        Ok(field_id)
-    }
-}
-
-impl Default for EdgeInterpolationAlgorithm {
-    fn default() -> Self {
-        Self::SPHERICAL
-    }
-}
+write_thrift_field!(EdgeInterpolationAlgorithm, FieldType::I32);
 
 // ----------------------------------------------------------------------
 // Mirrors thrift union `BloomFilterAlgorithm`
@@ -1177,10 +982,9 @@ union BloomFilterCompression {
 /// order, and a sort order should be considered when comparing values with statistics
 /// min/max.
 ///
-/// See reference in
-/// <https://github.com/apache/arrow/blob/main/cpp/src/parquet/types.h>
+/// See [`ColumnOrder`] for more information.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(non_camel_case_types)]
+#[expect(non_camel_case_types)]
 pub enum SortOrder {
     /// Signed (either value or legacy byte-wise) comparison.
     SIGNED,
@@ -1188,6 +992,13 @@ pub enum SortOrder {
     UNSIGNED,
     /// Comparison is undefined.
     UNDEFINED,
+    /// Use IEEE 754 total order.
+    TOTAL_ORDER,
+    /// Use INT96 timestamp order (see [parquet-format/#584] and the [Thrift spec]).
+    ///
+    /// [parquet-format/#584]: https://github.com/apache/parquet-format/pull/584
+    /// [Thrift spec]: https://github.com/apache/parquet-format/blob/2076361bb64e2de9ca6a8d06eda025a6fa4e9df6/src/main/thrift/parquet.thrift#L1230-L1233
+    INT96_TIMESTAMP,
 }
 
 impl SortOrder {
@@ -1200,14 +1011,33 @@ impl SortOrder {
 /// Column order that specifies what method was used to aggregate min/max values for
 /// statistics.
 ///
+/// Prior to version 2.4.0, Parquet used signed comparisons when computing min and max
+/// values for statistics. This caused problems for UTF8 encoded strings, so the
+/// [`ColumnOrder`] union was added, initially with a single variant `TYPE_ORDER`. The
+/// sort order for columns was then defined based on the logical or physical type of
+/// the column, and could use either signed comparison, unsigned comparison, or for some
+/// types be left undefined. Since then several new `ColumnOrder`s have been added to the
+/// specification.
+///
+/// In this crate, the `ColumnOrder` found in the footer is represented by this enum. To
+/// convey what actual sort order to use, this crate maps the `ColumnOrder` along with the
+/// physical and logical type to a [`SortOrder`]. It is this [`SortOrder`] that is used
+/// internally when deciding how to compute the min/max statistics.
+///
 /// If column order is undefined, then it is the legacy behaviour and all values should
 /// be compared as signed values/bytes.
+///
+/// [`ColumnOrder`]: https://github.com/apache/parquet-format/blob/2076361bb64e2de9ca6a8d06eda025a6fa4e9df6/src/main/thrift/parquet.thrift#L1103
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(non_camel_case_types)]
+#[expect(non_camel_case_types)]
 pub enum ColumnOrder {
     /// Column uses the order defined by its logical or physical type
     /// (if there is no logical type), parquet-format 2.4.0+.
     TYPE_DEFINED_ORDER(SortOrder),
+    /// Column ordering to use for floating point types.
+    IEEE_754_TOTAL_ORDER,
+    /// Column ordering to use for INT96 types.
+    INT96_TIMESTAMP_ORDER,
     // The following are not defined in the Parquet spec and should always be last.
     /// Undefined column order, means legacy behaviour before parquet-format 2.4.0.
     /// Sort order is always SIGNED.
@@ -1218,41 +1048,93 @@ pub enum ColumnOrder {
 }
 
 impl ColumnOrder {
-    /// Returns sort order for a physical/logical type.
-    pub fn get_sort_order(
-        logical_type: Option<LogicalType>,
+    /// Returns the `ColumnOrder` for a physical/logical type.
+    pub fn column_order_for_type(
+        logical_type: Option<&LogicalType>,
         converted_type: ConvertedType,
         physical_type: Type,
+    ) -> ColumnOrder {
+        if Some(&LogicalType::Float16) == logical_type
+            || matches!(physical_type, Type::FLOAT | Type::DOUBLE)
+        {
+            ColumnOrder::IEEE_754_TOTAL_ORDER
+        } else if matches!(physical_type, Type::INT96) {
+            ColumnOrder::INT96_TIMESTAMP_ORDER
+        } else {
+            let sort_order =
+                Self::get_sort_order_for_type(logical_type, converted_type, physical_type, true);
+            ColumnOrder::TYPE_DEFINED_ORDER(sort_order)
+        }
+    }
+
+    /// Returns sort order for a physical/logical type.
+    ///
+    /// `is_type_defined` indicates whether the column order for this type is
+    /// [`ColumnOrder::TYPE_DEFINED_ORDER`].
+    ///
+    /// It is now preferred to obtain this via [`Self::sort_order`].
+    #[deprecated(since = "60.0.0", note = "use `ColumnOrder::sort_order` instead")]
+    pub fn sort_order_for_type(
+        logical_type: Option<&LogicalType>,
+        converted_type: ConvertedType,
+        physical_type: Type,
+        is_type_defined: bool,
     ) -> SortOrder {
-        // TODO: Should this take converted and logical type, for compatibility?
+        ColumnOrder::get_sort_order_for_type(
+            logical_type,
+            converted_type,
+            physical_type,
+            is_type_defined,
+        )
+    }
+
+    // this is pub(crate) so it can be used in the thrift parser to correctly instantiate
+    // the column_orders vec
+    pub(crate) fn get_sort_order_for_type(
+        logical_type: Option<&LogicalType>,
+        converted_type: ConvertedType,
+        physical_type: Type,
+        is_type_defined: bool,
+    ) -> SortOrder {
         match logical_type {
             Some(logical) => match logical {
                 LogicalType::String | LogicalType::Enum | LogicalType::Json | LogicalType::Bson => {
                     SortOrder::UNSIGNED
                 }
-                LogicalType::Integer { is_signed, .. } => match is_signed {
+                LogicalType::Integer(int) => match int.is_signed {
                     true => SortOrder::SIGNED,
                     false => SortOrder::UNSIGNED,
                 },
                 LogicalType::Map | LogicalType::List => SortOrder::UNDEFINED,
-                LogicalType::Decimal { .. } => SortOrder::SIGNED,
+                LogicalType::Decimal(_) => SortOrder::SIGNED,
                 LogicalType::Date => SortOrder::SIGNED,
-                LogicalType::Time { .. } => SortOrder::SIGNED,
-                LogicalType::Timestamp { .. } => SortOrder::SIGNED,
+                LogicalType::Time(_) => SortOrder::SIGNED,
+                LogicalType::Timestamp(_) => SortOrder::SIGNED,
                 LogicalType::Unknown => SortOrder::UNDEFINED,
                 LogicalType::Uuid => SortOrder::UNSIGNED,
-                LogicalType::Float16 => SortOrder::SIGNED,
-                LogicalType::Variant { .. }
-                | LogicalType::Geometry { .. }
-                | LogicalType::Geography { .. }
+                LogicalType::Float16 => {
+                    if is_type_defined {
+                        SortOrder::SIGNED
+                    } else {
+                        SortOrder::TOTAL_ORDER
+                    }
+                }
+                LogicalType::Variant(_)
+                | LogicalType::Geometry(_)
+                | LogicalType::Geography(_)
+                | LogicalType::File
                 | LogicalType::_Unknown { .. } => SortOrder::UNDEFINED,
             },
             // Fall back to converted type
-            None => Self::get_converted_sort_order(converted_type, physical_type),
+            None => Self::get_converted_sort_order(converted_type, physical_type, is_type_defined),
         }
     }
 
-    fn get_converted_sort_order(converted_type: ConvertedType, physical_type: Type) -> SortOrder {
+    fn get_converted_sort_order(
+        converted_type: ConvertedType,
+        physical_type: Type,
+        is_type_defined: bool,
+    ) -> SortOrder {
         match converted_type {
             // Unsigned byte-wise comparison.
             ConvertedType::UTF8
@@ -1287,24 +1169,41 @@ impl ColumnOrder {
             }
 
             // Fall back to physical type.
-            ConvertedType::NONE => Self::get_default_sort_order(physical_type),
+            ConvertedType::NONE => Self::get_default_sort_order(physical_type, is_type_defined),
         }
     }
 
     /// Returns default sort order based on physical type.
-    fn get_default_sort_order(physical_type: Type) -> SortOrder {
+    fn get_default_sort_order(physical_type: Type, is_type_defined: bool) -> SortOrder {
         match physical_type {
             // Order: false, true
             Type::BOOLEAN => SortOrder::UNSIGNED,
             Type::INT32 | Type::INT64 => SortOrder::SIGNED,
-            Type::INT96 => SortOrder::UNDEFINED,
+            Type::INT96 => {
+                if is_type_defined {
+                    SortOrder::UNDEFINED
+                } else {
+                    SortOrder::INT96_TIMESTAMP
+                }
+            }
             // Notes to remember when comparing float/double values:
-            // If the min is a NaN, it should be ignored.
-            // If the max is a NaN, it should be ignored.
-            // If the min is +0, the row group may contain -0 values as well.
-            // If the max is -0, the row group may contain +0 values as well.
-            // When looking for NaN values, min and max should be ignored.
-            Type::FLOAT | Type::DOUBLE => SortOrder::SIGNED,
+            // If legacy TYPE_DEFINED_ORDER is specified:
+            //   If the min is a NaN, it should be ignored.
+            //   If the max is a NaN, it should be ignored.
+            //   If the min is +0, the row group may contain -0 values as well.
+            //   If the max is -0, the row group may contain +0 values as well.
+            //   When looking for NaN values, min and max should be ignored.
+            // If IEEE_754_TOTAL_ORDER:
+            //   Examine nan_count to see if NaNs are present.
+            //   If min/max are NaN, that means only NaNs are present.
+            //   If min/max are not NaN, they are ordered according to total order.
+            Type::FLOAT | Type::DOUBLE => {
+                if is_type_defined {
+                    SortOrder::SIGNED
+                } else {
+                    SortOrder::TOTAL_ORDER
+                }
+            }
             // Unsigned byte-wise comparison
             Type::BYTE_ARRAY | Type::FIXED_LEN_BYTE_ARRAY => SortOrder::UNSIGNED,
         }
@@ -1314,6 +1213,8 @@ impl ColumnOrder {
     pub fn sort_order(&self) -> SortOrder {
         match *self {
             ColumnOrder::TYPE_DEFINED_ORDER(order) => order,
+            ColumnOrder::IEEE_754_TOTAL_ORDER => SortOrder::TOTAL_ORDER,
+            ColumnOrder::INT96_TIMESTAMP_ORDER => SortOrder::INT96_TIMESTAMP,
             ColumnOrder::UNDEFINED => SortOrder::SIGNED,
             ColumnOrder::UNKNOWN => SortOrder::UNDEFINED,
         }
@@ -1331,6 +1232,14 @@ impl<'a, R: ThriftCompactInputProtocol<'a>> ReadThrift<'a, R> for ColumnOrder {
                 // NOTE: the sort order needs to be set correctly after parsing.
                 prot.skip_empty_struct()?;
                 Self::TYPE_DEFINED_ORDER(SortOrder::SIGNED)
+            }
+            2 => {
+                prot.skip_empty_struct()?;
+                Self::IEEE_754_TOTAL_ORDER
+            }
+            3 => {
+                prot.skip_empty_struct()?;
+                Self::INT96_TIMESTAMP_ORDER
             }
             _ => {
                 prot.skip(field_ident.field_type)?;
@@ -1356,6 +1265,14 @@ impl WriteThrift for ColumnOrder {
                 writer.write_field_begin(FieldType::Struct, 1, 0)?;
                 writer.write_struct_end()?;
             }
+            Self::IEEE_754_TOTAL_ORDER => {
+                writer.write_field_begin(FieldType::Struct, 2, 0)?;
+                writer.write_struct_end()?;
+            }
+            Self::INT96_TIMESTAMP_ORDER => {
+                writer.write_field_begin(FieldType::Struct, 3, 0)?;
+                writer.write_struct_end()?;
+            }
             _ => return Err(general_err!("Attempt to write undefined ColumnOrder")),
         }
         // write end of struct for this union
@@ -1365,12 +1282,6 @@ impl WriteThrift for ColumnOrder {
 
 // ----------------------------------------------------------------------
 // Display handlers
-
-impl fmt::Display for ConvertedType {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{self:?}")
-    }
-}
 
 impl fmt::Display for Compression {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -1409,20 +1320,17 @@ impl From<Option<LogicalType>> for ConvertedType {
                 LogicalType::Enum => ConvertedType::ENUM,
                 LogicalType::Decimal { .. } => ConvertedType::DECIMAL,
                 LogicalType::Date => ConvertedType::DATE,
-                LogicalType::Time { unit, .. } => match unit {
+                LogicalType::Time(time) => match time.unit {
                     TimeUnit::MILLIS => ConvertedType::TIME_MILLIS,
                     TimeUnit::MICROS => ConvertedType::TIME_MICROS,
                     TimeUnit::NANOS => ConvertedType::NONE,
                 },
-                LogicalType::Timestamp { unit, .. } => match unit {
+                LogicalType::Timestamp(time) => match time.unit {
                     TimeUnit::MILLIS => ConvertedType::TIMESTAMP_MILLIS,
                     TimeUnit::MICROS => ConvertedType::TIMESTAMP_MICROS,
                     TimeUnit::NANOS => ConvertedType::NONE,
                 },
-                LogicalType::Integer {
-                    bit_width,
-                    is_signed,
-                } => match (bit_width, is_signed) {
+                LogicalType::Integer(int_type) => match (int_type.bit_width, int_type.is_signed) {
                     (8, true) => ConvertedType::INT_8,
                     (16, true) => ConvertedType::INT_16,
                     (32, true) => ConvertedType::INT_32,
@@ -1439,9 +1347,10 @@ impl From<Option<LogicalType>> for ConvertedType {
                 LogicalType::Bson => ConvertedType::BSON,
                 LogicalType::Uuid
                 | LogicalType::Float16
-                | LogicalType::Variant { .. }
-                | LogicalType::Geometry { .. }
-                | LogicalType::Geography { .. }
+                | LogicalType::Variant(_)
+                | LogicalType::Geometry(_)
+                | LogicalType::Geography(_)
+                | LogicalType::File
                 | LogicalType::_Unknown { .. }
                 | LogicalType::Unknown => ConvertedType::NONE,
             },
@@ -1523,26 +1432,14 @@ impl str::FromStr for LogicalType {
     fn from_str(s: &str) -> Result<Self> {
         match s {
             // The type is a placeholder that gets updated elsewhere
-            "INTEGER" => Ok(LogicalType::Integer {
-                bit_width: 8,
-                is_signed: false,
-            }),
+            "INTEGER" => Ok(LogicalType::integer(8, false)),
             "MAP" => Ok(LogicalType::Map),
             "LIST" => Ok(LogicalType::List),
             "ENUM" => Ok(LogicalType::Enum),
-            "DECIMAL" => Ok(LogicalType::Decimal {
-                precision: -1,
-                scale: -1,
-            }),
+            "DECIMAL" => Ok(LogicalType::decimal(-1, -1)),
             "DATE" => Ok(LogicalType::Date),
-            "TIME" => Ok(LogicalType::Time {
-                is_adjusted_to_u_t_c: false,
-                unit: TimeUnit::MILLIS,
-            }),
-            "TIMESTAMP" => Ok(LogicalType::Timestamp {
-                is_adjusted_to_u_t_c: false,
-                unit: TimeUnit::MILLIS,
-            }),
+            "TIME" => Ok(LogicalType::time(false, TimeUnit::MILLIS)),
+            "TIMESTAMP" => Ok(LogicalType::timestamp(false, TimeUnit::MILLIS)),
             "STRING" => Ok(LogicalType::String),
             "JSON" => Ok(LogicalType::Json),
             "BSON" => Ok(LogicalType::Bson),
@@ -1552,18 +1449,20 @@ impl str::FromStr for LogicalType {
                 "Interval parquet logical type not yet supported"
             )),
             "FLOAT16" => Ok(LogicalType::Float16),
-            "GEOMETRY" => Ok(LogicalType::Geometry { crs: None }),
-            "GEOGRAPHY" => Ok(LogicalType::Geography {
-                crs: None,
-                algorithm: Some(EdgeInterpolationAlgorithm::SPHERICAL),
-            }),
+            "VARIANT" => Ok(LogicalType::variant(None)),
+            "FILE" => Ok(LogicalType::File),
+            "GEOMETRY" => Ok(LogicalType::geometry(None)),
+            "GEOGRAPHY" => Ok(LogicalType::geography(
+                None,
+                Some(EdgeInterpolationAlgorithm::SPHERICAL),
+            )),
             other => Err(general_err!("Invalid parquet logical type {}", other)),
         }
     }
 }
 
 #[cfg(test)]
-#[allow(deprecated)] // allow BIT_PACKED encoding for the whole test module
+#[expect(deprecated)] // allow BIT_PACKED encoding for the whole test module
 mod tests {
     use super::*;
     use crate::parquet_thrift::{ThriftSliceInputProtocol, tests::test_roundtrip};
@@ -1872,10 +1771,7 @@ mod tests {
         let logical_none: Option<LogicalType> = None;
         assert_eq!(ConvertedType::from(logical_none), ConvertedType::NONE);
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Decimal {
-                precision: 20,
-                scale: 5
-            })),
+            ConvertedType::from(Some(LogicalType::decimal(5, 20))),
             ConvertedType::DECIMAL
         );
         assert_eq!(
@@ -1895,101 +1791,59 @@ mod tests {
             ConvertedType::DATE
         );
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Time {
-                unit: TimeUnit::MILLIS,
-                is_adjusted_to_u_t_c: true,
-            })),
+            ConvertedType::from(Some(LogicalType::time(true, TimeUnit::MILLIS))),
             ConvertedType::TIME_MILLIS
         );
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Time {
-                unit: TimeUnit::MICROS,
-                is_adjusted_to_u_t_c: true,
-            })),
+            ConvertedType::from(Some(LogicalType::time(true, TimeUnit::MICROS))),
             ConvertedType::TIME_MICROS
         );
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Time {
-                unit: TimeUnit::NANOS,
-                is_adjusted_to_u_t_c: false,
-            })),
+            ConvertedType::from(Some(LogicalType::time(false, TimeUnit::NANOS))),
             ConvertedType::NONE
         );
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Timestamp {
-                unit: TimeUnit::MILLIS,
-                is_adjusted_to_u_t_c: true,
-            })),
+            ConvertedType::from(Some(LogicalType::timestamp(true, TimeUnit::MILLIS))),
             ConvertedType::TIMESTAMP_MILLIS
         );
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Timestamp {
-                unit: TimeUnit::MICROS,
-                is_adjusted_to_u_t_c: false,
-            })),
+            ConvertedType::from(Some(LogicalType::timestamp(false, TimeUnit::MICROS))),
             ConvertedType::TIMESTAMP_MICROS
         );
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Timestamp {
-                unit: TimeUnit::NANOS,
-                is_adjusted_to_u_t_c: false,
-            })),
+            ConvertedType::from(Some(LogicalType::timestamp(false, TimeUnit::NANOS))),
             ConvertedType::NONE
         );
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Integer {
-                bit_width: 8,
-                is_signed: false
-            })),
+            ConvertedType::from(Some(LogicalType::integer(8, false))),
             ConvertedType::UINT_8
         );
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Integer {
-                bit_width: 8,
-                is_signed: true
-            })),
+            ConvertedType::from(Some(LogicalType::integer(8, true))),
             ConvertedType::INT_8
         );
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Integer {
-                bit_width: 16,
-                is_signed: false
-            })),
+            ConvertedType::from(Some(LogicalType::integer(16, false))),
             ConvertedType::UINT_16
         );
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Integer {
-                bit_width: 16,
-                is_signed: true
-            })),
+            ConvertedType::from(Some(LogicalType::integer(16, true))),
             ConvertedType::INT_16
         );
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Integer {
-                bit_width: 32,
-                is_signed: false
-            })),
+            ConvertedType::from(Some(LogicalType::integer(32, false))),
             ConvertedType::UINT_32
         );
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Integer {
-                bit_width: 32,
-                is_signed: true
-            })),
+            ConvertedType::from(Some(LogicalType::integer(32, true))),
             ConvertedType::INT_32
         );
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Integer {
-                bit_width: 64,
-                is_signed: false
-            })),
+            ConvertedType::from(Some(LogicalType::integer(64, false))),
             ConvertedType::UINT_64
         );
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Integer {
-                bit_width: 64,
-                is_signed: true
-            })),
+            ConvertedType::from(Some(LogicalType::integer(64, true))),
             ConvertedType::INT_64
         );
         assert_eq!(
@@ -2013,14 +1867,15 @@ mod tests {
             ConvertedType::NONE
         );
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Geometry { crs: None })),
+            ConvertedType::from(Some(LogicalType::variant(None))),
             ConvertedType::NONE
         );
         assert_eq!(
-            ConvertedType::from(Some(LogicalType::Geography {
-                crs: None,
-                algorithm: Some(EdgeInterpolationAlgorithm::default()),
-            })),
+            ConvertedType::from(Some(LogicalType::geometry(None))),
+            ConvertedType::NONE
+        );
+        assert_eq!(
+            ConvertedType::from(Some(LogicalType::geography(None, Some(Default::default())))),
             ConvertedType::NONE
         );
         assert_eq!(
@@ -2035,81 +1890,42 @@ mod tests {
         test_roundtrip(LogicalType::Map);
         test_roundtrip(LogicalType::List);
         test_roundtrip(LogicalType::Enum);
-        test_roundtrip(LogicalType::Decimal {
-            scale: 0,
-            precision: 20,
-        });
+        test_roundtrip(LogicalType::decimal(0, 20));
         test_roundtrip(LogicalType::Date);
-        test_roundtrip(LogicalType::Time {
-            is_adjusted_to_u_t_c: true,
-            unit: TimeUnit::MICROS,
-        });
-        test_roundtrip(LogicalType::Time {
-            is_adjusted_to_u_t_c: false,
-            unit: TimeUnit::MILLIS,
-        });
-        test_roundtrip(LogicalType::Time {
-            is_adjusted_to_u_t_c: false,
-            unit: TimeUnit::NANOS,
-        });
-        test_roundtrip(LogicalType::Timestamp {
-            is_adjusted_to_u_t_c: false,
-            unit: TimeUnit::MICROS,
-        });
-        test_roundtrip(LogicalType::Timestamp {
-            is_adjusted_to_u_t_c: true,
-            unit: TimeUnit::MILLIS,
-        });
-        test_roundtrip(LogicalType::Timestamp {
-            is_adjusted_to_u_t_c: true,
-            unit: TimeUnit::NANOS,
-        });
-        test_roundtrip(LogicalType::Integer {
-            bit_width: 8,
-            is_signed: true,
-        });
-        test_roundtrip(LogicalType::Integer {
-            bit_width: 16,
-            is_signed: false,
-        });
-        test_roundtrip(LogicalType::Integer {
-            bit_width: 32,
-            is_signed: true,
-        });
-        test_roundtrip(LogicalType::Integer {
-            bit_width: 64,
-            is_signed: false,
-        });
+        test_roundtrip(LogicalType::time(true, TimeUnit::MICROS));
+        test_roundtrip(LogicalType::time(false, TimeUnit::MILLIS));
+        test_roundtrip(LogicalType::time(false, TimeUnit::NANOS));
+        test_roundtrip(LogicalType::timestamp(false, TimeUnit::MICROS));
+        test_roundtrip(LogicalType::timestamp(true, TimeUnit::MILLIS));
+        test_roundtrip(LogicalType::timestamp(true, TimeUnit::NANOS));
+        test_roundtrip(LogicalType::integer(8, true));
+        test_roundtrip(LogicalType::integer(16, false));
+        test_roundtrip(LogicalType::integer(32, true));
+        test_roundtrip(LogicalType::integer(64, false));
         test_roundtrip(LogicalType::Json);
         test_roundtrip(LogicalType::Bson);
         test_roundtrip(LogicalType::Uuid);
         test_roundtrip(LogicalType::Float16);
-        test_roundtrip(LogicalType::Variant {
-            specification_version: Some(1),
-        });
-        test_roundtrip(LogicalType::Variant {
-            specification_version: None,
-        });
-        test_roundtrip(LogicalType::Geometry {
-            crs: Some("foo".to_owned()),
-        });
-        test_roundtrip(LogicalType::Geometry { crs: None });
-        test_roundtrip(LogicalType::Geography {
-            crs: Some("foo".to_owned()),
-            algorithm: Some(EdgeInterpolationAlgorithm::ANDOYER),
-        });
-        test_roundtrip(LogicalType::Geography {
-            crs: None,
-            algorithm: Some(EdgeInterpolationAlgorithm::KARNEY),
-        });
-        test_roundtrip(LogicalType::Geography {
-            crs: Some("foo".to_owned()),
-            algorithm: Some(EdgeInterpolationAlgorithm::SPHERICAL),
-        });
-        test_roundtrip(LogicalType::Geography {
-            crs: None,
-            algorithm: Some(EdgeInterpolationAlgorithm::SPHERICAL),
-        });
+        test_roundtrip(LogicalType::variant(Some(1)));
+        test_roundtrip(LogicalType::variant(None));
+        test_roundtrip(LogicalType::geometry(Some("foo".to_owned())));
+        test_roundtrip(LogicalType::geometry(None));
+        test_roundtrip(LogicalType::geography(
+            Some("foo".to_owned()),
+            Some(EdgeInterpolationAlgorithm::ANDOYER),
+        ));
+        test_roundtrip(LogicalType::geography(
+            None,
+            Some(EdgeInterpolationAlgorithm::KARNEY),
+        ));
+        test_roundtrip(LogicalType::geography(
+            Some("foo".to_owned()),
+            Some(EdgeInterpolationAlgorithm::SPHERICAL),
+        ));
+        test_roundtrip(LogicalType::geography(
+            None,
+            Some(EdgeInterpolationAlgorithm::SPHERICAL),
+        ));
     }
 
     #[test]
@@ -2160,14 +1976,69 @@ mod tests {
         );
         assert_eq!(Encoding::DELTA_BYTE_ARRAY.to_string(), "DELTA_BYTE_ARRAY");
         assert_eq!(Encoding::RLE_DICTIONARY.to_string(), "RLE_DICTIONARY");
+        assert_eq!(Encoding::ALP.to_string(), "ALP");
     }
 
     #[test]
-    fn test_compression_codec_to_string() {
-        assert_eq!(Compression::UNCOMPRESSED.codec_to_string(), "UNCOMPRESSED");
+    fn test_compression_conversion() {
         assert_eq!(
-            Compression::ZSTD(ZstdLevel::default()).codec_to_string(),
-            "ZSTD"
+            CompressionCodec::from(Compression::UNCOMPRESSED),
+            CompressionCodec::UNCOMPRESSED
+        );
+        assert_eq!(
+            CompressionCodec::from(Compression::SNAPPY),
+            CompressionCodec::SNAPPY
+        );
+        assert_eq!(
+            CompressionCodec::from(Compression::GZIP(Default::default())),
+            CompressionCodec::GZIP
+        );
+        assert_eq!(
+            CompressionCodec::from(Compression::LZO),
+            CompressionCodec::LZO
+        );
+        assert_eq!(
+            CompressionCodec::from(Compression::BROTLI(Default::default())),
+            CompressionCodec::BROTLI
+        );
+        assert_eq!(
+            CompressionCodec::from(Compression::LZ4),
+            CompressionCodec::LZ4
+        );
+        assert_eq!(
+            CompressionCodec::from(Compression::ZSTD(Default::default())),
+            CompressionCodec::ZSTD
+        );
+        assert_eq!(
+            CompressionCodec::from(Compression::LZ4_RAW),
+            CompressionCodec::LZ4_RAW
+        );
+
+        assert_eq!(
+            Compression::from(CompressionCodec::UNCOMPRESSED),
+            Compression::UNCOMPRESSED
+        );
+        assert_eq!(
+            Compression::from(CompressionCodec::SNAPPY),
+            Compression::SNAPPY
+        );
+        assert_eq!(
+            Compression::from(CompressionCodec::GZIP),
+            Compression::GZIP(Default::default())
+        );
+        assert_eq!(Compression::from(CompressionCodec::LZO), Compression::LZO);
+        assert_eq!(
+            Compression::from(CompressionCodec::BROTLI),
+            Compression::BROTLI(Default::default())
+        );
+        assert_eq!(Compression::from(CompressionCodec::LZ4), Compression::LZ4);
+        assert_eq!(
+            Compression::from(CompressionCodec::ZSTD),
+            Compression::ZSTD(Default::default())
+        );
+        assert_eq!(
+            Compression::from(CompressionCodec::LZ4_RAW),
+            Compression::LZ4_RAW
         );
     }
 
@@ -2204,6 +2075,8 @@ mod tests {
         assert_eq!(SortOrder::SIGNED.to_string(), "SIGNED");
         assert_eq!(SortOrder::UNSIGNED.to_string(), "UNSIGNED");
         assert_eq!(SortOrder::UNDEFINED.to_string(), "UNDEFINED");
+        assert_eq!(SortOrder::TOTAL_ORDER.to_string(), "TOTAL_ORDER");
+        assert_eq!(SortOrder::INT96_TIMESTAMP.to_string(), "INT96_TIMESTAMP");
     }
 
     #[test]
@@ -2220,6 +2093,14 @@ mod tests {
             ColumnOrder::TYPE_DEFINED_ORDER(SortOrder::UNDEFINED).to_string(),
             "TYPE_DEFINED_ORDER(UNDEFINED)"
         );
+        assert_eq!(
+            ColumnOrder::IEEE_754_TOTAL_ORDER.to_string(),
+            "IEEE_754_TOTAL_ORDER"
+        );
+        assert_eq!(
+            ColumnOrder::INT96_TIMESTAMP_ORDER.to_string(),
+            "INT96_TIMESTAMP_ORDER"
+        );
         assert_eq!(ColumnOrder::UNDEFINED.to_string(), "UNDEFINED");
     }
 
@@ -2234,9 +2115,14 @@ mod tests {
         // Helper to check the order in a list of values.
         // Only logical type is checked.
         fn check_sort_order(types: Vec<LogicalType>, expected_order: SortOrder) {
-            for tpe in types {
+            for type_ in types {
                 assert_eq!(
-                    ColumnOrder::get_sort_order(Some(tpe), ConvertedType::NONE, Type::BYTE_ARRAY),
+                    ColumnOrder::column_order_for_type(
+                        Some(&type_),
+                        ConvertedType::NONE,
+                        Type::BYTE_ARRAY
+                    )
+                    .sort_order(),
                     expected_order
                 );
             }
@@ -2249,85 +2135,40 @@ mod tests {
             LogicalType::Bson,
             LogicalType::Enum,
             LogicalType::Uuid,
-            LogicalType::Integer {
-                bit_width: 8,
-                is_signed: false,
-            },
-            LogicalType::Integer {
-                bit_width: 16,
-                is_signed: false,
-            },
-            LogicalType::Integer {
-                bit_width: 32,
-                is_signed: false,
-            },
-            LogicalType::Integer {
-                bit_width: 64,
-                is_signed: false,
-            },
+            LogicalType::integer(8, false),
+            LogicalType::integer(16, false),
+            LogicalType::integer(32, false),
+            LogicalType::integer(64, false),
         ];
         check_sort_order(unsigned, SortOrder::UNSIGNED);
 
         // Signed comparison (physical type does not matter)
         let signed = vec![
-            LogicalType::Integer {
-                bit_width: 8,
-                is_signed: true,
-            },
-            LogicalType::Integer {
-                bit_width: 8,
-                is_signed: true,
-            },
-            LogicalType::Integer {
-                bit_width: 8,
-                is_signed: true,
-            },
-            LogicalType::Integer {
-                bit_width: 8,
-                is_signed: true,
-            },
-            LogicalType::Decimal {
-                scale: 20,
-                precision: 4,
-            },
+            LogicalType::integer(8, true),
+            LogicalType::integer(16, true),
+            LogicalType::integer(32, true),
+            LogicalType::integer(64, true),
+            LogicalType::decimal(20, 4),
             LogicalType::Date,
-            LogicalType::Time {
-                is_adjusted_to_u_t_c: false,
-                unit: TimeUnit::MILLIS,
-            },
-            LogicalType::Time {
-                is_adjusted_to_u_t_c: false,
-                unit: TimeUnit::MICROS,
-            },
-            LogicalType::Time {
-                is_adjusted_to_u_t_c: true,
-                unit: TimeUnit::NANOS,
-            },
-            LogicalType::Timestamp {
-                is_adjusted_to_u_t_c: false,
-                unit: TimeUnit::MILLIS,
-            },
-            LogicalType::Timestamp {
-                is_adjusted_to_u_t_c: false,
-                unit: TimeUnit::MICROS,
-            },
-            LogicalType::Timestamp {
-                is_adjusted_to_u_t_c: true,
-                unit: TimeUnit::NANOS,
-            },
-            LogicalType::Float16,
+            LogicalType::time(false, TimeUnit::MILLIS),
+            LogicalType::time(false, TimeUnit::MICROS),
+            LogicalType::time(true, TimeUnit::NANOS),
+            LogicalType::timestamp(false, TimeUnit::MILLIS),
+            LogicalType::timestamp(false, TimeUnit::MICROS),
+            LogicalType::timestamp(true, TimeUnit::NANOS),
         ];
         check_sort_order(signed, SortOrder::SIGNED);
+
+        let float = vec![LogicalType::Float16];
+        check_sort_order(float, SortOrder::TOTAL_ORDER);
 
         // Undefined comparison
         let undefined = vec![
             LogicalType::List,
             LogicalType::Map,
-            LogicalType::Geometry { crs: None },
-            LogicalType::Geography {
-                crs: None,
-                algorithm: Some(EdgeInterpolationAlgorithm::default()),
-            },
+            LogicalType::variant(None),
+            LogicalType::geometry(None),
+            LogicalType::geography(None, Some(Default::default())),
         ];
         check_sort_order(undefined, SortOrder::UNDEFINED);
     }
@@ -2337,9 +2178,9 @@ mod tests {
         // Helper to check the order in a list of values.
         // Only converted type is checked.
         fn check_sort_order(types: Vec<ConvertedType>, expected_order: SortOrder) {
-            for tpe in types {
+            for type_ in types {
                 assert_eq!(
-                    ColumnOrder::get_sort_order(None, tpe, Type::BYTE_ARRAY),
+                    ColumnOrder::column_order_for_type(None, type_, Type::BYTE_ARRAY).sort_order(),
                     expected_order
                 );
             }
@@ -2391,35 +2232,47 @@ mod tests {
     fn test_column_order_get_default_sort_order() {
         // Comparison based on physical type
         assert_eq!(
-            ColumnOrder::get_default_sort_order(Type::BOOLEAN),
+            ColumnOrder::get_default_sort_order(Type::BOOLEAN, true),
             SortOrder::UNSIGNED
         );
         assert_eq!(
-            ColumnOrder::get_default_sort_order(Type::INT32),
+            ColumnOrder::get_default_sort_order(Type::INT32, true),
             SortOrder::SIGNED
         );
         assert_eq!(
-            ColumnOrder::get_default_sort_order(Type::INT64),
+            ColumnOrder::get_default_sort_order(Type::INT64, true),
             SortOrder::SIGNED
         );
         assert_eq!(
-            ColumnOrder::get_default_sort_order(Type::INT96),
+            ColumnOrder::get_default_sort_order(Type::INT96, true),
             SortOrder::UNDEFINED
         );
         assert_eq!(
-            ColumnOrder::get_default_sort_order(Type::FLOAT),
+            ColumnOrder::get_default_sort_order(Type::INT96, false),
+            SortOrder::INT96_TIMESTAMP
+        );
+        assert_eq!(
+            ColumnOrder::get_default_sort_order(Type::FLOAT, false),
+            SortOrder::TOTAL_ORDER
+        );
+        assert_eq!(
+            ColumnOrder::get_default_sort_order(Type::DOUBLE, false),
+            SortOrder::TOTAL_ORDER
+        );
+        assert_eq!(
+            ColumnOrder::get_default_sort_order(Type::FLOAT, true),
             SortOrder::SIGNED
         );
         assert_eq!(
-            ColumnOrder::get_default_sort_order(Type::DOUBLE),
+            ColumnOrder::get_default_sort_order(Type::DOUBLE, true),
             SortOrder::SIGNED
         );
         assert_eq!(
-            ColumnOrder::get_default_sort_order(Type::BYTE_ARRAY),
+            ColumnOrder::get_default_sort_order(Type::BYTE_ARRAY, true),
             SortOrder::UNSIGNED
         );
         assert_eq!(
-            ColumnOrder::get_default_sort_order(Type::FIXED_LEN_BYTE_ARRAY),
+            ColumnOrder::get_default_sort_order(Type::FIXED_LEN_BYTE_ARRAY, true),
             SortOrder::UNSIGNED
         );
     }
@@ -2437,6 +2290,14 @@ mod tests {
         assert_eq!(
             ColumnOrder::TYPE_DEFINED_ORDER(SortOrder::UNDEFINED).sort_order(),
             SortOrder::UNDEFINED
+        );
+        assert_eq!(
+            ColumnOrder::IEEE_754_TOTAL_ORDER.sort_order(),
+            SortOrder::TOTAL_ORDER
+        );
+        assert_eq!(
+            ColumnOrder::INT96_TIMESTAMP_ORDER.sort_order(),
+            SortOrder::INT96_TIMESTAMP
         );
         assert_eq!(ColumnOrder::UNDEFINED.sort_order(), SortOrder::SIGNED);
     }
@@ -2461,6 +2322,8 @@ mod tests {
         assert_eq!(encoding, Encoding::RLE_DICTIONARY);
         encoding = "BYTE_STREAM_SPLIT".parse().unwrap();
         assert_eq!(encoding, Encoding::BYTE_STREAM_SPLIT);
+        encoding = "alp".parse().unwrap();
+        assert_eq!(encoding, Encoding::ALP);
 
         // test lowercase
         encoding = "byte_stream_split".parse().unwrap();
@@ -2485,6 +2348,8 @@ mod tests {
         assert_eq!(compress, Compression::LZO);
         compress = "zstd(3)".parse().unwrap();
         assert_eq!(compress, Compression::ZSTD(ZstdLevel::try_new(3).unwrap()));
+        compress = "zstd(-3)".parse().unwrap();
+        assert_eq!(compress, Compression::ZSTD(ZstdLevel::try_new(-3).unwrap()));
         compress = "LZ4_RAW".parse().unwrap();
         assert_eq!(compress, Compression::LZ4_RAW);
         compress = "uncompressed".parse().unwrap();
@@ -2537,6 +2402,35 @@ mod tests {
         assert_eq!(EdgeInterpolationAlgorithm::KARNEY.to_string(), "KARNEY");
     }
 
+    #[test]
+    fn test_from_str_edge_algo() {
+        assert_eq!(
+            "spHErical".parse::<EdgeInterpolationAlgorithm>().unwrap(),
+            EdgeInterpolationAlgorithm::SPHERICAL
+        );
+        assert_eq!(
+            "vinceNTY".parse::<EdgeInterpolationAlgorithm>().unwrap(),
+            EdgeInterpolationAlgorithm::VINCENTY
+        );
+        assert_eq!(
+            "tHOmas".parse::<EdgeInterpolationAlgorithm>().unwrap(),
+            EdgeInterpolationAlgorithm::THOMAS
+        );
+        assert_eq!(
+            "anDOYEr".parse::<EdgeInterpolationAlgorithm>().unwrap(),
+            EdgeInterpolationAlgorithm::ANDOYER
+        );
+        assert_eq!(
+            "kaRNey".parse::<EdgeInterpolationAlgorithm>().unwrap(),
+            EdgeInterpolationAlgorithm::KARNEY
+        );
+        assert!(
+            "does not exist"
+                .parse::<EdgeInterpolationAlgorithm>()
+                .is_err()
+        );
+    }
+
     fn encodings_roundtrip(mut encodings: Vec<Encoding>) {
         encodings.sort();
         let mask = EncodingMask::new_from_encodings(encodings.iter());
@@ -2567,6 +2461,7 @@ mod tests {
             Encoding::PLAIN_DICTIONARY,
             Encoding::RLE_DICTIONARY,
             Encoding::BYTE_STREAM_SPLIT,
+            Encoding::ALP,
         ];
         encodings_roundtrip(encodings.into());
     }
@@ -2590,5 +2485,15 @@ mod tests {
             err.to_string(),
             "Parquet error: Attempt to create invalid mask: 0x2"
         );
+    }
+
+    #[test]
+    fn test_encoding_mask_is_only() {
+        let mask = EncodingMask::new_from_encodings([Encoding::PLAIN].iter());
+        assert!(mask.is_only(Encoding::PLAIN));
+
+        let mask =
+            EncodingMask::new_from_encodings([Encoding::PLAIN, Encoding::PLAIN_DICTIONARY].iter());
+        assert!(!mask.is_only(Encoding::PLAIN));
     }
 }

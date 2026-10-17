@@ -29,17 +29,38 @@ use std::ops::Deref;
 /// with the following differences:
 ///
 /// - slicing and cloning is O(1).
-/// - it supports external allocated memory
+/// - support for external allocated memory (e.g. via FFI).
 ///
+/// See [`Buffer`] for more low-level memory management details.
+///
+/// # Example: Convert to/from Vec (without copies)
+///
+/// (See [`Buffer::from_vec`] and [`Buffer::into_vec`] for a lower level API)
 /// ```
 /// # use arrow_buffer::ScalarBuffer;
 /// // Zero-copy conversion from Vec
 /// let buffer = ScalarBuffer::from(vec![1, 2, 3]);
 /// assert_eq!(&buffer, &[1, 2, 3]);
+/// // convert the buffer back to Vec without copy assuming:
+/// // 1. the inner buffer is not sliced
+/// // 2. the inner buffer uses standard allocation
+/// // 3. there are no other references to the inner buffer
+/// let vec: Vec<i32> = buffer.into();
+/// assert_eq!(&vec, &[1, 2, 3]);
+/// ```
 ///
+/// # Example: Zero copy slicing
+/// ```
+/// # use arrow_buffer::ScalarBuffer;
+/// let buffer = ScalarBuffer::from(vec![1, 2, 3]);
+/// assert_eq!(&buffer, &[1, 2, 3]);
 /// // Zero-copy slicing
 /// let sliced = buffer.slice(1, 2);
 /// assert_eq!(&sliced, &[2, 3]);
+/// // Original buffer is unchanged
+/// assert_eq!(&buffer, &[1, 2, 3]);
+/// // converting the sliced buffer back to Vec incurs a copy
+/// let vec: Vec<i32> = sliced.into();
 /// ```
 #[derive(Clone, Default)]
 pub struct ScalarBuffer<T: ArrowNativeType> {
@@ -91,6 +112,10 @@ impl<T: ArrowNativeType> ScalarBuffer<T> {
     }
 
     /// Returns a zero-copy slice of this buffer with length `len` and starting at `offset`
+    ///
+    /// # Panics
+    ///
+    /// Panics for the same reasons as [`Self::new`]
     pub fn slice(&self, offset: usize, len: usize) -> Self {
         Self::new(self.buffer.clone(), offset, len)
     }
@@ -103,6 +128,14 @@ impl<T: ArrowNativeType> ScalarBuffer<T> {
     /// Returns the inner [`Buffer`], consuming self
     pub fn into_inner(self) -> Buffer {
         self.buffer
+    }
+
+    /// Claim memory used by this buffer in the provided memory pool.
+    ///
+    /// See [`Buffer::claim`] for details.
+    #[cfg(feature = "pool")]
+    pub fn claim(&self, pool: &dyn crate::MemoryPool) {
+        self.buffer.claim(pool);
     }
 
     /// Returns true if this [`ScalarBuffer`] is equal to `other`, using pointer comparisons
@@ -132,7 +165,7 @@ impl<T: ArrowNativeType> Deref for ScalarBuffer<T> {
         // SAFETY: Verified alignment in From<Buffer>
         unsafe {
             std::slice::from_raw_parts(
-                self.buffer.as_ptr() as *const T,
+                self.buffer.as_ptr().cast::<T>(),
                 self.buffer.len() / std::mem::size_of::<T>(),
             )
         }
@@ -258,7 +291,7 @@ mod tests {
     #[test]
     fn test_basic() {
         let expected = [0_i32, 1, 2];
-        let buffer = Buffer::from_iter(expected.iter().cloned());
+        let buffer = Buffer::from_iter(expected.iter().copied());
         let typed = ScalarBuffer::<i32>::new(buffer.clone(), 0, 3);
         assert_eq!(*typed, expected);
 
@@ -282,7 +315,7 @@ mod tests {
     #[should_panic(expected = "Memory pointer is not aligned with the specified scalar type")]
     fn test_unaligned() {
         let expected = [0_i32, 1, 2];
-        let buffer = Buffer::from_iter(expected.iter().cloned());
+        let buffer = Buffer::from_iter(expected.iter().copied());
         let buffer = buffer.slice(1);
         ScalarBuffer::<i32>::new(buffer, 0, 2);
     }

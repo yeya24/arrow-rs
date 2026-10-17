@@ -18,7 +18,8 @@
 use crate::errors::ParquetError;
 use crate::errors::ParquetError::General;
 use crate::errors::Result;
-use ring::aead::{AES_128_GCM, Aad, LessSafeKey, NonceSequence, UnboundKey};
+use crate::file::metadata::HeapSize;
+use ring::aead::{AES_128_GCM, AES_256_GCM, Aad, LessSafeKey, NonceSequence, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
 use std::fmt::Debug;
 
@@ -27,7 +28,7 @@ pub(crate) const NONCE_LEN: usize = 12;
 pub(crate) const TAG_LEN: usize = 16;
 pub(crate) const SIZE_LEN: usize = 4;
 
-pub(crate) trait BlockDecryptor: Debug + Send + Sync {
+pub(crate) trait BlockDecryptor: Debug + Send + Sync + HeapSize {
     fn decrypt(&self, length_and_ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>>;
 
     fn compute_plaintext_tag(&self, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>>;
@@ -39,14 +40,31 @@ pub(crate) struct RingGcmBlockDecryptor {
 }
 
 impl RingGcmBlockDecryptor {
+    /// Create a new `RingGcmBlockDecryptor` with a given key.
     pub(crate) fn new(key_bytes: &[u8]) -> Result<Self> {
-        // todo support other key sizes
-        let key = UnboundKey::new(&AES_128_GCM, key_bytes)
-            .map_err(|_| General("Failed to create AES key".to_string()))?;
+        let algorithm = if key_bytes.len() == AES_128_GCM.key_len() {
+            &AES_128_GCM
+        } else if key_bytes.len() == AES_256_GCM.key_len() {
+            &AES_256_GCM
+        } else {
+            return Err(general_err!(
+                "Error creating RingGcmBlockDecryptor with unsupported key length: {}",
+                key_bytes.len()
+            ));
+        };
+        let key = UnboundKey::new(algorithm, key_bytes)
+            .map_err(|_| general_err!("Failed to create {:?} key", algorithm))?;
 
         Ok(Self {
             key: LessSafeKey::new(key),
         })
+    }
+}
+
+impl HeapSize for RingGcmBlockDecryptor {
+    fn heap_size(&self) -> usize {
+        // Ring's LessSafeKey doesn't allocate on the heap
+        0
     }
 }
 
@@ -136,10 +154,19 @@ impl RingGcmBlockEncryptor {
     /// return an error if it wraps around.
     pub(crate) fn new(key_bytes: &[u8]) -> Result<Self> {
         let rng = SystemRandom::new();
+        let algorithm = if key_bytes.len() == AES_128_GCM.key_len() {
+            &AES_128_GCM
+        } else if key_bytes.len() == AES_256_GCM.key_len() {
+            &AES_256_GCM
+        } else {
+            return Err(general_err!(
+                "Error creating RingGcmBlockEncryptor with unsupported key length: {}",
+                key_bytes.len()
+            ));
+        };
 
-        // todo support other key sizes
-        let key = UnboundKey::new(&AES_128_GCM, key_bytes)
-            .map_err(|e| general_err!("Error creating AES key: {}", e))?;
+        let key = UnboundKey::new(algorithm, key_bytes)
+            .map_err(|e| general_err!("Error creating {:?} key: {}", algorithm, e))?;
         let nonce = CounterNonce::new(&rng)?;
 
         Ok(Self {

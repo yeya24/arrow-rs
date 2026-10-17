@@ -28,6 +28,7 @@ This crate provides:
 
 - a **reader** that decodes Avro
   - **Object Container Files (OCF)**,
+  - **unframed binary datums**,
   - **Avro Single‑Object Encoding (SOE)**, and
   - **Confluent Schema Registry wire format**  
   into Arrow `RecordBatch`es; and
@@ -44,14 +45,14 @@ This crate provides:
 
 ```toml
 [dependencies]
-arrow-avro = "56"
+arrow-avro = "57.0.0"
 ````
 
 Disable defaults and pick only what you need (see **Feature Flags**):
 
 ```toml
 [dependencies]
-arrow-avro = { version = "56", default-features = false, features = ["deflate", "snappy"] }
+arrow-avro = { version = "58.0.0", default-features = false, features = ["deflate", "snappy"] }
 ```
 
 ---
@@ -103,7 +104,40 @@ fn main() -> anyhow::Result<()> {
 }
 ```
 
-See the crate docs for runnable SOE and Confluent round‑trip examples.
+See the crate docs for runnable unframed-datum, SOE, and Confluent examples. Unframed Kafka
+messages or consecutive raw records can be decoded directly with `Decoder::decode` after
+selecting the known writer schema with `ReaderBuilder::with_active_fingerprint` and configuring
+`ReaderBuilder::with_decoder_mode(DecoderMode::UnframedDatum)`.
+
+### Async reading (`async` feature)
+
+```rust,ignore
+use arrow_avro::reader::AsyncAvroFileReader;
+use futures::TryStreamExt;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let file = tokio::fs::File::open("data/example.avro").await?;
+    let file_size = file.metadata().await?.len();
+
+    let stream = AsyncAvroFileReader::builder(file, file_size, 1024)
+        .try_build()
+        .await?;
+
+    let batches: Vec<_> = stream.try_collect().await?;
+    for batch in batches {
+        println!("rows: {}", batch.num_rows());
+    }
+    Ok(())
+}
+```
+
+Any `AsyncFileReader` implementation can be used as the source, so object
+storage services (S3, GCS, Azure Blob, etc.) can be integrated by implementing
+`AsyncFileReader` on top of a client such as the [`object_store`] crate. See
+the example on the `AsyncFileReader` trait documentation.
+
+[`object_store`]: https://docs.rs/object_store/latest/object_store/
 
 ---
 
@@ -128,15 +162,22 @@ See the crate docs for runnable SOE and Confluent round‑trip examples.
 * Only **OCF** uses these codecs (they compress per‑block). They do **not** apply to raw Avro frames used by Confluent wire format or SOE. The crate’s `compression` module is specifically for **OCF blocks**.
 * `deflate` uses `flate2` with the `rust_backend` (no system zlib required).
 
+### Async
+
+| Feature        | Default | What it enables                                                             | When to use                                                                   |
+|----------------|--------:|-----------------------------------------------------------------------------|-------------------------------------------------------------------------------|
+| `async`        |       ⬜ | Async APIs for reading Avro via `futures` and `tokio`                       | Enable for non-blocking async Avro reading with `AsyncAvroFileReader`, including from cloud storage via a custom `AsyncFileReader`. |
+| `object_store` |       ⬜ | **Deprecated**: the deprecated `AvroObjectReader` (implies `async`)         | Do not enable in new code; implement `AsyncFileReader` directly instead. Will be removed in a future release. |
+
 ### Schema fingerprints & custom logical type helpers
 
-| Feature                     | Default | What it enables                                                                  | When to use                                                                                                         |    
+| Feature                     | Default | What it enables                                                                  | When to use                                                                                                         |
 |-----------------------------|--------:|----------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------|
-| `md5`                       |       ⬜ | `md5` dep for optional **MD5** schema fingerprints                               | If you want to compute MD5 fingerprints of writer schemas (i.e. for custom prefixing/validation).                   |   
-| `sha256`                    |       ⬜ | `sha2` dep for optional **SHA‑256** schema fingerprints                          | If you prefer longer fingerprints; affects max prefix length (i.e. when framing).                                   |  
+| `md5`                       |       ⬜ | `md5` dep for optional **MD5** schema fingerprints                               | If you want to compute MD5 fingerprints of writer schemas (i.e. for custom prefixing/validation).                   |
+| `sha256`                    |       ⬜ | `sha2` dep for optional **SHA‑256** schema fingerprints                          | If you prefer longer fingerprints; affects max prefix length (i.e. when framing).                                   |
 | `small_decimals`            |       ⬜ | Extra handling for **small decimal** logical types (`Decimal32` and `Decimal64`) | If your Avro `decimal` values are small and you want more compact Arrow representations.                            |
-| `avro_custom_types`         |       ⬜ | Annotates Avro values using Arrow specific custom logical types                  | Enable when you need arrow-avro to reinterpret certain Avro fields as Arrow types that Avro doesn’t natively model. | 
-| `canonical_extension_types` |       ⬜ | Re‑exports Arrow’s canonical extension types support from `arrow-schema`         | Enable if your workflow uses Arrow [canonical extension types] and you want `arrow-avro` to respect them.           | 
+| `avro_custom_types`         |       ⬜ | Annotates Avro values using Arrow specific custom logical types                  | Enable when you need arrow-avro to reinterpret certain Avro fields as Arrow types that Avro doesn't natively model. |
+| `canonical_extension_types` |       ⬜ | Re‑exports Arrow's canonical extension types support from `arrow-schema`         | Enable if your workflow uses Arrow [canonical extension types] and you want `arrow-avro` to respect them.           | 
 
 [canonical extension types]: https://arrow.apache.org/docs/format/CanonicalExtensions.html
 
@@ -149,17 +190,22 @@ See the crate docs for runnable SOE and Confluent round‑trip examples.
 * Minimal, fast build (common pipelines):
 
   ```toml
-  arrow-avro = { version = "56", default-features = false, features = ["deflate", "snappy"] }
+  arrow-avro = { version = "58", default-features = false, features = ["deflate", "snappy"] }
   ```
 * Include Zstandard too (modern data lakes):
 
   ```toml
-  arrow-avro = { version = "56", default-features = false, features = ["deflate", "snappy", "zstd"] }
+  arrow-avro = { version = "58", default-features = false, features = ["deflate", "snappy", "zstd"] }
+  ```
+* Async reading (including from object stores such as S3, GCS, etc.):
+
+  ```toml
+  arrow-avro = { version = "58", features = ["async"] }
   ```
 * Fingerprint helpers:
 
   ```toml
-  arrow-avro = { version = "56", features = ["md5", "sha256"] }
+  arrow-avro = { version = "58", features = ["md5", "sha256"] }
   ```
   
 ---
@@ -167,12 +213,15 @@ See the crate docs for runnable SOE and Confluent round‑trip examples.
 ## What formats are supported?
 
 * **OCF (Object Container Files)**: self‑describing Avro files with header, optional compression, sync markers; reader and writer supported.
+* **Unframed binary datums**: bare Avro records with an externally known writer schema; configure `DecoderMode::UnframedDatum` and decode directly with `Decoder::decode`, without adding a synthetic framing prefix.
 * **Confluent Schema Registry wire format**: 1‑byte magic `0x00` + 4‑byte BE schema ID + Avro body; supports decode + encode helpers.
 * **Avro Single‑Object Encoding (SOE)**: 2‑byte magic `0xC3 0x01` + 8‑byte LE CRC‑64‑AVRO fingerprint + Avro body; supports decode + encode helpers.
 
----
+## Security
 
-## Examples
+See the [Security Policy] for information on the security model and how to report vulnerabilities.
+
+[Security Policy]: https://github.com/apache/arrow-rs/blob/main/SECURITY.md
 
 * Read/write OCF in memory and from files (see crate docs “OCF round‑trip”).
 * Confluent wire‑format and SOE quickstarts are provided as runnable snippets in docs.

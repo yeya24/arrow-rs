@@ -19,14 +19,21 @@ use arrow::array::{
     Array, ArrayRef, BooleanArray, Decimal128Array, FixedSizeBinaryArray, FixedSizeBinaryBuilder,
     FixedSizeListBuilder, GenericBinaryArray, GenericStringArray, Int32Array, Int32Builder,
     Int64Builder, ListArray, ListBuilder, NullArray, OffsetSizeTrait, StringArray,
-    StringDictionaryBuilder, StructArray, UnionBuilder, make_array,
+    StringDictionaryBuilder, StructArray, UnionArray, UnionBuilder, make_array,
 };
 use arrow::datatypes::{Int16Type, Int32Type};
-use arrow_array::builder::{StringBuilder, StringViewBuilder, StructBuilder};
-use arrow_array::{DictionaryArray, FixedSizeListArray, StringViewArray};
-use arrow_buffer::{Buffer, ToByteSlice};
+use arrow_array::builder::{
+    GenericListViewBuilder, StringBuilder, StringViewBuilder, StructBuilder,
+};
+use arrow_array::cast::AsArray;
+use arrow_array::{
+    DictionaryArray, FixedSizeListArray, Float32Array, GenericListViewArray, PrimitiveArray,
+    RunArray, StringViewArray,
+};
+use arrow_buffer::{Buffer, ScalarBuffer, ToByteSlice};
 use arrow_data::{ArrayData, ArrayDataBuilder};
-use arrow_schema::{DataType, Field, Fields};
+use arrow_schema::{DataType, Field, Fields, UnionFields};
+use arrow_select::take::take;
 use std::sync::Arc;
 
 #[test]
@@ -195,7 +202,7 @@ fn test_primitive_slice() {
     }
 }
 
-#[allow(clippy::eq_op)]
+#[expect(clippy::eq_op)]
 fn test_equal(lhs: &dyn Array, rhs: &dyn Array, expected: bool) {
     // equality is symmetric
     assert_eq!(lhs, lhs);
@@ -756,6 +763,151 @@ fn test_fixed_list_offsets() {
     test_equal(&a_slice, &b_slice, true);
 }
 
+fn create_list_view_array<
+    O: OffsetSizeTrait,
+    U: IntoIterator<Item = Option<i32>>,
+    T: IntoIterator<Item = Option<U>>,
+>(
+    data: T,
+) -> GenericListViewArray<O> {
+    let mut builder = GenericListViewBuilder::<O, _>::new(Int32Builder::new());
+    for d in data {
+        if let Some(v) = d {
+            builder.append_value(v);
+        } else {
+            builder.append_null();
+        }
+    }
+
+    builder.finish()
+}
+
+fn test_test_list_view_array<T: OffsetSizeTrait>() {
+    let a = create_list_view_array::<T, _, _>([
+        None,
+        Some(vec![Some(1), None, Some(2)]),
+        Some(vec![Some(3), Some(4), Some(5), None]),
+    ]);
+    let b = create_list_view_array::<T, _, _>([
+        None,
+        Some(vec![Some(1), None, Some(2)]),
+        Some(vec![Some(3), Some(4), Some(5), None]),
+    ]);
+
+    test_equal(&a, &b, true);
+
+    // Simple non-matching arrays by reordering
+    let b = create_list_view_array::<T, _, _>([
+        Some(vec![Some(3), Some(4), Some(5), None]),
+        Some(vec![Some(1), None, Some(2)]),
+    ]);
+    test_equal(&a, &b, false);
+
+    // reorder using take yields equal values
+    let indices: PrimitiveArray<Int32Type> = vec![None, Some(1), Some(0)].into();
+    let b = take(&b, &indices, None)
+        .unwrap()
+        .as_list_view::<T>()
+        .clone();
+
+    test_equal(&a, &b, true);
+
+    // Slicing one side yields unequal again
+    let a = a.slice(1, 2);
+
+    test_equal(&a, &b, false);
+
+    // Slicing the other to match makes them equal again
+    let b = b.slice(1, 2);
+
+    test_equal(&a, &b, true);
+}
+
+fn test_list_view_sizes_and_child_nulls<T: OffsetSizeTrait>() {
+    // Same first elements but different sizes, with a null row
+    let a = create_list_view_array::<T, _, _>([Some(vec![Some(1), Some(2)]), None]);
+    let b = create_list_view_array::<T, _, _>([Some(vec![Some(1), Some(2), Some(3)]), None]);
+    test_equal(&a, &b, false);
+
+    // Child values that differ only in their null masks, without and with a null row
+    let a = create_list_view_array::<T, _, _>([Some(vec![Some(1), Some(0)])]);
+    let b = create_list_view_array::<T, _, _>([Some(vec![Some(1), None])]);
+    test_equal(&a, &b, false);
+
+    let a = create_list_view_array::<T, _, _>([None, Some(vec![Some(1), Some(0)])]);
+    let b = create_list_view_array::<T, _, _>([None, Some(vec![Some(1), None])]);
+    test_equal(&a, &b, false);
+}
+
+// Special test for List<ListView<i32>>.
+// This tests the equal_ranges kernel
+fn test_sliced_list_of_list_view<T: OffsetSizeTrait>() {
+    // First list view is created using the builder, with elements not deduplicated.
+    let mut a = ListBuilder::new(GenericListViewBuilder::<T, _>::new(Int32Builder::new()));
+
+    a.append_value([Some(vec![Some(1), Some(2), Some(3)]), Some(vec![])]);
+    a.append_null();
+    a.append_value([
+        Some(vec![Some(1), Some(2), Some(3)]),
+        None,
+        Some(vec![Some(6)]),
+    ]);
+
+    let a = a.finish();
+    // a = [[[1,2,3], []], null, [[4, null], [5], null, [6]]]
+
+    // First list view is created using the builder, with elements not deduplicated.
+    let mut b = ListBuilder::new(GenericListViewBuilder::<T, _>::new(Int32Builder::new()));
+
+    // Add an extra row that we will slice off, adjust the List offsets
+    b.append_value([Some(vec![Some(0), Some(0), Some(0)])]);
+    b.append_value([Some(vec![Some(1), Some(2), Some(3)]), Some(vec![])]);
+    b.append_null();
+    b.append_value([
+        Some(vec![Some(1), Some(2), Some(3)]),
+        None,
+        Some(vec![Some(6)]),
+    ]);
+
+    let b = b.finish();
+    // b = [[[0, 0, 0]], [[1,2,3], []], null, [[4, null], [5], null, [6]]]
+    let b = b.slice(1, 3);
+    // b = [[[1,2,3], []], null, [[4, null], [5], null, [6]]] but the outer ListArray
+    // has an offset
+
+    test_equal(&a, &b, true);
+}
+
+#[test]
+fn test_list_view_array() {
+    test_test_list_view_array::<i32>();
+}
+
+#[test]
+fn test_large_list_view_array() {
+    test_test_list_view_array::<i64>();
+}
+
+#[test]
+fn test_list_view_array_sizes_and_child_nulls() {
+    test_list_view_sizes_and_child_nulls::<i32>();
+}
+
+#[test]
+fn test_large_list_view_array_sizes_and_child_nulls() {
+    test_list_view_sizes_and_child_nulls::<i64>();
+}
+
+#[test]
+fn test_nested_list_view_array() {
+    test_sliced_list_of_list_view::<i32>();
+}
+
+#[test]
+fn test_nested_large_list_view_array() {
+    test_sliced_list_of_list_view::<i64>();
+}
+
 #[test]
 fn test_struct_equal() {
     let strings: ArrayRef = Arc::new(StringArray::from(vec![
@@ -1148,6 +1300,104 @@ fn test_union_equal_sparse_slice() {
     test_equal(&a1.slice(1, 2), &a2, true)
 }
 
+/// Builds a sparse union with `Int32` children `a` (type id 0) and `b` (type id 1)
+/// from its component parts, so the values in unselected child slots can be
+/// chosen freely. `UnionBuilder` always pads unselected slots with nulls and so
+/// cannot produce arrays that differ only in unselected values.
+fn sparse_union(type_ids: &[i8], a: Int32Array, b: Int32Array) -> UnionArray {
+    let fields = UnionFields::try_new(
+        [0, 1],
+        [
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ],
+    )
+    .unwrap();
+    UnionArray::try_new(
+        fields,
+        ScalarBuffer::from(type_ids.to_vec()),
+        None,
+        vec![Arc::new(a), Arc::new(b)],
+    )
+    .unwrap()
+}
+
+#[test]
+fn test_union_equal_sparse_ignores_unselected_children() {
+    // Slot 0 selects `a` and slot 1 selects `b`. The unselected child at each
+    // slot holds a different value, or a null, on each side.
+    let lhs = sparse_union(
+        &[0, 1],
+        Int32Array::from(vec![Some(1), Some(10)]),
+        Int32Array::from(vec![Some(20), Some(2)]),
+    );
+    let rhs = sparse_union(
+        &[0, 1],
+        Int32Array::from(vec![Some(1), None]),
+        Int32Array::from(vec![None, Some(2)]),
+    );
+    test_equal(&lhs, &rhs, true);
+    test_equal(&lhs.slice(0, 1), &rhs.slice(0, 1), true);
+    test_equal(&lhs.slice(1, 1), &rhs.slice(1, 1), true);
+
+    // A differing selected value is still detected.
+    let rhs = sparse_union(
+        &[0, 1],
+        Int32Array::from(vec![Some(3), Some(10)]),
+        Int32Array::from(vec![Some(20), Some(2)]),
+    );
+    test_equal(&lhs, &rhs, false);
+    test_equal(&lhs.slice(0, 1), &rhs.slice(0, 1), false);
+    test_equal(&lhs.slice(1, 1), &rhs.slice(1, 1), true);
+
+    // A selected null against a selected value is still detected.
+    let rhs = sparse_union(
+        &[0, 1],
+        Int32Array::from(vec![None, Some(10)]),
+        Int32Array::from(vec![Some(20), Some(2)]),
+    );
+    test_equal(&lhs, &rhs, false);
+}
+
+#[test]
+fn test_union_equal_sparse_runs() {
+    // The type ids form the runs [a, a], [b, b, b], [a].
+    let type_ids = [0, 0, 1, 1, 1, 0];
+    let lhs = sparse_union(
+        &type_ids,
+        Int32Array::from(vec![1, 2, 0, 0, 0, 6]),
+        Int32Array::from(vec![0, 0, 3, 4, 5, 0]),
+    );
+    let rhs = sparse_union(
+        &type_ids,
+        Int32Array::from(vec![1, 2, 9, 9, 9, 6]),
+        Int32Array::from(vec![9, 9, 3, 4, 5, 9]),
+    );
+    test_equal(&lhs, &rhs, true);
+    // Slices starting and ending in the middle of a run.
+    test_equal(&lhs.slice(1, 4), &rhs.slice(1, 4), true);
+    test_equal(&lhs.slice(3, 3), &rhs.slice(3, 3), true);
+
+    // A slice compared against an unsliced array with a different offset.
+    let unsliced = sparse_union(
+        &[0, 1, 1, 1],
+        Int32Array::from(vec![2, 7, 7, 7]),
+        Int32Array::from(vec![7, 3, 4, 5]),
+    );
+    test_equal(&lhs.slice(1, 4), &unsliced, true);
+
+    // A differing selected value in the middle of a run is still detected.
+    let rhs = sparse_union(
+        &type_ids,
+        Int32Array::from(vec![1, 2, 9, 9, 9, 6]),
+        Int32Array::from(vec![9, 9, 3, 7, 5, 9]),
+    );
+    test_equal(&lhs, &rhs, false);
+    test_equal(&lhs.slice(1, 4), &rhs.slice(1, 4), false);
+    test_equal(&lhs.slice(0, 3), &rhs.slice(0, 3), true);
+    test_equal(&lhs.slice(4, 2), &rhs.slice(4, 2), true);
+}
+
 #[test]
 fn test_boolean_slice() {
     let array = BooleanArray::from(vec![true; 32]);
@@ -1233,7 +1483,7 @@ fn make_struct(elements: Vec<Option<(Option<&'static str>, Option<i32>)>>) -> St
                 .field_builder::<StringBuilder>(0)
                 .unwrap()
                 .append_value(s),
-        };
+        }
 
         builder
             .field_builder::<Int32Builder>(1)
@@ -1290,5 +1540,50 @@ fn test_list_excess_children_equal() {
 
     assert_eq!(a.value_offsets(), &[0, 1, 3]);
     assert_eq!(b.value_offsets(), &[0, 0, 2]);
+    assert_eq!(a, b);
+}
+
+#[test]
+fn test_from_run_array_array_data_offset() {
+    let a = RunArray::try_new(
+        &Int32Array::from(vec![1, 3]),
+        &Float32Array::from(vec![1.5, 2.5]),
+    )
+    .unwrap()
+    .to_data();
+
+    // ensure if run_ends child has a physical offset, it is respected
+    // we construct & compare with ArrayData as other APIs will usually normalize
+    // this physical offset to 0
+    let b = {
+        let dt = DataType::RunEndEncoded(
+            Arc::new(Field::new(
+                Field::REE_RUN_ENDS_FIELD_DEFAULT_NAME,
+                DataType::Int32,
+                false,
+            )),
+            Arc::new(Field::new(
+                Field::REE_VALUES_FIELD_DEFAULT_NAME,
+                DataType::Float32,
+                true,
+            )),
+        );
+
+        let runs = ArrayData::builder(DataType::Int32)
+            .len(3)
+            .offset(1)
+            .add_buffer(vec![-20_i32, 1_i32, 2, 4, 0].into())
+            .build()
+            .unwrap();
+        let values = Float32Array::from(vec![1.5, 2.5, 2.5]);
+
+        ArrayDataBuilder::new(dt)
+            .len(3)
+            .offset(0)
+            .child_data(vec![runs, values.to_data()])
+            .build()
+            .unwrap()
+    };
+
     assert_eq!(a, b);
 }

@@ -104,6 +104,14 @@
 //!     serde_json::json!({"a": 2}),
 //! );
 //! ```
+//!
+//! ## Customizing the encoder
+//!
+//! The output produced for each data type can be customized using
+//! [`WriterBuilder::with_encoder_factory`]. For example, you can override the
+//! default hex encoding of binary data to use `Base64` instead, or provide
+//! encoders for types with no built-in encoding, such as unions.
+//! See the example on [`EncoderFactory`].
 mod encoder;
 
 use std::{fmt::Debug, io::Write, sync::Arc};
@@ -491,8 +499,7 @@ mod tests {
     use super::{Encoder, WriterBuilder};
     use arrow_array::builder::*;
     use arrow_array::types::*;
-    use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer, ToByteSlice, i256};
-    use arrow_data::ArrayData;
+    use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer, i256};
 
     use crate::reader::*;
 
@@ -1070,25 +1077,19 @@ mod tests {
 
     #[test]
     fn write_struct_with_list_field() {
-        let field_c1 = Field::new(
-            "c1",
-            DataType::List(Arc::new(Field::new("c_list", DataType::Utf8, false))),
-            false,
-        );
+        let field_c_list = Arc::new(Field::new("c_list", DataType::Utf8, false));
+        let field_c1 = Field::new("c1", DataType::List(field_c_list.clone()), false);
         let field_c2 = Field::new("c2", DataType::Int32, false);
         let schema = Schema::new(vec![field_c1.clone(), field_c2]);
 
         let a_values = StringArray::from(vec!["a", "a1", "b", "c", "d", "e"]);
         // list column rows: ["a", "a1"], ["b"], ["c"], ["d"], ["e"]
-        let a_value_offsets = Buffer::from([0, 2, 3, 4, 5, 6].to_byte_slice());
-        let a_list_data = ArrayData::builder(field_c1.data_type().clone())
-            .len(5)
-            .add_buffer(a_value_offsets)
-            .add_child_data(a_values.into_data())
-            .null_bit_buffer(Some(Buffer::from([0b00011111])))
-            .build()
-            .unwrap();
-        let a = ListArray::from(a_list_data);
+        let a = ListArray::new(
+            field_c_list,
+            OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2, 3, 4, 5, 6])),
+            Arc::new(a_values),
+            None,
+        );
 
         let b = Int32Array::from(vec![1, 2, 3, 4, 5]);
 
@@ -1113,41 +1114,28 @@ mod tests {
 
     #[test]
     fn write_nested_list() {
-        let list_inner_type = Field::new(
-            "a",
-            DataType::List(Arc::new(Field::new("b", DataType::Int32, false))),
-            false,
-        );
-        let field_c1 = Field::new(
-            "c1",
-            DataType::List(Arc::new(list_inner_type.clone())),
-            false,
-        );
+        let field_b = Arc::new(Field::new("b", DataType::Int32, false));
+        let field_a = Arc::new(Field::new("a", DataType::List(field_b.clone()), false));
+        let field_c1 = Field::new("c1", DataType::List(field_a.clone()), false);
         let field_c2 = Field::new("c2", DataType::Utf8, true);
         let schema = Schema::new(vec![field_c1.clone(), field_c2]);
 
         // list column rows: [[1, 2], [3]], [], [[4, 5, 6]]
         let a_values = Int32Array::from(vec![1, 2, 3, 4, 5, 6]);
 
-        let a_value_offsets = Buffer::from([0, 2, 3, 6].to_byte_slice());
-        // Construct a list array from the above two
-        let a_list_data = ArrayData::builder(list_inner_type.data_type().clone())
-            .len(3)
-            .add_buffer(a_value_offsets)
-            .null_bit_buffer(Some(Buffer::from([0b00000111])))
-            .add_child_data(a_values.into_data())
-            .build()
-            .unwrap();
+        let a_list = ListArray::new(
+            field_b,
+            OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2, 3, 6])),
+            Arc::new(a_values),
+            None,
+        );
 
-        let c1_value_offsets = Buffer::from([0, 2, 2, 3].to_byte_slice());
-        let c1_list_data = ArrayData::builder(field_c1.data_type().clone())
-            .len(3)
-            .add_buffer(c1_value_offsets)
-            .add_child_data(a_list_data)
-            .build()
-            .unwrap();
-
-        let c1 = ListArray::from(c1_list_data);
+        let c1 = ListArray::new(
+            field_a,
+            OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2, 2, 3])),
+            Arc::new(a_list),
+            None,
+        );
         let c2 = StringArray::from(vec![Some("foo"), Some("bar"), None]);
 
         let batch =
@@ -1211,15 +1199,16 @@ mod tests {
         // [{"c11": 1, "c12": {"c121": "e"}}, {"c12": {"c121": "f"}}],
         // null,
         // [{"c11": 5, "c12": {"c121": "g"}}]
-        let c1_value_offsets = Buffer::from([0, 2, 2, 3].to_byte_slice());
-        let c1_list_data = ArrayData::builder(field_c1.data_type().clone())
-            .len(3)
-            .add_buffer(c1_value_offsets)
-            .add_child_data(struct_values.into_data())
-            .null_bit_buffer(Some(Buffer::from([0b00000101])))
-            .build()
-            .unwrap();
-        let c1 = ListArray::from(c1_list_data);
+        let c1_inner = match field_c1.data_type() {
+            DataType::List(f) => f.clone(),
+            _ => unreachable!(),
+        };
+        let c1 = ListArray::new(
+            c1_inner,
+            OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2, 2, 3])),
+            Arc::new(struct_values),
+            Some(NullBuffer::from(vec![true, false, true])),
+        );
 
         let c2 = Int32Array::from(vec![1, 2, 3]);
 
@@ -1239,6 +1228,54 @@ mod tests {
 {"c1":[{"c11":5,"c12":{"c121":"g"}}],"c2":3}
 "#,
         );
+    }
+
+    fn assert_write_list_view<O: OffsetSizeTrait>() {
+        let field = Arc::new(Field::new("item", DataType::Int32, true));
+        let data_type = GenericListViewArray::<O>::DATA_TYPE_CONSTRUCTOR(field.clone());
+        let schema = Schema::new(vec![Field::new("lv", data_type, true)]);
+
+        // rows: [1, 2, 3], [4, null], null, [6]
+        let values = Int32Array::from(vec![Some(1), Some(2), Some(3), Some(4), None, Some(6)]);
+        let offsets = [0, 3, 0, 5]
+            .iter()
+            .map(|&v| O::from_usize(v).unwrap())
+            .collect::<Vec<_>>();
+        let sizes = [3, 2, 0, 1]
+            .iter()
+            .map(|&v| O::from_usize(v).unwrap())
+            .collect::<Vec<_>>();
+        let list_view = GenericListViewArray::<O>::try_new(
+            field,
+            ScalarBuffer::from(offsets),
+            ScalarBuffer::from(sizes),
+            Arc::new(values),
+            Some(NullBuffer::from_iter([true, true, false, true])),
+        )
+        .unwrap();
+
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(list_view)]).unwrap();
+
+        let mut buf = Vec::new();
+        {
+            let mut writer = LineDelimitedWriter::new(&mut buf);
+            writer.write_batches(&[&batch]).unwrap();
+        }
+
+        assert_json_eq(
+            &buf,
+            r#"{"lv":[1,2,3]}
+{"lv":[4,null]}
+{}
+{"lv":[6]}
+"#,
+        );
+    }
+
+    #[test]
+    fn write_list_view() {
+        assert_write_list_view::<i32>();
+        assert_write_list_view::<i64>();
     }
 
     fn test_write_for_file(test_file: &str, remove_nulls: bool) {
@@ -1389,42 +1426,40 @@ mod tests {
         );
     }
 
-    #[test]
-    fn json_writer_map() {
-        let keys_array = super::StringArray::from(vec!["foo", "bar", "baz", "qux", "quux"]);
+    fn run_json_writer_map_with_keys(keys_array: ArrayRef) {
         let values_array = super::Int64Array::from(vec![10, 20, 30, 40, 50]);
 
-        let keys = Arc::new(Field::new("keys", DataType::Utf8, false));
-        let values = Arc::new(Field::new("values", DataType::Int64, false));
+        let keys_field = Arc::new(Field::new(
+            Field::MAP_KEY_FIELD_DEFAULT_NAME,
+            keys_array.data_type().clone(),
+            false,
+        ));
+        let values_field = Arc::new(Field::new(
+            Field::MAP_VALUE_FIELD_DEFAULT_NAME,
+            DataType::Int64,
+            false,
+        ));
         let entry_struct = StructArray::from(vec![
-            (keys, Arc::new(keys_array) as ArrayRef),
-            (values, Arc::new(values_array) as ArrayRef),
+            (keys_field, keys_array.clone()),
+            (values_field, Arc::new(values_array) as ArrayRef),
         ]);
 
-        let map_data_type = DataType::Map(
-            Arc::new(Field::new(
-                "entries",
-                entry_struct.data_type().clone(),
-                false,
-            )),
+        let entries_field = Arc::new(Field::new(
+            Field::MAP_ENTRIES_FIELD_DEFAULT_NAME,
+            entry_struct.data_type().clone(),
+            false,
+        ));
+
+        // [{"foo": 10}, null, {}, {"bar": 20, "baz": 30, "qux": 40}, {"quux": 50}, {}]
+        let map = MapArray::new(
+            entries_field.clone(),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1, 1, 1, 4, 5, 5])),
+            entry_struct,
+            Some(NullBuffer::from(vec![true, false, true, true, true, true])),
             false,
         );
 
-        // [{"foo": 10}, null, {}, {"bar": 20, "baz": 30, "qux": 40}, {"quux": 50}, {}]
-        let entry_offsets = Buffer::from([0, 1, 1, 1, 4, 5, 5].to_byte_slice());
-        let valid_buffer = Buffer::from([0b00111101]);
-
-        let map_data = ArrayData::builder(map_data_type.clone())
-            .len(6)
-            .null_bit_buffer(Some(valid_buffer))
-            .add_buffer(entry_offsets)
-            .add_child_data(entry_struct.into_data())
-            .build()
-            .unwrap();
-
-        let map = MapArray::from(map_data);
-
-        let map_field = Field::new("map", map_data_type, true);
+        let map_field = Field::new("map", DataType::Map(entries_field, false), true);
         let schema = Arc::new(Schema::new(vec![map_field]));
 
         let batch = RecordBatch::try_new(schema, vec![Arc::new(map)]).unwrap();
@@ -1445,6 +1480,21 @@ mod tests {
 {"map":{}}
 "#,
         );
+    }
+
+    #[test]
+    fn json_writer_map() {
+        // Utf8 (StringArray)
+        let keys_utf8 = super::StringArray::from(vec!["foo", "bar", "baz", "qux", "quux"]);
+        run_json_writer_map_with_keys(Arc::new(keys_utf8) as ArrayRef);
+
+        // LargeUtf8 (LargeStringArray)
+        let keys_large = super::LargeStringArray::from(vec!["foo", "bar", "baz", "qux", "quux"]);
+        run_json_writer_map_with_keys(Arc::new(keys_large) as ArrayRef);
+
+        // Utf8View (StringViewArray)
+        let keys_view = super::StringViewArray::from(vec!["foo", "bar", "baz", "qux", "quux"]);
+        run_json_writer_map_with_keys(Arc::new(keys_view) as ArrayRef);
     }
 
     #[test]
@@ -1479,6 +1529,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // Unsupported inline assembly
     fn test_write_multi_batches() {
         let test_file = "test/data/basic.json";
 
@@ -1587,22 +1638,17 @@ mod tests {
                 ),
             ]);
 
-            let field = Field::new_list(
-                "list",
-                Field::new("struct", struct_array.data_type().clone(), true),
-                true,
-            );
+            let values_field =
+                Arc::new(Field::new("struct", struct_array.data_type().clone(), true));
+            let field = Field::new_list("list", values_field.as_ref().clone(), true);
 
             // [{"list":[{"int32":1,"utf8":"a"},{"int32":null,"utf8":"b"}]},{"list":null},{"list":[{int32":5,"utf8":null}]},{"list":null}]
-            let entry_offsets = Buffer::from([0, 2, 2, 3, 3].to_byte_slice());
-            let data = ArrayData::builder(field.data_type().clone())
-                .len(4)
-                .add_buffer(entry_offsets)
-                .add_child_data(struct_array.into_data())
-                .null_bit_buffer(Some([0b00000101].into()))
-                .build()
-                .unwrap();
-            let array = Arc::new(ListArray::from(data));
+            let array = Arc::new(ListArray::new(
+                values_field,
+                OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2, 2, 3, 3])),
+                Arc::new(struct_array),
+                Some(NullBuffer::from(vec![true, false, true, false])),
+            ));
             (array, field)
         }
 
@@ -1751,17 +1797,13 @@ mod tests {
         Ok(())
     }
 
-    fn binary_encoding_test<O: OffsetSizeTrait>() {
-        // set up schema
+    fn build_array_binary<O: OffsetSizeTrait>(values: &[Option<&[u8]>]) -> RecordBatch {
         let schema = SchemaRef::new(Schema::new(vec![Field::new(
             "bytes",
             GenericBinaryType::<O>::DATA_TYPE,
             true,
         )]));
-
-        // build record batch:
         let mut builder = GenericByteBuilder::<GenericBinaryType<O>>::new();
-        let values = [Some(b"Ned Flanders"), None, Some(b"Troy McClure")];
         for value in values {
             match value {
                 Some(v) => builder.append_value(v),
@@ -1769,8 +1811,27 @@ mod tests {
             }
         }
         let array = Arc::new(builder.finish()) as ArrayRef;
-        let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
+        RecordBatch::try_new(schema, vec![array]).unwrap()
+    }
 
+    fn build_array_binary_view(values: &[Option<&[u8]>]) -> RecordBatch {
+        let schema = SchemaRef::new(Schema::new(vec![Field::new(
+            "bytes",
+            DataType::BinaryView,
+            true,
+        )]));
+        let mut builder = BinaryViewBuilder::new();
+        for value in values {
+            match value {
+                Some(v) => builder.append_value(v),
+                None => builder.append_null(),
+            }
+        }
+        let array = Arc::new(builder.finish()) as ArrayRef;
+        RecordBatch::try_new(schema, vec![array]).unwrap()
+    }
+
+    fn assert_binary_json(batch: &RecordBatch) {
         // encode and check JSON with explicit nulls:
         {
             let mut buf = Vec::new();
@@ -1778,7 +1839,7 @@ mod tests {
                 let mut writer = WriterBuilder::new()
                     .with_explicit_nulls(true)
                     .build::<_, JsonArray>(&mut buf);
-                writer.write(&batch).unwrap();
+                writer.write(batch).unwrap();
                 writer.close().unwrap();
                 serde_json::from_slice(&buf).unwrap()
             };
@@ -1786,7 +1847,7 @@ mod tests {
             assert_eq!(
                 json!([
                     {
-                        "bytes": "4e656420466c616e64657273"
+                        "bytes": "426f622054686f6d70736f6e"
                     },
                     {
                         "bytes": null // the explicit null
@@ -1806,20 +1867,16 @@ mod tests {
                 // explicit nulls are off by default, so we don't need
                 // to set that when creating the writer:
                 let mut writer = ArrayWriter::new(&mut buf);
-                writer.write(&batch).unwrap();
+                writer.write(batch).unwrap();
                 writer.close().unwrap();
                 serde_json::from_slice(&buf).unwrap()
             };
 
             assert_eq!(
                 json!([
-                    {
-                        "bytes": "4e656420466c616e64657273"
-                    },
-                    {}, // empty because nulls are omitted
-                    {
-                        "bytes": "54726f79204d63436c757265"
-                    }
+                    { "bytes": "426f622054686f6d70736f6e" },
+                    {},
+                    { "bytes": "54726f79204d63436c757265" }
                 ]),
                 json_value
             );
@@ -1828,10 +1885,25 @@ mod tests {
 
     #[test]
     fn test_writer_binary() {
+        let values: [Option<&[u8]>; 3] = [
+            Some(b"Bob Thompson" as &[u8]),
+            None,
+            Some(b"Troy McClure" as &[u8]),
+        ];
         // Binary:
-        binary_encoding_test::<i32>();
+        {
+            let batch = build_array_binary::<i32>(&values);
+            assert_binary_json(&batch);
+        }
         // LargeBinary:
-        binary_encoding_test::<i64>();
+        {
+            let batch = build_array_binary::<i64>(&values);
+            assert_binary_json(&batch);
+        }
+        {
+            let batch = build_array_binary_view(&values);
+            assert_binary_json(&batch);
+        }
     }
 
     #[test]
@@ -2145,6 +2217,31 @@ mod tests {
     }
 
     #[test]
+    fn test_decimal_encoder_negative_scale() {
+        // https://github.com/apache/arrow-rs/issues/10865
+        let array = Decimal128Array::from_iter([Some(0), Some(12), Some(-12)])
+            .with_precision_and_scale(10, -2)
+            .unwrap();
+        let field = Arc::new(Field::new("decimal", array.data_type().clone(), true));
+        let schema = Schema::new(vec![field]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)]).unwrap();
+
+        let mut buf = Vec::new();
+        {
+            let mut writer = LineDelimitedWriter::new(&mut buf);
+            writer.write_batches(&[&batch]).unwrap();
+        }
+
+        assert_json_eq(
+            &buf,
+            r#"{"decimal":0}
+{"decimal":1200}
+{"decimal":-1200}
+"#,
+        );
+    }
+
+    #[test]
     fn write_structs_as_list() {
         let schema = Schema::new(vec![
             Field::new(
@@ -2247,13 +2344,12 @@ mod tests {
                 _options: &'a EncoderOptions,
             ) -> Result<Option<NullableEncoder<'a>>, ArrowError> {
                 let data_type = array.data_type();
-                let fields = match data_type {
-                    DataType::Union(fields, UnionMode::Sparse) => fields,
-                    _ => return Ok(None),
+                let DataType::Union(fields, UnionMode::Sparse) = data_type else {
+                    return Ok(None);
                 };
                 // check that the fields are supported
                 let fields = fields.iter().map(|(_, f)| f).collect::<Vec<_>>();
-                for f in fields.iter() {
+                for f in &fields {
                     match f.data_type() {
                         DataType::Null => {}
                         DataType::Int32 => {}
@@ -2453,9 +2549,9 @@ mod tests {
         }
 
         #[derive(Debug)]
-        struct IntArayBinaryEncoderFactory;
+        struct IntArrayBinaryEncoderFactory;
 
-        impl EncoderFactory for IntArayBinaryEncoderFactory {
+        impl EncoderFactory for IntArrayBinaryEncoderFactory {
             fn make_default_encoder<'a>(
                 &self,
                 _field: &'a FieldRef,
@@ -2493,7 +2589,7 @@ mod tests {
         let json_value: Value = {
             let mut buf = Vec::new();
             let mut writer = WriterBuilder::new()
-                .with_encoder_factory(Arc::new(IntArayBinaryEncoderFactory))
+                .with_encoder_factory(Arc::new(IntArrayBinaryEncoderFactory))
                 .build::<_, JsonArray>(&mut buf);
             writer.write_batches(&[&batch]).unwrap();
             writer.finish().unwrap();
@@ -2540,11 +2636,7 @@ mod tests {
                 // 1. You can use information from Field to determine how to do the encoding.
                 // 2. For dictionary arrays the Field is always the outer field but the array may be the keys or values array
                 //    and thus the data type of `field` may not match the data type of `array`.
-                let padded = field
-                    .metadata()
-                    .get("padded")
-                    .map(|v| v == "true")
-                    .unwrap_or_default();
+                let padded = field.metadata().get("padded").is_some_and(|v| v == "true");
                 match (array.data_type(), padded) {
                     (DataType::Int32, true) => {
                         let array = array.as_primitive::<Int32Type>();
@@ -2618,5 +2710,110 @@ mod tests {
         ]);
 
         assert_eq!(json_value, expected);
+    }
+
+    #[test]
+    fn test_write_run_end_encoded() {
+        let run_ends = Int32Array::from(vec![2, 5, 6]);
+        let values = StringArray::from(vec![Some("a"), Some("b"), None]);
+        let ree = RunArray::<Int32Type>::try_new(&run_ends, &values).unwrap();
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "c1",
+            ree.data_type().clone(),
+            true,
+        )]));
+
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(ree)]).unwrap();
+
+        let mut buf = Vec::new();
+        {
+            let mut writer = LineDelimitedWriter::new(&mut buf);
+            writer.write_batches(&[&batch]).unwrap();
+        }
+
+        assert_json_eq(
+            &buf,
+            r#"{"c1":"a"}
+{"c1":"a"}
+{"c1":"b"}
+{"c1":"b"}
+{"c1":"b"}
+{}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_write_run_end_encoded_int_values() {
+        let run_ends = Int32Array::from(vec![3, 5]);
+        let values = Int32Array::from(vec![10, 20]);
+        let ree = RunArray::<Int32Type>::try_new(&run_ends, &values).unwrap();
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "n",
+            ree.data_type().clone(),
+            true,
+        )]));
+
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(ree)]).unwrap();
+
+        let json_value: Value = {
+            let mut buf = Vec::new();
+            let mut writer = WriterBuilder::new().build::<_, JsonArray>(&mut buf);
+            writer.write_batches(&[&batch]).unwrap();
+            writer.finish().unwrap();
+            serde_json::from_slice(&buf).unwrap()
+        };
+
+        let expected = json!([
+            {"n": 10},
+            {"n": 10},
+            {"n": 10},
+            {"n": 20},
+            {"n": 20},
+        ]);
+
+        assert_eq!(json_value, expected);
+    }
+
+    #[test]
+    fn test_run_end_encoded_roundtrip() {
+        let run_ends = Int32Array::from(vec![3, 5, 7]);
+        let values = StringArray::from(vec![Some("a"), None, Some("b")]);
+        let ree = RunArray::<Int32Type>::try_new(&run_ends, &values).unwrap();
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "c",
+            ree.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ree)]).unwrap();
+
+        let mut buf = Vec::new();
+        {
+            let mut writer = super::LineDelimitedWriter::new(&mut buf);
+            writer.write_batches(&[&batch]).unwrap();
+        }
+
+        let batches: Vec<RecordBatch> = ReaderBuilder::new(schema)
+            .with_batch_size(1024)
+            .build(std::io::Cursor::new(&buf))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+
+        let col = batches[0].column(0);
+        let run_array = col.as_run::<Int32Type>();
+
+        assert_eq!(run_array.len(), 7);
+        assert_eq!(run_array.run_ends().values(), &[3, 5, 7]);
+
+        let values = run_array.values().as_string::<i32>();
+        assert_eq!(values.len(), 3);
+        assert_eq!(values.value(0), "a");
+        assert!(values.is_null(1));
+        assert_eq!(values.value(2), "b");
     }
 }

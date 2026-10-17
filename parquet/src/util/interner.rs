@@ -33,7 +33,6 @@ pub trait Storage {
     fn push(&mut self, value: &Self::Value) -> Self::Key;
 
     /// Return an estimate of the memory used in this storage, in bytes
-    #[allow(dead_code)] // not used in parquet_derive, so is dead there
     fn estimated_memory_size(&self) -> usize;
 }
 
@@ -75,11 +74,8 @@ impl<S: Storage> Interner<S> {
     }
 
     /// Return estimate of the memory used, in bytes
-    #[allow(dead_code)] // not used in parquet_derive, so is dead there
     pub fn estimated_memory_size(&self) -> usize {
-        self.storage.estimated_memory_size() +
-            // estimate size of dedup hashmap as just th size of the keys
-            self.dedup.capacity() + std::mem::size_of::<S::Key>()
+        self.storage.estimated_memory_size() + self.dedup.allocation_size()
     }
 
     /// Returns the storage for this interner

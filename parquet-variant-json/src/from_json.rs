@@ -102,7 +102,7 @@ fn variant_from_number<'m, 'v>(n: &Number) -> Result<Variant<'m, 'v>, ArrowError
     }
 }
 
-fn append_json(json: &Value, builder: &mut impl VariantBuilderExt) -> Result<(), ArrowError> {
+pub fn append_json(json: &Value, builder: &mut impl VariantBuilderExt) -> Result<(), ArrowError> {
     match json {
         Value::Null => builder.append_value(Variant::Null),
         Value::Bool(b) => builder.append_value(*b),
@@ -119,13 +119,13 @@ fn append_json(json: &Value, builder: &mut impl VariantBuilderExt) -> Result<(),
         }
         Value::Object(obj) => {
             let mut obj_builder = builder.try_new_object()?;
-            for (key, value) in obj.iter() {
+            for (key, value) in obj {
                 let mut field_builder = ObjectFieldBuilder::new(key, &mut obj_builder);
                 append_json(value, &mut field_builder)?;
             }
             obj_builder.finish();
         }
-    };
+    }
     Ok(())
 }
 

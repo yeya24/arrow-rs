@@ -273,7 +273,11 @@ pub enum DataType {
     /// of binary data in total.
     Binary,
     /// Opaque binary data of fixed size.
-    /// Enum parameter specifies the number of bytes per value.
+    ///
+    /// Enum parameter specifies the number of bytes per value, defined by the
+    /// [`byteWidth` field] in the Arrow Spec
+    ///
+    /// [`byteWidth` field]: https://github.com/apache/arrow/blob/2a89d03bbefd620b42126b8e00f8ae57e99cd638/format/Schema.fbs#L211
     FixedSizeBinary(i32),
     /// Opaque binary data of variable length and 64-bit offsets.
     ///
@@ -312,13 +316,10 @@ pub enum DataType {
     ///
     /// A single List array can store up to [`i32::MAX`] elements in total.
     List(FieldRef),
-
-    /// (NOT YET FULLY SUPPORTED)  A list of some logical data type with variable length.
+    /// A list of some logical data type with variable length.
     ///
     /// Logically the same as [`List`], but the internal representation differs in how child
-    /// data is referenced, allowing flexibility in how data is layed out.
-    ///
-    /// Note this data type is not yet fully supported. Using it with arrow APIs may result in `panic`s.
+    /// data is referenced, allowing flexibility in how data is laid out.
     ///
     /// [`List`]: Self::List
     ListView(FieldRef),
@@ -328,13 +329,10 @@ pub enum DataType {
     ///
     /// A single LargeList array can store up to [`i64::MAX`] elements in total.
     LargeList(FieldRef),
-
-    /// (NOT YET FULLY SUPPORTED)  A list of some logical data type with variable length and 64-bit offsets.
+    /// A list of some logical data type with variable length and 64-bit offsets.
     ///
     /// Logically the same as [`LargeList`], but the internal representation differs in how child
-    /// data is referenced, allowing flexibility in how data is layed out.
-    ///
-    /// Note this data type is not yet fully supported. Using it with arrow APIs may result in `panic`s.
+    /// data is referenced, allowing flexibility in how data is laid out.
     ///
     /// [`LargeList`]: Self::LargeList
     LargeListView(FieldRef),
@@ -358,59 +356,51 @@ pub enum DataType {
     Dictionary(Box<DataType>, Box<DataType>),
     /// Exact 32-bit width decimal value with precision and scale
     ///
-    /// * precision is the total number of digits
-    /// * scale is the number of digits past the decimal
+    /// * precision is the maximum number of digits in the unscaled value
+    /// * scale controls the position of the decimal point
     ///
-    /// For example the number 123.45 has precision 5 and scale 2.
+    /// The represented value is the unscaled integer multiplied by 10^{-scale}.
+    /// For example, the unscaled value 12345 with precision 5 and scale 2
+    /// represents 123.45.
     ///
-    /// In certain situations, scale could be negative number. For
-    /// negative scale, it is the number of padding 0 to the right
-    /// of the digits.
-    ///
-    /// For example the number 12300 could be treated as a decimal
-    /// has precision 3 and scale -2.
+    /// Scale can also be negative. For example, the unscaled value 12 with
+    /// precision 2 and scale -3 represents 12000.
     Decimal32(u8, i8),
     /// Exact 64-bit width decimal value with precision and scale
     ///
-    /// * precision is the total number of digits
-    /// * scale is the number of digits past the decimal
+    /// * precision is the maximum number of digits in the unscaled value
+    /// * scale controls the position of the decimal point
     ///
-    /// For example the number 123.45 has precision 5 and scale 2.
+    /// The represented value is the unscaled integer multiplied by 10^{-scale}.
+    /// For example, the unscaled value 12345 with precision 5 and scale 2
+    /// represents 123.45.
     ///
-    /// In certain situations, scale could be negative number. For
-    /// negative scale, it is the number of padding 0 to the right
-    /// of the digits.
-    ///
-    /// For example the number 12300 could be treated as a decimal
-    /// has precision 3 and scale -2.
+    /// Scale can also be negative. For example, the unscaled value 12 with
+    /// precision 2 and scale -3 represents 12000.
     Decimal64(u8, i8),
     /// Exact 128-bit width decimal value with precision and scale
     ///
-    /// * precision is the total number of digits
-    /// * scale is the number of digits past the decimal
+    /// * precision is the maximum number of digits in the unscaled value
+    /// * scale controls the position of the decimal point
     ///
-    /// For example the number 123.45 has precision 5 and scale 2.
+    /// The represented value is the unscaled integer multiplied by 10^{-scale}.
+    /// For example, the unscaled value 12345 with precision 5 and scale 2
+    /// represents 123.45.
     ///
-    /// In certain situations, scale could be negative number. For
-    /// negative scale, it is the number of padding 0 to the right
-    /// of the digits.
-    ///
-    /// For example the number 12300 could be treated as a decimal
-    /// has precision 3 and scale -2.
+    /// Scale can also be negative. For example, the unscaled value 12 with
+    /// precision 2 and scale -3 represents 12000.
     Decimal128(u8, i8),
     /// Exact 256-bit width decimal value with precision and scale
     ///
-    /// * precision is the total number of digits
-    /// * scale is the number of digits past the decimal
+    /// * precision is the maximum number of digits in the unscaled value
+    /// * scale controls the position of the decimal point
     ///
-    /// For example the number 123.45 has precision 5 and scale 2.
+    /// The represented value is the unscaled integer multiplied by 10^{-scale}.
+    /// For example, the unscaled value 12345 with precision 5 and scale 2
+    /// represents 123.45.
     ///
-    /// In certain situations, scale could be negative number. For
-    /// negative scale, it is the number of padding 0 to the right
-    /// of the digits.
-    ///
-    /// For example the number 12300 could be treated as a decimal
-    /// has precision 3 and scale -2.
+    /// Scale can also be negative. For example, the unscaled value 12 with
+    /// precision 2 and scale -3 represents 12000.
     Decimal256(u8, i8),
     /// A Map is a logical nested type that is represented as
     ///
@@ -425,6 +415,11 @@ pub enum DataType {
     /// has two children: key type and the second the value type. The names of the
     /// child fields may be respectively "entries", "key", and "value", but this is
     /// not enforced.
+    ///
+    /// # Requirements
+    /// - The entries [`Field`] (first argument) must be non-nullable.
+    /// - The entries field must be a [`DataType::Struct`] with exactly 2 children.
+    /// - The first child (key) must be non-nullable.
     Map(FieldRef, bool),
     /// A run-end encoding (REE) is a variation of run-length encoding (RLE). These
     /// encodings are well-suited for representing data containing sequences of the
@@ -437,6 +432,10 @@ pub enum DataType {
     ///
     /// These child arrays are prescribed the standard names of "run_ends" and "values"
     /// respectively.
+    ///
+    /// # Requirements
+    /// - The run_ends [`Field`] (first argument) must be non-nullable and of type
+    ///   [`DataType::Int16`], [`DataType::Int32`], or [`DataType::Int64`].
     RunEndEncoded(FieldRef, FieldRef),
 }
 
@@ -591,6 +590,16 @@ impl DataType {
         matches!(self, UInt8 | UInt16 | UInt32 | UInt64)
     }
 
+    /// Returns true if this type is decimal: (Decimal*).
+    #[inline]
+    pub fn is_decimal(&self) -> bool {
+        use DataType::*;
+        matches!(
+            self,
+            Decimal32(..) | Decimal64(..) | Decimal128(..) | Decimal256(..)
+        )
+    }
+
     /// Returns true if this type is valid as a dictionary key
     #[inline]
     pub fn is_dictionary_key_type(&self) -> bool {
@@ -629,6 +638,34 @@ impl DataType {
     pub fn is_null(&self) -> bool {
         use DataType::*;
         matches!(self, Null)
+    }
+
+    /// Returns true if this type is a String type
+    #[inline]
+    pub fn is_string(&self) -> bool {
+        use DataType::*;
+        matches!(self, Utf8 | LargeUtf8 | Utf8View)
+    }
+
+    /// Returns true if this type is a List type.
+    ///
+    /// List types include List, LargeList, FixedSizeList, ListView, and LargeListView.
+    #[inline]
+    pub fn is_list(&self) -> bool {
+        use DataType::*;
+        matches!(
+            self,
+            List(_) | LargeList(_) | FixedSizeList(_, _) | ListView(_) | LargeListView(_)
+        )
+    }
+
+    /// Returns true if this type is a Binary type.
+    ///
+    /// Binary types include Binary, LargeBinary, FixedSizeBinary and BinaryView.
+    #[inline]
+    pub fn is_binary(&self) -> bool {
+        use DataType::*;
+        matches!(self, Binary | LargeBinary | FixedSizeBinary(_) | BinaryView)
     }
 
     /// Compares the datatype with another, ignoring nested field names
@@ -994,53 +1031,58 @@ mod tests {
         assert!(!list_s.equals_datatype(&list_v));
 
         let union_a = DataType::Union(
-            UnionFields::new(
+            UnionFields::try_new(
                 vec![1, 2],
                 vec![
                     Field::new("f1", DataType::Utf8, false),
                     Field::new("f2", DataType::UInt8, false),
                 ],
-            ),
+            )
+            .unwrap(),
             UnionMode::Sparse,
         );
         let union_b = DataType::Union(
-            UnionFields::new(
+            UnionFields::try_new(
                 vec![1, 2],
                 vec![
                     Field::new("ff1", DataType::Utf8, false),
                     Field::new("ff2", DataType::UInt8, false),
                 ],
-            ),
+            )
+            .unwrap(),
             UnionMode::Sparse,
         );
         let union_c = DataType::Union(
-            UnionFields::new(
+            UnionFields::try_new(
                 vec![2, 1],
                 vec![
                     Field::new("fff2", DataType::UInt8, false),
                     Field::new("fff1", DataType::Utf8, false),
                 ],
-            ),
+            )
+            .unwrap(),
             UnionMode::Sparse,
         );
         let union_d = DataType::Union(
-            UnionFields::new(
+            UnionFields::try_new(
                 vec![2, 1],
                 vec![
                     Field::new("fff1", DataType::Int8, false),
                     Field::new("fff2", DataType::UInt8, false),
                 ],
-            ),
+            )
+            .unwrap(),
             UnionMode::Sparse,
         );
         let union_e = DataType::Union(
-            UnionFields::new(
+            UnionFields::try_new(
                 vec![1, 2],
                 vec![
                     Field::new("f1", DataType::Utf8, true),
                     Field::new("f2", DataType::UInt8, false),
                 ],
-            ),
+            )
+            .unwrap(),
             UnionMode::Sparse,
         );
 
@@ -1143,15 +1185,64 @@ mod tests {
     }
 
     #[test]
+    fn test_string() {
+        assert!(DataType::is_string(&DataType::Utf8));
+        assert!(DataType::is_string(&DataType::LargeUtf8));
+        assert!(DataType::is_string(&DataType::Utf8View));
+        assert!(!DataType::is_string(&DataType::Int32));
+    }
+
+    #[test]
     fn test_floating() {
         assert!(DataType::is_floating(&DataType::Float16));
         assert!(!DataType::is_floating(&DataType::Int32));
     }
 
     #[test]
+    fn test_decimal() {
+        assert!(DataType::is_decimal(&DataType::Decimal32(4, 2)));
+        assert!(DataType::is_decimal(&DataType::Decimal64(4, 2)));
+        assert!(DataType::is_decimal(&DataType::Decimal128(4, 2)));
+        assert!(DataType::is_decimal(&DataType::Decimal256(4, 2)));
+        assert!(!DataType::is_decimal(&DataType::Float16));
+    }
+
+    #[test]
     fn test_datatype_is_null() {
         assert!(DataType::is_null(&DataType::Null));
         assert!(!DataType::is_null(&DataType::Int32));
+    }
+
+    #[test]
+    fn test_is_list() {
+        assert!(DataType::is_list(&DataType::new_list(
+            DataType::Int16,
+            true
+        )));
+        assert!(DataType::is_list(&DataType::new_large_list(
+            DataType::Int16,
+            true
+        )));
+        assert!(DataType::is_list(&DataType::new_fixed_size_list(
+            DataType::Int16,
+            5,
+            true
+        )));
+        assert!(DataType::is_list(&DataType::ListView(Arc::new(
+            Field::new("f", DataType::Int16, true)
+        ))));
+        assert!(DataType::is_list(&DataType::LargeListView(Arc::new(
+            Field::new("f", DataType::Int16, true)
+        ))));
+        assert!(!DataType::is_list(&DataType::Binary));
+    }
+
+    #[test]
+    fn test_is_binary() {
+        assert!(DataType::is_binary(&DataType::Binary));
+        assert!(DataType::is_binary(&DataType::LargeBinary));
+        assert!(DataType::is_binary(&DataType::BinaryView));
+        assert!(!DataType::is_list(&DataType::Utf8View));
     }
 
     #[test]
@@ -1164,13 +1255,14 @@ mod tests {
     fn test_union_with_duplicated_type_id() {
         let type_ids = vec![1, 1];
         let _union = DataType::Union(
-            UnionFields::new(
+            UnionFields::try_new(
                 type_ids,
                 vec![
                     Field::new("f1", DataType::Int32, false),
                     Field::new("f2", DataType::Utf8, false),
                 ],
-            ),
+            )
+            .unwrap(),
             UnionMode::Dense,
         );
     }
@@ -1188,7 +1280,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)] // Can't handle the inlined strings of the assert_debug_snapshot macro
+    #[cfg_attr(miri, ignore)] // fork is not supported
     fn test_debug_format_field() {
         // Make sure the `Debug` formatting of `DataType` is readable and not too long
         insta::assert_debug_snapshot!(DataType::new_list(DataType::Int8, false), @r"

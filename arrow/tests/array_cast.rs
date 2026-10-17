@@ -146,7 +146,7 @@ fn test_cast_timestamp_with_timezone_daylight_3() {
 }
 
 #[test]
-#[cfg_attr(miri, ignore)] // running forever
+#[cfg_attr(miri, ignore)] // Takes too long
 fn test_can_cast_types() {
     // this function attempts to ensure that can_cast_types stays
     // in sync with cast.  It simply tries all combinations of
@@ -183,7 +183,7 @@ fn test_can_cast_types() {
                 }
                 // otherwise it was a match
                 _ => {}
-            };
+            }
         }
     }
 }
@@ -366,7 +366,7 @@ fn make_fixed_size_list_array() -> FixedSizeListArray {
 }
 
 fn make_fixed_size_binary_array() -> FixedSizeBinaryArray {
-    let values: &[u8; 15] = b"hellotherearrow";
+    let values = b"hellotherearrow";
 
     let array_data = ArrayData::builder(DataType::FixedSizeBinary(5))
         .len(3)
@@ -507,7 +507,7 @@ fn get_all_types() -> Vec<DataType> {
         Int8,
         Int16,
         Int32,
-        UInt64,
+        Int64,
         UInt8,
         UInt16,
         UInt32,
@@ -552,13 +552,14 @@ fn get_all_types() -> Vec<DataType> {
             Field::new("f2", DataType::Utf8, true),
         ])),
         Union(
-            UnionFields::new(
+            UnionFields::try_new(
                 vec![0, 1],
                 vec![
                     Field::new("f1", DataType::Int32, false),
                     Field::new("f2", DataType::Utf8, true),
                 ],
-            ),
+            )
+            .unwrap(),
             UnionMode::Dense,
         ),
         Decimal128(38, 0),
@@ -591,7 +592,7 @@ fn get_all_types() -> Vec<DataType> {
 fn test_timestamp_cast_utf8() {
     let array: PrimitiveArray<TimestampMicrosecondType> =
         vec![Some(37800000000), None, Some(86339000000)].into();
-    let out = cast(&(Arc::new(array) as ArrayRef), &DataType::Utf8).unwrap();
+    let out = cast(&array, &DataType::Utf8).unwrap();
 
     let expected = StringArray::from(vec![
         Some("1970-01-01T10:30:00"),
@@ -607,7 +608,7 @@ fn test_timestamp_cast_utf8() {
     let array: PrimitiveArray<TimestampMicrosecondType> =
         vec![Some(37800000000), None, Some(86339000000)].into();
     let array = array.with_timezone("Australia/Sydney".to_string());
-    let out = cast(&(Arc::new(array) as ArrayRef), &DataType::Utf8).unwrap();
+    let out = cast(&array, &DataType::Utf8).unwrap();
 
     let expected = StringArray::from(vec![
         Some("1970-01-01T20:30:00+10:00"),

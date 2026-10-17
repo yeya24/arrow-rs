@@ -21,13 +21,12 @@ extern crate criterion;
 use criterion::Criterion;
 use std::ops::Range;
 
-use rand::Rng;
-
-extern crate arrow;
+use rand::RngExt;
 
 use arrow::datatypes::*;
 use arrow::util::test_util::seedable_rng;
 use arrow::{array::*, util::bench_util::*};
+use arrow_buffer::ScalarBuffer;
 use arrow_select::interleave::interleave;
 use std::hint;
 use std::sync::Arc;
@@ -70,6 +69,8 @@ fn bench_values(c: &mut Criterion, name: &str, len: usize, values: &[&dyn Array]
 fn add_benchmark(c: &mut Criterion) {
     let i32 = create_primitive_array::<Int32Type>(1024, 0.);
     let i32_opt = create_primitive_array::<Int32Type>(1024, 0.5);
+    let boolean = create_boolean_array(1024, 0.0, 0.5);
+    let boolean_opt = create_boolean_array(1024, 0.1, 0.5);
     let string = create_string_array_with_len::<i32>(1024, 0., 20);
     let string_opt = create_string_array_with_len::<i32>(1024, 0.5, 20);
     let values = create_string_array_with_len::<i32>(10, 0.0, 20);
@@ -116,7 +117,56 @@ fn add_benchmark(c: &mut Criterion) {
 
     let string_view = create_string_view_array(1024, 0.0);
 
+    // use 8192 as a standard list size for better coverage
+    let list_i64 = create_primitive_list_array_with_seed::<i32, Int64Type>(8192, 0.1, 0.1, 20, 42);
+    let list_i64_no_nulls =
+        create_primitive_list_array_with_seed::<i32, Int64Type>(8192, 0.0, 0.0, 20, 42);
+
+    let list_view_i64: ListViewArray =
+        create_primitive_list_array_with_seed::<i32, Int64Type>(8192, 0.1, 0.1, 20, 42).into();
+    let list_view_i64_no_nulls: ListViewArray =
+        create_primitive_list_array_with_seed::<i32, Int64Type>(8192, 0.0, 0.0, 20, 42).into();
+
+    // ListView with overlapping offset/size ranges: 100 unique element ranges of
+    // 20 elements each, with 80 rows sharing each range (8000 rows, 2000 backing elements).
+    let list_view_overlapping = {
+        let num_unique = 100;
+        let rows_per_unique = 80;
+        let elems_per_row = 20;
+        let total_rows = num_unique * rows_per_unique;
+        let values = Arc::new(Int64Array::from_iter_values(
+            0..((num_unique * elems_per_row) as i64),
+        ));
+        let offsets: Vec<i32> = (0..total_rows)
+            .map(|i| ((i / rows_per_unique) * elems_per_row) as i32)
+            .collect();
+        let sizes = vec![elems_per_row as i32; total_rows];
+        ListViewArray::new(
+            Arc::new(Field::new_list_field(DataType::Int64, false)),
+            ScalarBuffer::from(offsets),
+            ScalarBuffer::from(sizes),
+            values,
+            None,
+        )
+    };
+
+    let fsl_i64 = create_primitive_fixed_size_list_array::<Int64Type>(8192, 0.0, 0.0, 5);
+    let fsl_i64_nulls = create_primitive_fixed_size_list_array::<Int64Type>(8192, 0.1, 0.1, 5);
+
+    let map_str_i64 = create_string_map_array::<Int64Type>(8192, 0.0, 5, 8);
+    let map_str_i64_nulls = create_string_map_array::<Int64Type>(8192, 0.1, 5, 8);
+
+    let ree_run_ends = Int32Array::from_iter_values((1..=64).map(|i| i * 16));
+    let ree_i64_values = create_primitive_array::<Int64Type>(64, 0.0);
+    let ree_i64 = RunArray::<Int32Type>::try_new(&ree_run_ends, &ree_i64_values).unwrap();
+
+    let dict_str_values = create_string_array_with_len::<i32>(20, 0.0, 12);
+    let dict_for_ree = create_dict_from_values::<UInt32Type>(64, 0.0, &dict_str_values);
+    let ree_dict = RunArray::<Int32Type>::try_new(&ree_run_ends, &dict_for_ree).unwrap();
+
     let cases: &[(&str, &dyn Array)] = &[
+        ("bool(0.0)", &boolean),
+        ("bool(0.1)", &boolean_opt),
         ("i32(0.0)", &i32),
         ("i32(0.5)", &i32_opt),
         ("str(20, 0.0)", &string),
@@ -136,6 +186,17 @@ fn add_benchmark(c: &mut Criterion) {
             "struct(i32(0.0), str(20, 0.0)",
             &struct_i32_no_nulls_string_no_nulls,
         ),
+        ("list<i64>(0.1,0.1,20)", &list_i64),
+        ("list<i64>(0.0,0.0,20)", &list_i64_no_nulls),
+        ("list_view<i64>(0.1,0.1,20)", &list_view_i64),
+        ("list_view<i64>(0.0,0.0,20)", &list_view_i64_no_nulls),
+        ("list_view_overlapping<i64>(80x,20)", &list_view_overlapping),
+        ("fixed_size_list<i64,5>(0.0,0.0)", &fsl_i64),
+        ("fixed_size_list<i64,5>(0.1,0.1)", &fsl_i64_nulls),
+        ("map<utf8,i64>(0.0,5,8)", &map_str_i64),
+        ("map<utf8,i64>(0.1,5,8)", &map_str_i64_nulls),
+        ("ree_i32<i64>(64 runs)", &ree_i64),
+        ("ree_i32<dict<u32,utf8>>(64 runs)", &ree_dict),
     ];
 
     for (prefix, base) in cases {
@@ -155,7 +216,7 @@ fn add_benchmark(c: &mut Criterion) {
         bench_values(
             c,
             &format!("interleave dict_distinct {len}"),
-            100,
+            len,
             &[&dict, &sparse_dict],
         );
     }

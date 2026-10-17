@@ -19,12 +19,18 @@
 name = "arrow-array"
 version = { workspace = true }
 description = "Array abstractions for Apache Arrow"
-homepage = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
-license = { workspace = true }
+license = "Apache-2.0 AND MIT"
 keywords = { workspace = true }
-include = { workspace = true }
+include = [
+    "benches/*.rs",
+    "src/**/*.rs",
+    "Cargo.toml",
+    "LICENSE.txt",
+    "LICENSE-MIT",
+    "NOTICE.txt",
+]
 edition = { workspace = true }
 rust-version = { workspace = true }
 
@@ -38,28 +44,37 @@ ahash = { version = "0.8", default-features = false, features = ["compile-time-r
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ahash = { version = "0.8", default-features = false, features = ["runtime-rng"] }
 
+# Used by the ffi feature for platform-correct errno values. Excluded on
+# wasm32-unknown-unknown, which has no libc.
+[target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
+libc = { version = "0.2", default-features = false, optional = true }
+
 [dependencies]
 arrow-buffer = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-data = { workspace = true }
 chrono = { workspace = true }
-chrono-tz = { version = "0.10", optional = true }
+chrono-tz = { version = "0.10.3", optional = true }
+futures = { version = "0.3", optional = true }
 num-complex = { version = "0.4.6", default-features = false, features = ["std"] }
 num-integer = { version = "0.1.46", default-features = false, features = ["std"] }
 num-traits = { version = "0.2.19", default-features = false, features = ["std"] }
 half = { version = "2.1", default-features = false, features = ["num-traits"] }
-hashbrown = { version = "0.16.0", default-features = false }
+hashbrown = { version = "0.17.0", default-features = false }
 
 [package.metadata.docs.rs]
 all-features = true
 
 [features]
-ffi = ["arrow-schema/ffi", "arrow-data/ffi"]
-force_validate = []
+async = ["dep:futures"]
+ffi = ["arrow-schema/ffi", "arrow-data/ffi", "dep:libc"]
+force_validate = ["arrow-data/force_validate"]
+# Enable memory tracking support
+pool = ["arrow-buffer/pool", "arrow-data/pool"]
 
 [dev-dependencies]
-rand = { version = "0.9", default-features = false, features = ["std", "std_rng", "thread_rng"] }
-criterion = { version = "0.5", default-features = false }
+rand = { version = "0.10", default-features = false, features = ["std", "std_rng", "thread_rng"] }
+criterion = { workspace = true, default-features = false }
 
 [[bench]]
 name = "occupancy"
@@ -74,9 +89,28 @@ name = "fixed_size_list_array"
 harness = false
 
 [[bench]]
+name = "null_dict"
+harness = false
+
+[[bench]]
 name = "decimal_overflow"
 harness = false
 
 [[bench]]
 name = "union_array"
 harness = false
+
+[[bench]]
+name = "record_batch"
+harness = false
+
+[[bench]]
+name = "boolean_array"
+harness = false
+
+[[bench]]
+name = "primitive_array"
+harness = false
+
+[lints]
+workspace = true

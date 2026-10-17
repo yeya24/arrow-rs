@@ -29,9 +29,12 @@ There are several [examples](https://github.com/apache/arrow-rs/tree/main/arrow/
 
 The API documentation for most recent, unreleased code is available [here](https://arrow.apache.org/rust/arrow/index.html).
 
-## Rust Version Compatibility
+## Arrow Implementation Status
 
-This crate is tested with the latest stable version of Rust. We do not currently test against other, older versions.
+Please see the [Implementation Status Page] on the Apache Arrow website for which
+Arrow features are supported by this crate.
+
+[Implementation Status Page]: https://arrow.apache.org/docs/status.html
 
 ## Versioning / Releases
 
@@ -61,11 +64,32 @@ The `arrow` crate provides the following features which may be enabled in your `
 - `chrono-tz` - support of parsing timezone using [chrono-tz](https://docs.rs/chrono-tz/0.6.0/chrono_tz/)
 - `ffi` - bindings for the Arrow C [C Data Interface](https://arrow.apache.org/docs/format/CDataInterface.html)
 - `pyarrow` - bindings for pyo3 to call arrow-rs from python
+- `pyarrow-experimental-inspect` - record the pyarrow type of each conversion in PyO3's introspection data, so that stub generators emit e.g. `pyarrow.Array` rather than `_typeshed.Incomplete` (also enables `pyarrow`)
 - `canonical_extension_types` - definitions for [canonical extension types](https://arrow.apache.org/docs/format/CanonicalExtensions.html#format-canonical-extensions)
+- `async` - definitions for traits using `async`, intended to work with the async ecosystem
 
 ## Arrow Feature Status
 
 The [Apache Arrow Status](https://arrow.apache.org/docs/status.html) page lists which features of Arrow this crate supports.
+
+
+## Security
+
+`arrow-rs` follows the [Apache Arrow Security Model].
+
+Unexpected behavior (e.g., panics, crashes, or infinite loops) triggered by
+malformed input, and instances of undefined behavior (UB) triggered via safe
+APIs are considered bugs rather than security vulnerabilities unless they are exploitable
+by an attacker to
+
+* Execute arbitrary code (Remote Code Execution);
+* Exfiltrate sensitive information from process memory (Information Disclosure);
+
+We welcome your help in fixing such bugs and security issues. See our
+[Security Policy] for reporting.
+
+[Apache Arrow Security Model]: https://arrow.apache.org/docs/dev/format/Security.html
+[Security Policy]: https://github.com/apache/arrow-rs/blob/main/SECURITY.md
 
 ## Safety
 

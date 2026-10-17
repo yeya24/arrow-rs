@@ -21,10 +21,9 @@ use criterion::Criterion;
 
 use arrow::util::bench_util::create_boolean_array;
 
-extern crate arrow;
-
 use arrow::array::*;
 use arrow::compute::kernels::boolean as boolean_kernels;
+use arrow_buffer::NullBuffer;
 use std::hint;
 
 fn bench_and(lhs: &BooleanArray, rhs: &BooleanArray) {
@@ -40,32 +39,73 @@ fn bench_not(array: &BooleanArray) {
 }
 
 fn add_benchmark(c: &mut Criterion) {
+    // allocate arrays of 32K elements
     let size = 2usize.pow(15);
+
+    // Note we allocate all arrays before the benchmark to ensure the allocation of the arrays
+    // is not affected by allocations that happen during the benchmarked operation.
     let array1 = create_boolean_array(size, 0.0, 0.5);
     let array2 = create_boolean_array(size, 0.0, 0.5);
+
+    // Slice by 1 (not aligned to byte (8 bit) or word (64 bit) boundaries)
+    let offset = 1;
+    let array1_sliced_1 = array1.slice(offset, size - offset);
+    let array2_sliced_1 = array2.slice(offset, size - offset);
+
+    // Slice by 24 (aligned on byte (8 bit) but not word (64 bit) boundaries)
+    let offset = 24;
+    let array1_sliced_24 = array1.slice(offset, size - offset);
+    let array2_sliced_24 = array2.slice(offset, size - offset);
+
     c.bench_function("and", |b| b.iter(|| bench_and(&array1, &array2)));
     c.bench_function("or", |b| b.iter(|| bench_or(&array1, &array2)));
     c.bench_function("not", |b| b.iter(|| bench_not(&array1)));
 
-    let array1_slice = array1.slice(1, size - 1);
-    let array1_slice = array1_slice
-        .as_any()
-        .downcast_ref::<BooleanArray>()
-        .unwrap();
-    let array2_slice = array2.slice(1, size - 1);
-    let array2_slice = array2_slice
-        .as_any()
-        .downcast_ref::<BooleanArray>()
-        .unwrap();
+    c.bench_function("and_sliced_1", |b| {
+        b.iter(|| bench_and(&array1_sliced_1, &array2_sliced_1))
+    });
+    c.bench_function("or_sliced_1", |b| {
+        b.iter(|| bench_or(&array1_sliced_1, &array2_sliced_1))
+    });
+    c.bench_function("not_sliced_1", |b| b.iter(|| bench_not(&array1_sliced_1)));
 
-    c.bench_function("and_sliced", |b| {
-        b.iter(|| bench_and(array1_slice, array2_slice))
+    c.bench_function("and_sliced_24", |b| {
+        b.iter(|| bench_and(&array1_sliced_24, &array2_sliced_24))
     });
-    c.bench_function("or_sliced", |b| {
-        b.iter(|| bench_or(array1_slice, array2_slice))
+    c.bench_function("or_sliced_24", |b| {
+        b.iter(|| bench_or(&array1_sliced_24, &array2_sliced_24))
     });
-    c.bench_function("not_sliced", |b| b.iter(|| bench_not(array1_slice)));
+    c.bench_function("not_slice_24", |b| b.iter(|| bench_not(&array1_sliced_24)));
 }
 
-criterion_group!(benches, add_benchmark);
+fn make_null_buffer(len: usize) -> NullBuffer {
+    NullBuffer::from(
+        (0..len)
+            .map(|i| (i / 4) % 2 == 0)
+            .collect::<Vec<bool>>()
+            .as_slice(),
+    )
+}
+
+fn bench_null_buffer_expand(c: &mut Criterion) {
+    let mut group = c.benchmark_group("null_buffer_expand");
+
+    let cases: &[(&str, usize, usize)] = &[
+        ("len=512/count=16", 512, 16), // pow2
+        ("len=512/count=12", 512, 12), // non-pow2
+        ("len=1024/count=128", 1024, 128),
+        ("len=1024/count=96", 1024, 96),
+        ("len=2048/count=256", 2048, 256),
+        ("len=2048/count=192", 2048, 192),
+    ];
+
+    for &(label, len, count) in cases {
+        let buf = make_null_buffer(len);
+        group.bench_function(label, |b| b.iter(|| hint::black_box(buf.expand(count))));
+    }
+
+    group.finish();
+}
+
+criterion_group!(benches, add_benchmark, bench_null_buffer_expand);
 criterion_main!(benches);

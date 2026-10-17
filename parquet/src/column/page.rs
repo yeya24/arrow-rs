@@ -21,7 +21,7 @@ use bytes::Bytes;
 
 use crate::basic::{Encoding, PageType};
 use crate::errors::{ParquetError, Result};
-use crate::file::metadata::thrift_gen::{
+use crate::file::metadata::thrift::{
     DataPageHeader, DataPageHeaderV2, DictionaryPageHeader, PageHeader,
 };
 use crate::file::statistics::{Statistics, page_stats_to_thrift};
@@ -31,7 +31,7 @@ use crate::file::statistics::{Statistics, page_stats_to_thrift};
 /// List of supported pages.
 /// These are 1-to-1 mapped from the equivalent Thrift definitions, except `buf` which
 /// used to store uncompressed bytes of the page.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Page {
     /// Data page Parquet format v1.
     DataPage {
@@ -197,6 +197,15 @@ impl CompressedPage {
         self.compressed_page.buffer()
     }
 
+    /// Returns the number of heap bytes this page currently holds.
+    ///
+    /// This is the page's compressed buffer (the embedded [`Bytes`]); use it to
+    /// account for a buffered page's memory footprint rather than reaching for
+    /// `data().len()` at each call site.
+    pub fn memory_usage(&self) -> usize {
+        self.compressed_page.buffer().len()
+    }
+
     /// Returns the thrift page header
     pub(crate) fn to_thrift_header(&self) -> Result<PageHeader> {
         let uncompressed_size = self.uncompressed_size();
@@ -345,11 +354,11 @@ pub struct PageMetadata {
     pub is_dict: bool,
 }
 
-impl TryFrom<&crate::file::metadata::thrift_gen::PageHeader> for PageMetadata {
+impl TryFrom<&crate::file::metadata::thrift::PageHeader> for PageMetadata {
     type Error = ParquetError;
 
     fn try_from(
-        value: &crate::file::metadata::thrift_gen::PageHeader,
+        value: &crate::file::metadata::thrift::PageHeader,
     ) -> std::result::Result<Self, Self::Error> {
         match value.r#type {
             PageType::DATA_PAGE => {
@@ -373,7 +382,7 @@ impl TryFrom<&crate::file::metadata::thrift_gen::PageHeader> for PageMetadata {
                     is_dict: false,
                 })
             }
-            other => Err(ParquetError::General(format!(
+            other @ PageType::INDEX_PAGE => Err(ParquetError::General(format!(
                 "page type {other:?} cannot be converted to PageMetadata"
             ))),
         }
@@ -395,6 +404,30 @@ pub trait PageReader: Iterator<Item = Result<Page>> + Send {
     /// column index information
     fn skip_next_page(&mut self) -> Result<()>;
 
+    /// Returns whether skipped dictionary pages can later be recovered with
+    /// [`Self::take_deferred_dictionary`].
+    ///
+    /// Implementations returning `true` must retain dictionary pages consumed by
+    /// [`Self::skip_next_page`].
+    fn supports_deferred_dictionary(&self) -> bool {
+        false
+    }
+
+    /// Returns the decoded dictionary [`Page`] this reader has previously
+    /// skipped past, if any, removing it from the reader.
+    ///
+    /// [`Self::skip_next_page`] may skip a dictionary page without decoding
+    /// it, since skipping rows never needs dictionary contents. If decoding
+    /// later reaches a dictionary-encoded data page, the reader is asked for
+    /// the dictionary through this method, which pays the deferred
+    /// decompression exactly once. A chunk skipped end to end never pays it.
+    ///
+    /// The default implementation returns `Ok(None)`, meaning the reader
+    /// never defers.
+    fn take_deferred_dictionary(&mut self) -> Result<Option<Page>> {
+        Ok(None)
+    }
+
     /// Returns `true` if the next page can be assumed to contain the start of a new record
     ///
     /// Prior to parquet V2 the specification was ambiguous as to whether a single record
@@ -406,7 +439,14 @@ pub trait PageReader: Iterator<Item = Result<Page>> + Send {
     /// [(#4327)]: https://github.com/apache/arrow-rs/pull/4327
     /// [(#4943)]: https://github.com/apache/arrow-rs/pull/4943
     fn at_record_boundary(&mut self) -> Result<bool> {
-        Ok(self.peek_next_page()?.is_none())
+        match self.peek_next_page()? {
+            // Last page in the column chunk - always a record boundary
+            None => Ok(true),
+            // A V2 data page is required by the parquet spec to start at a
+            // record boundary, so the current page ends at one.  V2 pages
+            // are identified by having `num_rows` set in their header.
+            Some(metadata) => Ok(metadata.num_rows.is_some()),
+        }
     }
 }
 
@@ -422,6 +462,55 @@ pub trait PageWriter: Send {
     /// This method is called for every compressed page we write into underlying buffer,
     /// either data page or dictionary page.
     fn write_page(&mut self, page: CompressedPage) -> Result<PageWriteSpec>;
+
+    /// **Unstable, not public API.** This is an internal protocol between
+    /// [`GenericColumnWriter`] and its in-crate page writers; it is hidden from
+    /// the rendered docs and may change or be removed without a major version
+    /// bump. External `PageWriter` implementations should not override it. See
+    /// the page-spilling cleanup tracked in
+    /// <https://github.com/apache/arrow-rs/pull/10020>.
+    ///
+    /// Whether this writer resolves the final page layout itself (at flush)
+    /// rather than committing bytes to their final position as pages arrive.
+    ///
+    /// The dictionary page of a column chunk must be written *first*, but it is
+    /// not finalized until every value has been seen. A writer that commits
+    /// bytes live (e.g. straight to a file) therefore relies on the column
+    /// writer buffering the dictionary-encoded data pages in memory until the
+    /// dictionary page is ready — see [`GenericColumnWriter`]'s `data_pages`.
+    ///
+    /// A writer that instead buffers the whole chunk and splices it later (the
+    /// [`ArrowWriter`] path) can accept data pages *before* the dictionary page
+    /// and order them itself at flush. Returning `true` tells the column writer
+    /// to skip that in-memory buffering and stream dictionary-column data pages
+    /// straight through, bounding the column writer's memory.
+    ///
+    /// [`GenericColumnWriter`]: crate::column::writer::GenericColumnWriter
+    /// [`ArrowWriter`]: crate::arrow::arrow_writer::ArrowWriter
+    #[doc(hidden)]
+    fn defers_dictionary_ordering(&self) -> bool {
+        false
+    }
+
+    /// **Unstable, not public API.** Companion to
+    /// [`defers_dictionary_ordering`](Self::defers_dictionary_ordering): an
+    /// internal hook for the column writer's memory accounting, hidden from the
+    /// rendered docs and subject to change or removal without a major version
+    /// bump. External `PageWriter` implementations should not override it.
+    ///
+    /// The number of bytes this writer is currently holding **in memory** for
+    /// pages it has been handed (i.e. completed pages not yet committed to their
+    /// final destination).
+    ///
+    /// Used by the column writer to report its memory footprint. The default is
+    /// `0`: a writer that streams pages straight to their destination retains
+    /// nothing. A writer that buffers pages should report what it actually holds
+    /// on the heap — which, when it spills to a backing store, can be far less
+    /// than the bytes written.
+    #[doc(hidden)]
+    fn buffered_memory_size(&self) -> usize {
+        0
+    }
 
     /// Closes resources and flushes underlying sink.
     /// Page writer should not be used after this method is called.

@@ -149,7 +149,7 @@
 //! #
 //! let file = File::open(path).unwrap();
 //!
-//! // Define the AES encryption keys required required for decrypting the footer metadata
+//! // Define the AES encryption keys required for decrypting the footer metadata
 //! // and column-specific data. If only a footer key is used then it is assumed that the
 //! // file uses uniform encryption and all columns are encrypted with the footer key.
 //! // If any column keys are specified, other columns without a key provided are assumed
@@ -179,10 +179,20 @@
 //! assert_eq!(50, record_batch.num_rows());
 //! ```
 
-experimental!(mod array_reader);
+// Keep these module declarations explicit so rustfmt discovers their source files.
+// See the comment in the crate root.
+#[cfg(feature = "experimental")]
+#[doc(hidden)]
+pub mod array_reader;
+#[cfg(not(feature = "experimental"))]
+mod array_reader;
+// Re-exported (beyond the `experimental` feature) so `file::metadata::dictionary`
+// can PLAIN-decode a raw dictionary page without duplicating this logic.
+pub(crate) use array_reader::ByteArrayDecoderPlain;
 pub mod arrow_reader;
 pub mod arrow_writer;
 mod buffer;
+pub(crate) use buffer::offset_buffer::OffsetBuffer;
 mod decoder;
 
 #[cfg(feature = "async")]
@@ -190,8 +200,18 @@ pub mod async_reader;
 #[cfg(feature = "async")]
 pub mod async_writer;
 
+pub mod push_decoder;
+
+mod in_memory_row_group;
 mod record_reader;
-experimental!(mod schema);
+
+#[cfg(feature = "experimental")]
+#[doc(hidden)]
+pub mod schema;
+#[cfg(not(feature = "experimental"))]
+mod schema;
+
+use std::fmt::Debug;
 
 pub use self::arrow_writer::ArrowWriter;
 #[cfg(feature = "async")]
@@ -203,7 +223,8 @@ use arrow_schema::{FieldRef, Schema};
 
 pub use self::schema::{
     ArrowSchemaConverter, FieldLevels, add_encoded_arrow_schema_to_metadata, encode_arrow_schema,
-    parquet_to_arrow_field_levels, parquet_to_arrow_schema, parquet_to_arrow_schema_by_columns,
+    parquet_to_arrow_field_levels, parquet_to_arrow_field_levels_with_virtual,
+    parquet_to_arrow_schema, parquet_to_arrow_schema_by_columns, virtual_type::*,
 };
 
 /// Schema metadata key used to store serialized Arrow schema
@@ -258,7 +279,7 @@ pub struct ProjectionMask {
     /// A mask of `[true, false, true, false]` will result in a schema 2
     /// elements long:
     /// * `fields[0]`: `a`
-    /// * `fields[1]`: `c`    
+    /// * `fields[1]`: `c`
     ///
     /// A mask of `None` will result in a schema 4 elements long:
     /// * `fields[0]`: `a`
@@ -403,13 +424,48 @@ impl ProjectionMask {
     /// ```
     pub fn intersect(&mut self, other: &Self) {
         match (self.mask.as_ref(), other.mask.as_ref()) {
-            (None, _) => self.mask = other.mask.clone(),
+            (None, _) => self.mask.clone_from(&other.mask),
             (_, None) => {}
             (Some(a), Some(b)) => {
                 debug_assert_eq!(a.len(), b.len());
                 let mask = a.iter().zip(b.iter()).map(|(&a, &b)| a && b).collect();
                 self.mask = Some(mask);
             }
+        }
+    }
+
+    /// Return a new [`ProjectionMask`] that excludes any leaf columns that are
+    /// part of a nested type, such as struct, list, or map
+    ///
+    /// If there are no non-nested columns in the mask, returns `None`
+    pub(crate) fn without_nested_types(&self, schema: &SchemaDescriptor) -> Option<Self> {
+        let num_leaves = schema.num_columns();
+
+        // Count how many leaves each root column has
+        let num_roots = schema.root_schema().get_fields().len();
+        let mut root_leaf_counts = vec![0usize; num_roots];
+        for leaf_idx in 0..num_leaves {
+            let root_idx = schema.get_column_root_idx(leaf_idx);
+            root_leaf_counts[root_idx] += 1;
+        }
+
+        // Cache only top-level primitive columns.
+        // Even a one-leaf group is nested; caching it drops parent def levels.
+        let mut included_leaves = Vec::new();
+        for leaf_idx in 0..num_leaves {
+            if self.leaf_included(leaf_idx) {
+                let root = schema.get_column_root(leaf_idx);
+                let root_idx = schema.get_column_root_idx(leaf_idx);
+                if root_leaf_counts[root_idx] == 1 && root.is_primitive() {
+                    included_leaves.push(leaf_idx);
+                }
+            }
+        }
+
+        if included_leaves.is_empty() {
+            None
+        } else {
+            Some(ProjectionMask::leaves(schema, included_leaves))
         }
     }
 }
@@ -442,7 +498,10 @@ pub fn parquet_column<'a>(
 #[cfg(test)]
 mod test {
     use crate::arrow::ArrowWriter;
-    use crate::file::metadata::{ParquetMetaData, ParquetMetaDataReader, ParquetMetaDataWriter};
+    use crate::file::metadata::{
+        PageIndexPolicy, ParquetMetaData, ParquetMetaDataOptions, ParquetMetaDataReader,
+        ParquetMetaDataWriter,
+    };
     use crate::file::properties::{EnabledStatistics, WriterProperties};
     use crate::schema::parser::parse_message_type;
     use crate::schema::types::SchemaDescriptor;
@@ -453,20 +512,23 @@ mod test {
     use super::ProjectionMask;
 
     #[test]
-    #[allow(deprecated)]
     // Reproducer for https://github.com/apache/arrow-rs/issues/6464
     fn test_metadata_read_write_partial_offset() {
         let parquet_bytes = create_parquet_file();
 
         // read the metadata from the file WITHOUT the page index structures
+        let options = ParquetMetaDataOptions::new().with_encoding_stats_as_mask(false);
         let original_metadata = ParquetMetaDataReader::new()
+            .with_metadata_options(Some(options))
             .parse_and_finish(&parquet_bytes)
             .unwrap();
 
         // this should error because the page indexes are not present, but have offsets specified
         let metadata_bytes = metadata_to_bytes(&original_metadata);
+        let options = ParquetMetaDataOptions::new().with_encoding_stats_as_mask(false);
         let err = ParquetMetaDataReader::new()
-            .with_page_indexes(true) // there are no page indexes in the metadata
+            .with_metadata_options(Some(options))
+            .with_page_index_policy(PageIndexPolicy::Required) // there are no page indexes in the metadata
             .parse_and_finish(&metadata_bytes)
             .err()
             .unwrap();
@@ -481,7 +543,9 @@ mod test {
         let parquet_bytes = create_parquet_file();
 
         // read the metadata from the file
+        let options = ParquetMetaDataOptions::new().with_encoding_stats_as_mask(false);
         let original_metadata = ParquetMetaDataReader::new()
+            .with_metadata_options(Some(options))
             .parse_and_finish(&parquet_bytes)
             .unwrap();
 
@@ -493,7 +557,9 @@ mod test {
             "metadata is subset of parquet"
         );
 
+        let options = ParquetMetaDataOptions::new().with_encoding_stats_as_mask(false);
         let roundtrip_metadata = ParquetMetaDataReader::new()
+            .with_metadata_options(Some(options))
             .parse_and_finish(&metadata_bytes)
             .unwrap();
 
@@ -501,21 +567,25 @@ mod test {
     }
 
     #[test]
-    #[allow(deprecated)]
+    #[cfg_attr(miri, ignore)] // Takes too long
     fn test_metadata_read_write_roundtrip_page_index() {
         let parquet_bytes = create_parquet_file();
 
         // read the metadata from the file including the page index structures
         // (which are stored elsewhere in the footer)
+        let options = ParquetMetaDataOptions::new().with_encoding_stats_as_mask(false);
         let original_metadata = ParquetMetaDataReader::new()
-            .with_page_indexes(true)
+            .with_metadata_options(Some(options))
+            .with_page_index_policy(PageIndexPolicy::Required)
             .parse_and_finish(&parquet_bytes)
             .unwrap();
 
         // read metadata back from the serialized bytes and ensure it is the same
         let metadata_bytes = metadata_to_bytes(&original_metadata);
+        let options = ParquetMetaDataOptions::new().with_encoding_stats_as_mask(false);
         let roundtrip_metadata = ParquetMetaDataReader::new()
-            .with_page_indexes(true)
+            .with_metadata_options(Some(options))
+            .with_page_index_policy(PageIndexPolicy::Required)
             .parse_and_finish(&metadata_bytes)
             .unwrap();
 
@@ -527,6 +597,112 @@ mod test {
             format!("{roundtrip_metadata:#?}")
         );
         assert_eq!(original_metadata, roundtrip_metadata);
+    }
+
+    #[test]
+    fn test_metadata_read_write_roundtrip_missing_page_index() {
+        let parquet_bytes = create_parquet_file();
+
+        // read the metadata from the file but skip the page indexes
+        let options = ParquetMetaDataOptions::new().with_encoding_stats_as_mask(false);
+        let original_metadata = ParquetMetaDataReader::new()
+            .with_metadata_options(Some(options))
+            .with_page_index_policy(PageIndexPolicy::Skip)
+            .parse_and_finish(&parquet_bytes)
+            .unwrap();
+
+        // metadata_to_bytes_no_page_idx should zero out the page index locations. if they aren't
+        // then reading metadata_bytes will fail with EOF
+        let metadata_bytes = metadata_to_bytes_no_page_idx(&original_metadata);
+        let options = ParquetMetaDataOptions::new().with_encoding_stats_as_mask(false);
+        let roundtrip_metadata = ParquetMetaDataReader::new()
+            .with_metadata_options(Some(options))
+            .with_page_index_policy(PageIndexPolicy::Optional)
+            .parse_and_finish(&metadata_bytes)
+            .expect("page index locations should have been cleared");
+
+        assert!(roundtrip_metadata.page_index().is_none());
+    }
+
+    #[test]
+    fn test_metadata_read_write_roundtrip_offset_index_only() {
+        // `Chunk` statistics: the file has an offset index, but no column index
+        let array: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let batch = RecordBatch::try_from_iter(vec![("id", array)]).unwrap();
+        let props = WriterProperties::builder()
+            .set_statistics_enabled(EnabledStatistics::Chunk)
+            .build();
+        let mut buf = vec![];
+        let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let read = |bytes: &Bytes| {
+            let options = ParquetMetaDataOptions::new().with_encoding_stats_as_mask(false);
+            ParquetMetaDataReader::new()
+                .with_metadata_options(Some(options))
+                .with_page_index_policy(PageIndexPolicy::Optional)
+                .parse_and_finish(bytes)
+                .unwrap()
+        };
+        let original = read(&Bytes::from(buf));
+        let page_index = original.page_index().unwrap();
+        assert!(!page_index.has_column_indexes() && page_index.has_offset_indexes());
+        let roundtrip = read(&metadata_to_bytes(&original));
+        assert_eq!(
+            normalize_locations(original),
+            normalize_locations(roundtrip)
+        );
+    }
+
+    #[test]
+    fn test_metadata_read_write_roundtrip_custom_page_index() {
+        use crate::file::metadata::page_index::PageIndexProvider;
+        use crate::file::page_index::{
+            column_index::ColumnIndexMetaData, offset_index::OffsetIndexMetaData,
+        };
+
+        /// A custom provider that forwards to another provider
+        #[derive(Debug)]
+        struct Forward(Arc<dyn PageIndexProvider>);
+        impl PageIndexProvider for Forward {
+            fn has_offset_indexes(&self) -> bool {
+                self.0.has_offset_indexes()
+            }
+            fn has_column_indexes(&self) -> bool {
+                self.0.has_column_indexes()
+            }
+            fn column_index(&self, rg: usize, col: usize) -> Option<&ColumnIndexMetaData> {
+                self.0.column_index(rg, col)
+            }
+            fn offset_index(&self, rg: usize, col: usize) -> Option<&OffsetIndexMetaData> {
+                self.0.offset_index(rg, col)
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let read = |bytes: &Bytes| {
+            let options = ParquetMetaDataOptions::new().with_encoding_stats_as_mask(false);
+            ParquetMetaDataReader::new()
+                .with_metadata_options(Some(options))
+                .with_page_index_policy(PageIndexPolicy::Required)
+                .parse_and_finish(bytes)
+                .unwrap()
+        };
+        let original = read(&create_parquet_file());
+        let provider = Forward(original.page_index().unwrap().clone());
+        let custom = original
+            .clone()
+            .into_builder()
+            .set_page_index(Some(Arc::new(provider)))
+            .build();
+        let roundtrip = read(&metadata_to_bytes(&custom));
+        assert_eq!(
+            normalize_locations(original),
+            normalize_locations(roundtrip)
+        );
     }
 
     /// Sets the page index offset locations in the metadata to `None`
@@ -581,9 +757,20 @@ mod test {
         Bytes::from(buf)
     }
 
+    // like metadata_to_bytes, but do not preserve page index location info
+    fn metadata_to_bytes_no_page_idx(metadata: &ParquetMetaData) -> Bytes {
+        let mut buf = vec![];
+        ParquetMetaDataWriter::new(&mut buf, metadata)
+            .with_preserve_page_index_locations(false)
+            .finish()
+            .unwrap();
+        Bytes::from(buf)
+    }
+
     #[test]
     fn test_mask_from_column_names() {
-        let message_type = "
+        let schema = parse_schema(
+            "
             message test_schema {
                 OPTIONAL group a (MAP) {
                     REPEATED group key_value {
@@ -599,9 +786,8 @@ mod test {
                 REQUIRED INT32 b;
                 REQUIRED DOUBLE c;
             }
-            ";
-        let parquet_group_type = parse_message_type(message_type).unwrap();
-        let schema = SchemaDescriptor::new(Arc::new(parquet_group_type));
+            ",
+        );
 
         let mask = ProjectionMask::columns(&schema, ["foo", "bar"]);
         assert_eq!(mask.mask.unwrap(), vec![false; 5]);
@@ -618,7 +804,8 @@ mod test {
         let mask = ProjectionMask::columns(&schema, ["a.key_value.value", "b"]);
         assert_eq!(mask.mask.unwrap(), [false, true, true, true, false]);
 
-        let message_type = "
+        let schema = parse_schema(
+            "
             message test_schema {
                 OPTIONAL group a (LIST) {
                     REPEATED group list {
@@ -635,9 +822,8 @@ mod test {
                 }
                 REQUIRED INT32 b;
             }
-            ";
-        let parquet_group_type = parse_message_type(message_type).unwrap();
-        let schema = SchemaDescriptor::new(Arc::new(parquet_group_type));
+            ",
+        );
 
         let mask = ProjectionMask::columns(&schema, ["a", "b"]);
         assert_eq!(mask.mask.unwrap(), [true, true]);
@@ -652,7 +838,8 @@ mod test {
         let mask = ProjectionMask::columns(&schema, ["b"]);
         assert_eq!(mask.mask.unwrap(), [false, true]);
 
-        let message_type = "
+        let schema = parse_schema(
+            "
             message test_schema {
                 OPTIONAL INT32 a;
                 OPTIONAL INT32 b;
@@ -660,9 +847,8 @@ mod test {
                 OPTIONAL INT32 d;
                 OPTIONAL INT32 e;
             }
-            ";
-        let parquet_group_type = parse_message_type(message_type).unwrap();
-        let schema = SchemaDescriptor::new(Arc::new(parquet_group_type));
+            ",
+        );
 
         let mask = ProjectionMask::columns(&schema, ["a", "b"]);
         assert_eq!(mask.mask.unwrap(), [true, true, false, false, false]);
@@ -670,7 +856,8 @@ mod test {
         let mask = ProjectionMask::columns(&schema, ["d", "b", "d"]);
         assert_eq!(mask.mask.unwrap(), [false, true, false, true, false]);
 
-        let message_type = "
+        let schema = parse_schema(
+            "
             message test_schema {
                 OPTIONAL INT32 a;
                 OPTIONAL INT32 b;
@@ -678,21 +865,20 @@ mod test {
                 OPTIONAL INT32 d;
                 OPTIONAL INT32 e;
             }
-            ";
-        let parquet_group_type = parse_message_type(message_type).unwrap();
-        let schema = SchemaDescriptor::new(Arc::new(parquet_group_type));
+            ",
+        );
 
         let mask = ProjectionMask::columns(&schema, ["a", "e"]);
         assert_eq!(mask.mask.unwrap(), [true, false, true, false, true]);
 
-        let message_type = "
+        let schema = parse_schema(
+            "
             message test_schema {
                 OPTIONAL INT32 a;
                 OPTIONAL INT32 aa;
             }
-            ";
-        let parquet_group_type = parse_message_type(message_type).unwrap();
-        let schema = SchemaDescriptor::new(Arc::new(parquet_group_type));
+            ",
+        );
 
         let mask = ProjectionMask::columns(&schema, ["a"]);
         assert_eq!(mask.mask.unwrap(), [true, false]);
@@ -758,5 +944,260 @@ mod test {
         let mask2 = ProjectionMask { mask: None };
         mask1.intersect(&mask2);
         assert_eq!(mask1.mask, None);
+    }
+
+    #[test]
+    fn test_projection_mask_without_nested_no_nested() {
+        // Schema with no nested types
+        let schema = parse_schema(
+            "
+            message test_schema {
+                OPTIONAL INT32 a;
+                OPTIONAL INT32 b;
+                REQUIRED DOUBLE d;
+            }
+            ",
+        );
+
+        let mask = ProjectionMask::all();
+        // All columns are non-nested, but without_nested_types returns a new mask
+        assert_eq!(
+            Some(ProjectionMask::leaves(&schema, [0, 1, 2])),
+            mask.without_nested_types(&schema)
+        );
+
+        // select b, c
+        let mask = ProjectionMask::leaves(&schema, [1, 2]);
+        assert_eq!(Some(mask.clone()), mask.without_nested_types(&schema));
+    }
+
+    #[test]
+    fn test_projection_mask_without_nested_nested() {
+        // Schema with nested types (structs)
+        let schema = parse_schema(
+            "
+            message test_schema {
+                OPTIONAL INT32 a;
+                OPTIONAL group b {
+                    REQUIRED INT32 b1;
+                    OPTIONAL INT64 b2;
+                }
+                OPTIONAL group c (LIST) {
+                    REPEATED group list {
+                        OPTIONAL INT32 element;
+                    }
+                }
+                REQUIRED DOUBLE d;
+            }
+            ",
+        );
+
+        // all leaves --> a, d
+        let mask = ProjectionMask::all();
+        assert_eq!(
+            Some(ProjectionMask::leaves(&schema, [0, 4])),
+            mask.without_nested_types(&schema)
+        );
+
+        // b1 --> empty (it is nested)
+        let mask = ProjectionMask::leaves(&schema, [1]);
+        assert_eq!(None, mask.without_nested_types(&schema));
+
+        // b2, d --> d
+        let mask = ProjectionMask::leaves(&schema, [1, 4]);
+        assert_eq!(
+            Some(ProjectionMask::leaves(&schema, [4])),
+            mask.without_nested_types(&schema)
+        );
+
+        // element --> empty (it is nested)
+        let mask = ProjectionMask::leaves(&schema, [3]);
+        assert_eq!(None, mask.without_nested_types(&schema));
+    }
+
+    #[test]
+    fn test_projection_mask_without_nested_map_only() {
+        // Example from https://github.com/apache/parquet-format/blob/master/LogicalTypes.md
+        let schema = parse_schema(
+            "
+            message test_schema {
+                required group my_map (MAP) {
+                    repeated group key_value {
+                        required binary key (STRING);
+                        optional int32 value;
+                    }
+                }
+            }
+            ",
+        );
+
+        let mask = ProjectionMask::all();
+        assert_eq!(None, mask.without_nested_types(&schema));
+
+        // key --> empty (it is nested)
+        let mask = ProjectionMask::leaves(&schema, [0]);
+        assert_eq!(None, mask.without_nested_types(&schema));
+
+        // value --> empty (it is nested)
+        let mask = ProjectionMask::leaves(&schema, [1]);
+        assert_eq!(None, mask.without_nested_types(&schema));
+    }
+
+    #[test]
+    fn test_projection_mask_without_nested_map_with_non_nested() {
+        // Example from https://github.com/apache/parquet-format/blob/master/LogicalTypes.md
+        // with an additional non-nested field
+        let schema = parse_schema(
+            "
+            message test_schema {
+                REQUIRED INT32 a;
+                required group my_map (MAP) {
+                    repeated group key_value {
+                        required binary key (STRING);
+                        optional int32 value;
+                    }
+                }
+                REQUIRED INT32 b;
+            }
+            ",
+        );
+
+        // all leaves --> a, b which are the only non nested ones
+        let mask = ProjectionMask::all();
+        assert_eq!(
+            Some(ProjectionMask::leaves(&schema, [0, 3])),
+            mask.without_nested_types(&schema)
+        );
+
+        // key, value, b --> b (the only non-nested one)
+        let mask = ProjectionMask::leaves(&schema, [1, 2, 3]);
+        assert_eq!(
+            Some(ProjectionMask::leaves(&schema, [3])),
+            mask.without_nested_types(&schema)
+        );
+
+        // key, value --> NONE
+        let mask = ProjectionMask::leaves(&schema, [1, 2]);
+        assert_eq!(None, mask.without_nested_types(&schema));
+    }
+
+    #[test]
+    fn test_projection_mask_without_nested_deeply_nested() {
+        // Map of Maps
+        let schema = parse_schema(
+            "
+            message test_schema {
+                OPTIONAL group a (MAP) {
+                    REPEATED group key_value {
+                        REQUIRED BYTE_ARRAY key (UTF8);
+                        OPTIONAL group value (MAP) {
+                            REPEATED group key_value {
+                                REQUIRED INT32 key;
+                                REQUIRED BOOLEAN value;
+                            }
+                        }
+                    }
+                }
+                REQUIRED INT32 b;
+                REQUIRED DOUBLE c;
+            ",
+        );
+
+        let mask = ProjectionMask::all();
+        assert_eq!(
+            Some(ProjectionMask::leaves(&schema, [3, 4])),
+            mask.without_nested_types(&schema)
+        );
+
+        // (first) key, c --> c (the only non-nested one)
+        let mask = ProjectionMask::leaves(&schema, [0, 4]);
+        assert_eq!(
+            Some(ProjectionMask::leaves(&schema, [4])),
+            mask.without_nested_types(&schema)
+        );
+
+        // (second) key, value, b --> b (the only non-nested one)
+        let mask = ProjectionMask::leaves(&schema, [1, 2, 3]);
+        assert_eq!(
+            Some(ProjectionMask::leaves(&schema, [3])),
+            mask.without_nested_types(&schema)
+        );
+
+        // key --> NONE (the only non-nested one)
+        let mask = ProjectionMask::leaves(&schema, [0]);
+        assert_eq!(None, mask.without_nested_types(&schema));
+    }
+
+    #[test]
+    fn test_projection_mask_without_nested_list() {
+        // Example from https://github.com/apache/parquet-format/blob/master/LogicalTypes.md#lists
+        let schema = parse_schema(
+            "
+            message test_schema {
+                required group my_list (LIST) {
+                    repeated group list {
+                        optional binary element (STRING);
+                    }
+                }
+                REQUIRED INT32 b;
+            }
+            ",
+        );
+
+        let mask = ProjectionMask::all();
+        assert_eq!(
+            Some(ProjectionMask::leaves(&schema, [1])),
+            mask.without_nested_types(&schema),
+        );
+
+        // element --> empty (it is nested)
+        let mask = ProjectionMask::leaves(&schema, [0]);
+        assert_eq!(None, mask.without_nested_types(&schema));
+
+        // element, b --> b (it is nested)
+        let mask = ProjectionMask::leaves(&schema, [0, 1]);
+        assert_eq!(
+            Some(ProjectionMask::leaves(&schema, [1])),
+            mask.without_nested_types(&schema),
+        );
+    }
+
+    #[test]
+    fn test_projection_mask_without_nested_single_leaf_struct() {
+        // Regression: a single-leaf struct is still nested.
+        let schema = parse_schema(
+            "
+            message test_schema {
+                OPTIONAL group address {
+                    REQUIRED BYTE_ARRAY street (UTF8);
+                }
+                REQUIRED INT32 id;
+            }
+            ",
+        );
+
+        // street -> empty; root is a struct
+        let mask = ProjectionMask::leaves(&schema, [0]);
+        assert_eq!(None, mask.without_nested_types(&schema));
+
+        // street, id --> id only
+        let mask = ProjectionMask::leaves(&schema, [0, 1]);
+        assert_eq!(
+            Some(ProjectionMask::leaves(&schema, [1])),
+            mask.without_nested_types(&schema)
+        );
+
+        // all --> id only
+        let mask = ProjectionMask::all();
+        assert_eq!(
+            Some(ProjectionMask::leaves(&schema, [1])),
+            mask.without_nested_types(&schema)
+        );
+    }
+
+    /// Converts a schema string into a `SchemaDescriptor`
+    fn parse_schema(schema: &str) -> SchemaDescriptor {
+        let parquet_group_type = parse_message_type(schema).unwrap();
+        SchemaDescriptor::new(Arc::new(parquet_group_type))
     }
 }

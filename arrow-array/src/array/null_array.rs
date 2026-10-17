@@ -58,6 +58,9 @@ impl NullArray {
     }
 
     /// Returns a zero-copy slice of this array with the indicated offset and length.
+    ///
+    /// # Panics
+    /// Panics if `offset + len > self.len()`
     pub fn slice(&self, offset: usize, len: usize) -> Self {
         assert!(
             offset.saturating_add(len) <= self.len,
@@ -76,7 +79,8 @@ impl NullArray {
     }
 }
 
-impl Array for NullArray {
+/// SAFETY: Correctly implements the contract of Arrow Arrays
+unsafe impl Array for NullArray {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -132,25 +136,28 @@ impl Array for NullArray {
     fn get_array_memory_size(&self) -> usize {
         std::mem::size_of::<Self>()
     }
+
+    #[cfg(feature = "pool")]
+    fn claim(&self, _pool: &dyn arrow_buffer::MemoryPool) {
+        // NullArray has no buffers to claim
+    }
 }
 
 impl From<ArrayData> for NullArray {
     fn from(data: ArrayData) -> Self {
+        let (data_type, len, nulls, _offset, buffers, _child_data) = data.into_parts();
+
         assert_eq!(
-            data.data_type(),
-            &DataType::Null,
+            data_type,
+            DataType::Null,
             "NullArray data type should be Null"
         );
-        assert_eq!(
-            data.buffers().len(),
-            0,
-            "NullArray data should contain 0 buffers"
-        );
+        assert_eq!(buffers.len(), 0, "NullArray data should contain 0 buffers");
         assert!(
-            data.nulls().is_none(),
+            nulls.is_none(),
             "NullArray data should not contain a null buffer, as no buffers are required"
         );
-        Self { len: data.len() }
+        Self { len }
     }
 }
 
@@ -226,10 +233,10 @@ mod tests {
 
         // Simulate a NULL value in the parent array, for instance, if array being queried by
         // invalid index
-        mutable.extend_nulls(1);
+        mutable.try_extend_nulls(1).unwrap();
         let data = mutable.freeze();
 
         let struct_array = Arc::new(StructArray::from(data.clone()));
-        assert!(make_array(data) == struct_array);
+        assert_eq!(&make_array(data), &(struct_array as ArrayRef));
     }
 }

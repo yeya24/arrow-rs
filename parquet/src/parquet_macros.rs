@@ -31,15 +31,23 @@
 //! [Thrift compact]: https://github.com/apache/thrift/blob/master/doc/specs/thrift-compact-protocol.md#list-and-set
 //! [THRIFT.md]: https://github.com/apache/arrow-rs/blob/main/parquet/THRIFT.md
 
+// These macros generate `allow` attributes for lints that may not fire on every
+// invocation, so we keep `allow` instead of `expect`.
+
+#[doc(hidden)]
 #[macro_export]
+#[expect(clippy::allow_attributes)]
 #[allow(clippy::crate_in_macro_def)]
 /// Macro used to generate rust enums from a Thrift `enum` definition.
 ///
-/// When utilizing this macro the Thrift serialization traits and structs need to be in scope.
+/// Note:
+///  - All enums generated with this macro will have `pub` visibility.
+///  - When utilizing this macro the Thrift serialization traits and structs need to be in scope.
 macro_rules! thrift_enum {
     ($(#[$($def_attrs:tt)*])* enum $identifier:ident { $($(#[$($field_attrs:tt)*])* $field_name:ident = $field_value:literal;)* }) => {
         $(#[$($def_attrs)*])*
         #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        #[allow(clippy::allow_attributes)]
         #[allow(non_camel_case_types)]
         #[allow(missing_docs)]
         pub enum $identifier {
@@ -47,6 +55,7 @@ macro_rules! thrift_enum {
         }
 
         impl<'a, R: ThriftCompactInputProtocol<'a>> ReadThrift<'a, R> for $identifier {
+            #[allow(clippy::allow_attributes)]
             #[allow(deprecated)]
             fn read_thrift(prot: &mut R) -> Result<Self> {
                 let val = prot.read_i32()?;
@@ -78,6 +87,38 @@ macro_rules! thrift_enum {
                 Ok(field_id)
             }
         }
+
+        impl $identifier {
+            #[allow(clippy::allow_attributes)]
+            #[allow(deprecated)]
+            #[doc = "Returns a slice containing every variant of this enum."]
+            #[allow(dead_code)]
+            pub const VARIANTS: &'static [Self] = &[
+                $(Self::$field_name),*
+            ];
+
+            #[allow(clippy::allow_attributes)]
+            #[allow(deprecated)]
+            const fn max_discriminant_impl() -> i32 {
+                let values: &[i32] = &[$($field_value),*];
+                let mut max = values[0];
+                let mut idx = 1;
+                while idx < values.len() {
+                    let candidate = values[idx];
+                    if candidate > max {
+                        max = candidate;
+                    }
+                    idx += 1;
+                }
+                max
+            }
+
+            #[allow(clippy::allow_attributes)]
+            #[allow(deprecated)]
+            #[doc = "Returns the largest discriminant value defined for this enum."]
+            #[allow(dead_code)]
+            pub const MAX_DISCRIMINANT: i32 = Self::max_discriminant_impl();
+        }
     }
 }
 
@@ -90,13 +131,18 @@ macro_rules! thrift_enum {
 ///
 /// The resulting Rust enum will have all unit variants.
 ///
-/// When utilizing this macro the Thrift serialization traits and structs need to be in scope.
+/// Note:
+///  - All enums generated with this macro will have `pub` visibility.
+///  - When utilizing this macro the Thrift serialization traits and structs need to be in scope.
+#[doc(hidden)]
 #[macro_export]
+#[expect(clippy::allow_attributes)]
 #[allow(clippy::crate_in_macro_def)]
 macro_rules! thrift_union_all_empty {
     ($(#[$($def_attrs:tt)*])* union $identifier:ident { $($(#[$($field_attrs:tt)*])* $field_id:literal : $field_type:ident $(< $element_type:ident >)? $field_name:ident $(;)?)* }) => {
         $(#[cfg_attr(not(doctest), $($def_attrs)*)])*
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        #[allow(clippy::allow_attributes)]
         #[allow(non_camel_case_types)]
         #[allow(non_snake_case)]
         #[allow(missing_docs)]
@@ -160,15 +206,19 @@ macro_rules! thrift_union_all_empty {
 /// non-empty type, the typename must be contained within parens (e.g. `1: MyType Var1;` becomes
 /// `1: (MyType) Var1;`).
 ///
-/// This macro allows for specifying lifetime annotations for the resulting `enum` and its fields.
-///
-/// When utilizing this macro the Thrift serialization traits and structs need to be in scope.
+/// Note:
+///  - All enums generated with this macro will have `pub` visibility.
+///  - This macro allows for specifying lifetime annotations for the resulting `enum` and its fields.
+///  - When utilizing this macro the Thrift serialization traits and structs need to be in scope.
+#[doc(hidden)]
 #[macro_export]
+#[expect(clippy::allow_attributes)]
 #[allow(clippy::crate_in_macro_def)]
 macro_rules! thrift_union {
     ($(#[$($def_attrs:tt)*])* union $identifier:ident $(< $lt:lifetime >)? { $($(#[$($field_attrs:tt)*])* $field_id:literal : $( ( $field_type:ident $(< $element_type:ident >)? $(< $field_lt:lifetime >)?) )? $field_name:ident $(;)?)* }) => {
         $(#[cfg_attr(not(doctest), $($def_attrs)*)])*
         #[derive(Clone, Debug, Eq, PartialEq)]
+        #[allow(clippy::allow_attributes)]
         #[allow(non_camel_case_types)]
         #[allow(non_snake_case)]
         #[allow(missing_docs)]
@@ -223,16 +273,102 @@ macro_rules! thrift_union {
     }
 }
 
-/// Macro used to generate Rust structs from a Thrift `struct` definition.
+/// Macro used to generate Rust enums for Thrift unions where variants are a mix of unit and
+/// tuple types. This version allows for unknown variants for forwards compatibility.
 ///
-/// This macro allows for specifying lifetime annotations for the resulting `struct` and its fields.
+/// Use of this macro requires modifying the thrift IDL. For variants with empty structs as their
+/// type, delete the typename (i.e. `1: EmptyStruct Var1;` becomes `1: Var1`). For variants with a
+/// non-empty type, the typename must be contained within parens (e.g. `1: MyType Var1;` becomes
+/// `1: (MyType) Var1;`).
+///
+/// This macro allows for specifying lifetime annotations for the resulting `enum` and its fields.
 ///
 /// When utilizing this macro the Thrift serialization traits and structs need to be in scope.
+#[doc(hidden)]
+#[macro_export]
+#[expect(clippy::allow_attributes)]
+#[allow(clippy::crate_in_macro_def)]
+macro_rules! thrift_union_with_unknown {
+    ($(#[$($def_attrs:tt)*])* union $identifier:ident $(< $lt:lifetime >)? { $($(#[$($field_attrs:tt)*])* $field_id:literal : $( ( $field_type:ident $(< $element_type:ident >)? $(< $field_lt:lifetime >)?) )? $field_name:ident $(;)?)* }) => {
+        $(#[cfg_attr(not(doctest), $($def_attrs)*)])*
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        #[allow(clippy::allow_attributes)]
+        #[allow(non_camel_case_types)]
+        #[allow(non_snake_case)]
+        #[allow(missing_docs)]
+        pub enum $identifier $(<$lt>)? {
+            $($(#[cfg_attr(not(doctest), $($field_attrs)*)])* $field_name $( ( $crate::__thrift_union_type!{$field_type $($field_lt)? $($element_type)?} ) )?),*,
+            _Unknown {
+                /// The field id encountered when parsing the unknown variant.
+                field_id: i16,
+            },
+        }
+
+        impl<'a, R: ThriftCompactInputProtocol<'a>> ReadThrift<'a, R> for $identifier $(<$lt>)? {
+            fn read_thrift(prot: &mut R) -> Result<Self> {
+                let field_ident = prot.read_field_begin(0)?;
+                if field_ident.field_type == FieldType::Stop {
+                    return Err(general_err!("Received empty union from remote {}", stringify!($identifier)));
+                }
+                let ret = match field_ident.id {
+                    $($field_id => {
+                        let val = $crate::__thrift_read_variant!(prot, $field_name $($field_type $($element_type)?)?);
+                        val
+                    })*
+                    _ => {
+                        prot.skip(field_ident.field_type)?;
+                        Self::_Unknown {
+                            field_id: field_ident.id,
+                        }
+                    }
+                };
+                let field_ident = prot.read_field_begin(field_ident.id)?;
+                if field_ident.field_type != FieldType::Stop {
+                    return Err(general_err!(
+                        concat!("Received multiple fields for union from remote {}", stringify!($identifier))
+                    ));
+                }
+                Ok(ret)
+            }
+        }
+
+        impl $(<$lt>)? WriteThrift for $identifier $(<$lt>)? {
+            const ELEMENT_TYPE: ElementType = ElementType::Struct;
+
+            fn write_thrift<W: Write>(&self, writer: &mut ThriftCompactOutputProtocol<W>) -> Result<()> {
+                match self {
+                    $($crate::__thrift_write_variant_lhs!($field_name $($field_type)?, variant_val) =>
+                      $crate::__thrift_write_variant_rhs!($field_id $($field_type)?, writer, variant_val),)*
+                    Self::_Unknown{..} => return Err(general_err!("Trying to write unknown variant")),
+                };
+                writer.write_struct_end()
+            }
+        }
+
+        impl $(<$lt>)? WriteThriftField for $identifier $(<$lt>)? {
+            fn write_thrift_field<W: Write>(&self, writer: &mut ThriftCompactOutputProtocol<W>, field_id: i16, last_field_id: i16) -> Result<i16> {
+                writer.write_field_begin(FieldType::Struct, field_id, last_field_id)?;
+                self.write_thrift(writer)?;
+                Ok(field_id)
+            }
+        }
+    }
+}
+
+/// Macro used to generate Rust structs from a Thrift `struct` definition.
+///
+/// Note:
+///  - This macro allows for specifying the visibility of the resulting `struct` and its fields.
+///    + The `struct` and all fields will have the same visibility.
+///  - This macro allows for specifying lifetime annotations for the resulting `struct` and its fields.
+///  - When utilizing this macro the Thrift serialization traits and structs need to be in scope.
+#[doc(hidden)]
 #[macro_export]
 macro_rules! thrift_struct {
     ($(#[$($def_attrs:tt)*])* $vis:vis struct $identifier:ident $(< $lt:lifetime >)? { $($(#[$($field_attrs:tt)*])* $field_id:literal : $required_or_optional:ident $field_type:ident $(< $field_lt:lifetime >)? $(< $element_type:ident >)? $field_name:ident $(= $default_value:literal)? $(;)?)* }) => {
         $(#[cfg_attr(not(doctest), $($def_attrs)*)])*
         #[derive(Clone, Debug, Eq, PartialEq)]
+        #[allow(clippy::allow_attributes)]
         #[allow(non_camel_case_types)]
         #[allow(non_snake_case)]
         #[allow(missing_docs)]
@@ -270,6 +406,7 @@ macro_rules! thrift_struct {
         impl $(<$lt>)? WriteThrift for $identifier $(<$lt>)? {
             const ELEMENT_TYPE: ElementType = ElementType::Struct;
 
+            #[allow(clippy::allow_attributes)]
             #[allow(unused_assignments)]
             fn write_thrift<W: Write>(&self, writer: &mut ThriftCompactOutputProtocol<W>) -> Result<()> {
                 #[allow(unused_mut, unused_variables)]
@@ -282,6 +419,21 @@ macro_rules! thrift_struct {
         impl $(<$lt>)? WriteThriftField for $identifier $(<$lt>)? {
             fn write_thrift_field<W: Write>(&self, writer: &mut ThriftCompactOutputProtocol<W>, field_id: i16, last_field_id: i16) -> Result<i16> {
                 writer.write_field_begin(FieldType::Struct, field_id, last_field_id)?;
+                self.write_thrift(writer)?;
+                Ok(field_id)
+            }
+        }
+    }
+}
+
+#[doc(hidden)]
+#[macro_export]
+/// Generate `WriteThriftField` implementation for a struct.
+macro_rules! write_thrift_field {
+    ($identifier:ident $(< $lt:lifetime >)?, $fld_type:expr) => {
+        impl $(<$lt>)? WriteThriftField for $identifier $(<$lt>)? {
+            fn write_thrift_field<W: Write>(&self, writer: &mut ThriftCompactOutputProtocol<W>, field_id: i16, last_field_id: i16) -> Result<i16> {
+                writer.write_field_begin($fld_type, field_id, last_field_id)?;
                 self.write_thrift(writer)?;
                 Ok(field_id)
             }
@@ -409,7 +561,7 @@ macro_rules! __thrift_read_field {
         $crate::parquet_thrift::OrderedF64::read_thrift(&mut *$prot)?
     };
     ($prot:tt, $field_ident:tt, bool) => {
-        $field_ident.bool_val.unwrap()
+        $field_ident.bool_val()?
     };
     ($prot:tt, $field_ident:tt, $field_type:ident) => {
         $field_type::read_thrift(&mut *$prot)?

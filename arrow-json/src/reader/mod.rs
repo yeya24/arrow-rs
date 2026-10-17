@@ -49,11 +49,11 @@
 //!
 //! # Async Usage
 //!
-//! The lower-level [`Decoder`] can be integrated with various forms of async data streams,
-//! and is designed to be agnostic to the various different kinds of async IO primitives found
+//! The lower-level [`Decoder`] can be integrated with various forms of async
+//! data streams, and can be used with any of the async IO primitives found
 //! within the Rust ecosystem.
 //!
-//! For example, see below for how it can be used with an arbitrary `Stream` of `Bytes`
+//! For example, it can be used with an arbitrary `Stream` of `Bytes` as shown below
 //!
 //! ```
 //! # use std::task::{Poll, ready};
@@ -132,39 +132,59 @@
 //! }
 //! ```
 //!
+//! # Customizing the decoder
+//!
+//! The decoding of each data type can be customized using
+//! [`ReaderBuilder::with_decoder_factory`]. For example, you can override the
+//! default decoding of binary data from hex strings to decode from an array of
+//! integers instead, or provide decoders for types with no built-in decoding.
+//! See the example on [`DecoderFactory`].
+//!
 
-use crate::StructMode;
 use std::io::BufRead;
 use std::sync::Arc;
 
+use arrow_array::cast::AsArray;
+use arrow_array::timezone::Tz;
+use arrow_array::types::*;
+use arrow_array::{ArrayRef, RecordBatch, RecordBatchReader, downcast_integer};
+use arrow_schema::{ArrowError, DataType, Field, FieldRef, Schema, SchemaRef, TimeUnit};
 use chrono::Utc;
 use serde_core::Serialize;
 
-use arrow_array::timezone::Tz;
-use arrow_array::types::*;
-use arrow_array::{RecordBatch, RecordBatchReader, StructArray, downcast_integer, make_array};
-use arrow_data::ArrayData;
-use arrow_schema::{ArrowError, DataType, FieldRef, Schema, SchemaRef, TimeUnit};
-pub use schema::*;
-
+use crate::StructMode;
+use crate::reader::binary_array::{
+    BinaryArrayDecoder, BinaryViewDecoder, FixedSizeBinaryArrayDecoder,
+};
 use crate::reader::boolean_array::BooleanArrayDecoder;
 use crate::reader::decimal_array::DecimalArrayDecoder;
-use crate::reader::list_array::ListArrayDecoder;
+use crate::reader::list_array::{
+    FixedSizeListArrayDecoder, ListArrayDecoder, ListViewArrayDecoder,
+};
 use crate::reader::map_array::MapArrayDecoder;
 use crate::reader::null_array::NullArrayDecoder;
 use crate::reader::primitive_array::PrimitiveArrayDecoder;
+use crate::reader::run_end_array::RunEndEncodedArrayDecoder;
 use crate::reader::string_array::StringArrayDecoder;
 use crate::reader::string_view_array::StringViewArrayDecoder;
 use crate::reader::struct_array::StructArrayDecoder;
-use crate::reader::tape::{Tape, TapeDecoder};
+use crate::reader::tape::{TapeDecoder, TapeDecoderOptions};
 use crate::reader::timestamp_array::TimestampArrayDecoder;
 
+pub use schema::*;
+// `mod tape` is private by design: exposing only these two types means downstream can read a
+// `Tape` but not construct one, keeping `TapeDecoder` an implementation detail.
+pub use tape::{Tape, TapeElement};
+pub use value_iter::ValueIter;
+
+mod binary_array;
 mod boolean_array;
 mod decimal_array;
 mod list_array;
 mod map_array;
 mod null_array;
 mod primitive_array;
+mod run_end_array;
 mod schema;
 mod serializer;
 mod string_array;
@@ -172,15 +192,19 @@ mod string_view_array;
 mod struct_array;
 mod tape;
 mod timestamp_array;
+mod value_iter;
 
 /// A builder for [`Reader`] and [`Decoder`]
+#[derive(Clone)]
 pub struct ReaderBuilder {
     batch_size: usize,
     coerce_primitive: bool,
     strict_mode: bool,
+    ignore_type_conflicts: bool,
     is_field: bool,
     struct_mode: StructMode,
-
+    flatten_top_level_arrays: bool,
+    decoder_factory: Option<Arc<dyn DecoderFactory>>,
     schema: SchemaRef,
 }
 
@@ -198,8 +222,11 @@ impl ReaderBuilder {
             batch_size: 1024,
             coerce_primitive: false,
             strict_mode: false,
+            ignore_type_conflicts: false,
             is_field: false,
             struct_mode: Default::default(),
+            flatten_top_level_arrays: false,
+            decoder_factory: None,
             schema,
         }
     }
@@ -239,8 +266,11 @@ impl ReaderBuilder {
             batch_size: 1024,
             coerce_primitive: false,
             strict_mode: false,
+            ignore_type_conflicts: false,
             is_field: true,
             struct_mode: Default::default(),
+            flatten_top_level_arrays: false,
+            decoder_factory: None,
             schema: Arc::new(Schema::new([field.into()])),
         }
     }
@@ -281,6 +311,56 @@ impl ReaderBuilder {
         }
     }
 
+    /// Sets whether the decoder should produce NULL instead of returning an error if it encounters
+    /// value that can not be parsed into the specified column type.
+    ///
+    /// For example, if the type is declared to be a nullable array of `DataType::Int32` but the
+    /// reader encounters a string value `"foo"` and the value `ignore_type_conflicts` is:
+    ///
+    /// * `false` (the default): The reader will return an error.
+    ///
+    /// * `true`: The reader will fill in NULL value for that array element.
+    ///
+    /// NOTE: An inferred NULL due to a type conflict will still produce parsing errors for
+    /// non-nullable fields, the same as any other NULL or missing value.
+    pub fn with_ignore_type_conflicts(self, ignore_type_conflicts: bool) -> Self {
+        Self {
+            ignore_type_conflicts,
+            ..self
+        }
+    }
+    /// Sets whether to flatten top-level arrays.
+    ///
+    /// * When `true`, each element of a top-level array will be treated as its own row.
+    /// * When `false` (the default), the entire top-level array will be treated as one row.
+    ///
+    /// For example, consider this input file:
+    /// ```text
+    /// [{ "a": 1 }, { "a": 2 }, { "b": 3 }]
+    /// [{ "a": 4 }, { "a": 5 }, { "b": 6 }]
+    /// ```
+    ///
+    /// By default, this would be parsed as two rows, each an array containing three elements.
+    /// With this option set to `true`, however, this would be parsed as six rows.
+    ///
+    /// Note that even with this option set to `true`, top-level objects are still permitted
+    /// and will be parsed as individual rows in the exact same manner as when this option is
+    /// set to `false`. It is even possible to mix top-level arrays with top-level objects.
+    pub fn with_flatten(self, flatten_top_level_arrays: bool) -> Self {
+        Self {
+            flatten_top_level_arrays,
+            ..self
+        }
+    }
+
+    /// Set a hook for customizing decoding behavior. See [`DecoderFactory`].
+    pub fn with_decoder_factory(self, decoder_factory: Arc<dyn DecoderFactory>) -> Self {
+        Self {
+            decoder_factory: Some(decoder_factory),
+            ..self
+        }
+    }
+
     /// Create a [`Reader`] with the provided [`BufRead`]
     pub fn build<R: BufRead>(self, reader: R) -> Result<Reader<R>, ArrowError> {
         Ok(Reader {
@@ -291,28 +371,35 @@ impl ReaderBuilder {
 
     /// Create a [`Decoder`]
     pub fn build_decoder(self) -> Result<Decoder, ArrowError> {
-        let (data_type, nullable) = match self.is_field {
-            false => (DataType::Struct(self.schema.fields.clone()), false),
-            true => {
-                let field = &self.schema.fields[0];
-                (field.data_type().clone(), field.is_nullable())
-            }
+        let (field, nullable) = if self.is_field {
+            let field = self.schema.fields[0].clone();
+            let nullable = field.is_nullable();
+            (field, nullable)
+        } else {
+            // The root has no field of its own; synthesize a nameless one
+            let data_type = DataType::Struct(self.schema.fields.clone());
+            (Arc::new(Field::new("", data_type, false)), false)
         };
 
-        let decoder = make_decoder(
-            data_type,
-            self.coerce_primitive,
-            self.strict_mode,
-            nullable,
-            self.struct_mode,
-        )?;
+        let ctx = DecoderContext {
+            coerce_primitive: self.coerce_primitive,
+            strict_mode: self.strict_mode,
+            struct_mode: self.struct_mode,
+            ignore_type_conflicts: self.ignore_type_conflicts,
+            decoder_factory: self.decoder_factory,
+        };
+        let decoder = ctx.make_decoder(&field, nullable)?;
 
         let num_fields = self.schema.flattened_fields().len();
 
         Ok(Decoder {
             decoder,
             is_field: self.is_field,
-            tape_decoder: TapeDecoder::new(self.batch_size, num_fields),
+            tape_decoder: TapeDecoder::new(TapeDecoderOptions {
+                batch_size: self.batch_size,
+                num_fields,
+                flatten_top_level_arrays: self.flatten_top_level_arrays,
+            }),
             batch_size: self.batch_size,
             schema: self.schema,
         })
@@ -649,20 +736,20 @@ impl Decoder {
 
         // First offset is null sentinel
         let mut next_object = 1;
-        let pos: Vec<_> = (0..tape.num_rows())
+        let pos = (0..tape.num_rows())
             .map(|_| {
-                let next = tape.next(next_object, "row").unwrap();
-                std::mem::replace(&mut next_object, next)
+                let next = tape.next(next_object, "row")?;
+                Ok(std::mem::replace(&mut next_object, next))
             })
-            .collect();
+            .collect::<Result<Vec<_>, ArrowError>>()?;
 
         let decoded = self.decoder.decode(&tape, &pos)?;
         self.tape_decoder.clear();
 
         let batch = match self.is_field {
-            true => RecordBatch::try_new(self.schema.clone(), vec![make_array(decoded)])?,
+            true => RecordBatch::try_new(self.schema.clone(), vec![decoded])?,
             false => {
-                RecordBatch::from(StructArray::from(decoded)).with_schema(self.schema.clone())?
+                RecordBatch::from(decoded.as_struct().clone()).with_schema(self.schema.clone())?
             }
         };
 
@@ -670,57 +757,402 @@ impl Decoder {
     }
 }
 
-trait ArrayDecoder: Send {
+/// Decodes a column of JSON values from a [`Tape`] into an [`ArrayRef`]
+///
+/// Implement alongside [`DecoderFactory`] to override or add support for a type.
+pub trait ArrayDecoder: Send {
     /// Decode elements from `tape` starting at the indexes contained in `pos`
-    fn decode(&mut self, tape: &Tape<'_>, pos: &[u32]) -> Result<ArrayData, ArrowError>;
+    ///
+    /// `pos` contains one tape index per output row, so the returned array must have
+    /// exactly `pos.len()` elements and the field's data type. A row's value may be
+    /// [`TapeElement::Null`].
+    fn decode(&mut self, tape: &Tape<'_>, pos: &[u32]) -> Result<ArrayRef, ArrowError>;
 }
 
-macro_rules! primitive_decoder {
-    ($t:ty, $data_type:expr) => {
-        Ok(Box::new(PrimitiveArrayDecoder::<$t>::new($data_type)))
-    };
+/// A trait to create custom decoders for specific data types.
+///
+/// Overrides the reader's decoder for a data type, or adds support for one it does not
+/// handle. The reader-side counterpart of [`EncoderFactory`]; register an
+/// implementation with [`ReaderBuilder::with_decoder_factory`].
+///
+/// # Example: Decode `Binary` from a JSON array of integers
+///
+/// This example shows how to decode a `Binary` column from a JSON array of
+/// integers, e.g. `[104, 105]` for the bytes `b"hi"`, as created by the
+/// example in [`EncoderFactory`].
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use arrow_array::{Array, ArrayRef, BinaryArray};
+/// # use arrow_array::types::Float64Type;
+/// # use arrow_array::cast::AsArray;
+/// # use arrow_json::reader::{ArrayDecoder, DecoderContext, DecoderFactory, Tape, TapeElement};
+/// # use arrow_json::ReaderBuilder;
+/// # use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema};
+///
+/// /// Decodes `[104, 105]` into the bytes `b"hi"`
+/// struct IntArrayBinaryDecoder;
+///
+/// impl ArrayDecoder for IntArrayBinaryDecoder {
+///     fn decode(&mut self, tape: &Tape<'_>, pos: &[u32]) -> Result<ArrayRef, ArrowError> {
+///         let mut values: Vec<Option<Vec<u8>>> = Vec::with_capacity(pos.len());
+///         for p in pos {
+///             match tape.get(*p) {
+///                 TapeElement::Null => values.push(None),
+///                 TapeElement::StartList(end) => {
+///                     let mut bytes = Vec::new();
+///                     let mut cur = p + 1;
+///                     while cur < end {
+///                         match tape.get(cur) {
+///                             // JSON text yields `Number`; serde yields `I32`
+///                             TapeElement::Number(idx) => {
+///                                 let s = tape.get_string(idx);
+///                                 bytes.push(s.parse::<u8>().map_err(|e| {
+///                                     ArrowError::JsonError(format!("invalid byte {s}: {e}"))
+///                                 })?);
+///                             }
+///                             TapeElement::I32(v) => bytes.push(v as u8),
+///                             _ => return Err(tape.error(cur, "byte")),
+///                         }
+///                         cur = tape.next(cur, "byte")?;
+///                     }
+///                     values.push(Some(bytes));
+///                 }
+///                 _ => return Err(tape.error(*p, "list of bytes")),
+///             }
+///         }
+///         Ok(Arc::new(BinaryArray::from_iter(values.iter().map(|v| v.as_deref()))))
+///     }
+/// }
+///
+/// /// A factory that overrides the reader's default decoder for `Binary` to decode from an array of integers
+/// #[derive(Debug)]
+/// struct IntArrayBinaryDecoderFactory;
+///
+/// impl DecoderFactory for IntArrayBinaryDecoderFactory {
+///     fn make_default_decoder(
+///         &self,
+///         ctx: &DecoderContext,
+///         field: &FieldRef,
+///         is_nullable: bool,
+///     ) -> Result<Option<Box<dyn ArrayDecoder>>, ArrowError> {
+///         match field.data_type() {
+///             DataType::Binary => Ok(Some(Box::new(IntArrayBinaryDecoder))),
+///             // Returning `None` uses the reader's default decoder
+///             _ => Ok(None),
+///         }
+///     }
+/// }
+///
+/// let nested = Fields::from(vec![Field::new("inner", DataType::Binary, true)]);
+/// let schema = Arc::new(Schema::new(vec![
+///     Field::new("bytes", DataType::Binary, true),
+///     Field::new("float", DataType::Float64, true),
+///     Field::new("nested", DataType::Struct(nested), true),
+/// ]));
+///
+/// let json = r#"{"bytes": [104, 105], "float": 1.0, "nested": {"inner": [104, 105]}}
+/// {"float": 2.3}
+/// {"bytes": [98], "nested": {"inner": [98]}}
+/// "#;
+///
+/// let batch = ReaderBuilder::new(schema)
+///     .with_decoder_factory(Arc::new(IntArrayBinaryDecoderFactory))
+///     .build(json.as_bytes())
+///     .unwrap()
+///     .next()
+///     .unwrap()
+///     .unwrap();
+///
+/// let bytes = batch.column(0).as_binary::<i32>();
+/// assert_eq!(bytes.value(0), b"hi");
+/// assert!(bytes.is_null(1));
+/// assert_eq!(bytes.value(2), b"b");
+///
+/// // The override applies wherever `Binary` appears, including nested, while types
+/// // the factory declines are decoded as usual
+/// let inner = batch.column(2).as_struct().column(0).as_binary::<i32>();
+/// assert_eq!(inner.value(0), b"hi");
+/// assert_eq!(batch.column(1).as_primitive::<Float64Type>().value(0), 1.0);
+/// ```
+///
+/// # Example: Decode an [extension type] from a JSON string
+///
+/// The choice of decoder can also depend on field metadata rather than just
+/// the data type, for example to recognize an [extension type]. The reader's
+/// own decoder for the field can be invoked with
+/// [`DecoderContext::make_builtin_decoder`].
+///
+/// This example upper-cases the strings produced by the builtin `Utf8` decoder
+/// for a fictional extension type `apache.shout`.
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use arrow_array::{ArrayRef, StringArray};
+/// # use arrow_array::cast::AsArray;
+/// # use arrow_json::reader::{ArrayDecoder, DecoderContext, DecoderFactory, Tape};
+/// # use arrow_json::ReaderBuilder;
+/// # use arrow_schema::{ArrowError, DataType, Field, FieldRef, Schema};
+/// # use arrow_schema::extension::EXTENSION_TYPE_NAME_KEY;
+///
+/// /// Upper-cases whatever the reader's own decoder produced
+/// struct ShoutDecoder(Box<dyn ArrayDecoder>);
+///
+/// impl ArrayDecoder for ShoutDecoder {
+///     fn decode(&mut self, tape: &Tape<'_>, pos: &[u32]) -> Result<ArrayRef, ArrowError> {
+///         let inner = self.0.decode(tape, pos)?;
+///         let values = inner.as_string::<i32>();
+///         Ok(Arc::new(StringArray::from_iter(
+///             values.iter().map(|v| v.map(str::to_uppercase)),
+///         )))
+///     }
+/// }
+///
+/// /// A factory that recognizes the `apache.shout` extension type and upper-cases its strings
+/// #[derive(Debug)]
+/// struct ShoutDecoderFactory;
+///
+/// impl DecoderFactory for ShoutDecoderFactory {
+///     fn make_default_decoder(
+///         &self,
+///         ctx: &DecoderContext,
+///         field: &FieldRef,
+///         is_nullable: bool,
+///     ) -> Result<Option<Box<dyn ArrayDecoder>>, ArrowError> {
+///         if field.metadata().get(EXTENSION_TYPE_NAME_KEY).map(String::as_str)
+///             == Some("apache.shout")
+///         {
+///             let inner = ctx.make_builtin_decoder(field, is_nullable)?;
+///             return Ok(Some(Box::new(ShoutDecoder(inner))));
+///         }
+///         Ok(None)
+///     }
+/// }
+///
+/// let schema = Arc::new(Schema::new(vec![
+///     Field::new("shout", DataType::Utf8, true)
+///         .with_metadata([(EXTENSION_TYPE_NAME_KEY, "apache.shout")]),
+///     Field::new("plain", DataType::Utf8, true),
+/// ]));
+///
+/// let json = r#"{"shout": "hi", "plain": "hi"}"#;
+///
+/// let batch = ReaderBuilder::new(schema)
+///     .with_decoder_factory(Arc::new(ShoutDecoderFactory))
+///     .build(json.as_bytes())
+///     .unwrap()
+///     .next()
+///     .unwrap()
+///     .unwrap();
+///
+/// // Dispatched on metadata, and decoded by the reader's own `Utf8` decoder
+/// assert_eq!(batch.column(0).as_string::<i32>().value(0), "HI");
+/// // The factory declines fields without the extension type, so they are decoded as usual
+/// assert_eq!(batch.column(1).as_string::<i32>().value(0), "hi");
+/// ```
+///
+/// [`EncoderFactory`]: crate::EncoderFactory
+/// [extension type]: https://arrow.apache.org/docs/format/Columnar.html#extension-types
+pub trait DecoderFactory: std::fmt::Debug + Send + Sync {
+    /// Make a decoder for `field`, or `Ok(None)` to use the reader's default.
+    ///
+    /// Receives the [`FieldRef`] rather than just its [`DataType`] so decoder
+    /// selection can consider the field's metadata, e.g. to identify [extension
+    /// types]. The root of a [`ReaderBuilder::new`] schema is presented as a
+    /// synthesized nameless `Struct` field.
+    ///
+    /// Use [`DecoderContext::make_decoder`] on `ctx` to build child decoders, and
+    /// [`DecoderContext::make_builtin_decoder`] to build on the reader's own decoder
+    /// for this field. Calling `make_decoder` with the field this was invoked with
+    /// recurses back here and loops.
+    ///
+    /// `is_nullable` folds in ancestor nullability, so it may differ from
+    /// `field.is_nullable()` in either direction: a nullable struct widens its
+    /// children, while a run-end encoded array narrows its values.
+    ///
+    /// [extension types]: https://arrow.apache.org/docs/format/Columnar.html#extension-types
+    fn make_default_decoder(
+        &self,
+        _ctx: &DecoderContext,
+        _field: &FieldRef,
+        _is_nullable: bool,
+    ) -> Result<Option<Box<dyn ArrayDecoder>>, ArrowError> {
+        Ok(None)
+    }
+}
+
+/// Validates the output of a [`DecoderFactory`] decoder before it reaches the arrays
+/// built from it, some of which are constructed without further checks.
+struct CheckedDecoder {
+    inner: Box<dyn ArrayDecoder>,
+    data_type: DataType,
+}
+
+impl ArrayDecoder for CheckedDecoder {
+    fn decode(&mut self, tape: &Tape<'_>, pos: &[u32]) -> Result<ArrayRef, ArrowError> {
+        let array = self.inner.decode(tape, pos)?;
+        if array.data_type() != &self.data_type {
+            return Err(ArrowError::JsonError(format!(
+                "custom decoder returned {} for a field of type {}",
+                array.data_type(),
+                self.data_type
+            )));
+        }
+        if array.len() != pos.len() {
+            return Err(ArrowError::JsonError(format!(
+                "custom decoder returned {} values for {} rows",
+                array.len(),
+                pos.len()
+            )));
+        }
+        Ok(array)
+    }
+}
+
+/// Context for decoder creation, containing configuration.
+///
+/// This context is passed through the decoder creation process and contains
+/// all the configuration needed to create decoders recursively.
+pub struct DecoderContext {
+    /// Whether to coerce primitives to strings
+    coerce_primitive: bool,
+    /// Whether to validate struct fields strictly
+    strict_mode: bool,
+    /// How to decode struct fields
+    struct_mode: StructMode,
+    /// Whether to treat columns with incompatible types as missing (i.e. NULL)
+    ignore_type_conflicts: bool,
+    /// An optional hook for customizing decoding behavior
+    decoder_factory: Option<Arc<dyn DecoderFactory>>,
+}
+
+impl DecoderContext {
+    /// Returns whether to coerce primitive types (e.g., number to string)
+    pub fn coerce_primitive(&self) -> bool {
+        self.coerce_primitive
+    }
+
+    /// Returns whether to validate struct fields strictly
+    pub fn strict_mode(&self) -> bool {
+        self.strict_mode
+    }
+
+    /// Returns how to decode struct fields
+    pub fn struct_mode(&self) -> StructMode {
+        self.struct_mode
+    }
+
+    /// Returns whether to treat columns with incompatible types as missing (i.e. NULL)
+    pub fn ignore_type_conflicts(&self) -> bool {
+        self.ignore_type_conflicts
+    }
+
+    /// Returns the optional hook for customizing decoding behavior
+    pub fn decoder_factory(&self) -> Option<&Arc<dyn DecoderFactory>> {
+        self.decoder_factory.as_ref()
+    }
+
+    /// Create a decoder for a type.
+    ///
+    /// This is the standard way to create child decoders from within a decoder
+    /// implementation.
+    pub fn make_decoder(
+        &self,
+        field: &FieldRef,
+        is_nullable: bool,
+    ) -> Result<Box<dyn ArrayDecoder>, ArrowError> {
+        make_decoder(self, field, is_nullable)
+    }
+
+    /// Create the decoder the reader would use for `field`, ignoring any
+    /// [`DecoderFactory`].
+    ///
+    /// Lets a factory build on the reader's own decoder, including for the field it was
+    /// asked about — which [`Self::make_decoder`] cannot do without looping.
+    pub fn make_builtin_decoder(
+        &self,
+        field: &FieldRef,
+        is_nullable: bool,
+    ) -> Result<Box<dyn ArrayDecoder>, ArrowError> {
+        make_builtin_decoder(self, field, is_nullable)
+    }
 }
 
 fn make_decoder(
-    data_type: DataType,
-    coerce_primitive: bool,
-    strict_mode: bool,
+    ctx: &DecoderContext,
+    field: &FieldRef,
     is_nullable: bool,
-    struct_mode: StructMode,
 ) -> Result<Box<dyn ArrayDecoder>, ArrowError> {
+    if let Some(factory) = ctx.decoder_factory()
+        && let Some(decoder) = factory.make_default_decoder(ctx, field, is_nullable)?
+    {
+        return Ok(Box::new(CheckedDecoder {
+            inner: decoder,
+            data_type: field.data_type().clone(),
+        }));
+    }
+
+    make_builtin_decoder(ctx, field, is_nullable)
+}
+
+fn make_builtin_decoder(
+    ctx: &DecoderContext,
+    field: &FieldRef,
+    is_nullable: bool,
+) -> Result<Box<dyn ArrayDecoder>, ArrowError> {
+    let data_type = field.data_type();
+
+    macro_rules! primitive_decoder {
+        ($t:ty, $data_type:expr) => {
+            Ok(Box::new(PrimitiveArrayDecoder::<$t>::new(ctx, $data_type)))
+        };
+    }
+    macro_rules! timestamp_decoder {
+        ($t:ty, $data_type:expr, $tz:expr) => {{
+            Ok(Box::new(TimestampArrayDecoder::<$t, _>::new(
+                ctx, $data_type, $tz,
+            )))
+        }};
+    }
+    macro_rules! decimal_decoder {
+        ($t:ty, $p:expr, $s:expr) => {
+            Ok(Box::new(DecimalArrayDecoder::<$t>::new(ctx, $p, $s)))
+        };
+    }
+
     downcast_integer! {
-        data_type => (primitive_decoder, data_type),
-        DataType::Null => Ok(Box::<NullArrayDecoder>::default()),
+        *data_type => (primitive_decoder, data_type),
+        DataType::Null => Ok(Box::new(NullArrayDecoder::new(ctx))),
         DataType::Float16 => primitive_decoder!(Float16Type, data_type),
         DataType::Float32 => primitive_decoder!(Float32Type, data_type),
         DataType::Float64 => primitive_decoder!(Float64Type, data_type),
         DataType::Timestamp(TimeUnit::Second, None) => {
-            Ok(Box::new(TimestampArrayDecoder::<TimestampSecondType, _>::new(data_type, Utc)))
+            timestamp_decoder!(TimestampSecondType, data_type, Utc)
         },
         DataType::Timestamp(TimeUnit::Millisecond, None) => {
-            Ok(Box::new(TimestampArrayDecoder::<TimestampMillisecondType, _>::new(data_type, Utc)))
+            timestamp_decoder!(TimestampMillisecondType, data_type, Utc)
         },
         DataType::Timestamp(TimeUnit::Microsecond, None) => {
-            Ok(Box::new(TimestampArrayDecoder::<TimestampMicrosecondType, _>::new(data_type, Utc)))
+            timestamp_decoder!(TimestampMicrosecondType, data_type, Utc)
         },
         DataType::Timestamp(TimeUnit::Nanosecond, None) => {
-            Ok(Box::new(TimestampArrayDecoder::<TimestampNanosecondType, _>::new(data_type, Utc)))
+            timestamp_decoder!(TimestampNanosecondType, data_type, Utc)
         },
         DataType::Timestamp(TimeUnit::Second, Some(ref tz)) => {
             let tz: Tz = tz.parse()?;
-            Ok(Box::new(TimestampArrayDecoder::<TimestampSecondType, _>::new(data_type, tz)))
+            timestamp_decoder!(TimestampSecondType, data_type, tz)
         },
         DataType::Timestamp(TimeUnit::Millisecond, Some(ref tz)) => {
             let tz: Tz = tz.parse()?;
-            Ok(Box::new(TimestampArrayDecoder::<TimestampMillisecondType, _>::new(data_type, tz)))
+            timestamp_decoder!(TimestampMillisecondType, data_type, tz)
         },
         DataType::Timestamp(TimeUnit::Microsecond, Some(ref tz)) => {
             let tz: Tz = tz.parse()?;
-            Ok(Box::new(TimestampArrayDecoder::<TimestampMicrosecondType, _>::new(data_type, tz)))
+            timestamp_decoder!(TimestampMicrosecondType, data_type, tz)
         },
         DataType::Timestamp(TimeUnit::Nanosecond, Some(ref tz)) => {
             let tz: Tz = tz.parse()?;
-            Ok(Box::new(TimestampArrayDecoder::<TimestampNanosecondType, _>::new(data_type, tz)))
+            timestamp_decoder!(TimestampNanosecondType, data_type, tz)
         },
         DataType::Date32 => primitive_decoder!(Date32Type, data_type),
         DataType::Date64 => primitive_decoder!(Date64Type, data_type),
@@ -732,37 +1164,49 @@ fn make_decoder(
         DataType::Duration(TimeUnit::Microsecond) => primitive_decoder!(DurationMicrosecondType, data_type),
         DataType::Duration(TimeUnit::Millisecond) => primitive_decoder!(DurationMillisecondType, data_type),
         DataType::Duration(TimeUnit::Second) => primitive_decoder!(DurationSecondType, data_type),
-        DataType::Decimal32(p, s) => Ok(Box::new(DecimalArrayDecoder::<Decimal32Type>::new(p, s))),
-        DataType::Decimal64(p, s) => Ok(Box::new(DecimalArrayDecoder::<Decimal64Type>::new(p, s))),
-        DataType::Decimal128(p, s) => Ok(Box::new(DecimalArrayDecoder::<Decimal128Type>::new(p, s))),
-        DataType::Decimal256(p, s) => Ok(Box::new(DecimalArrayDecoder::<Decimal256Type>::new(p, s))),
-        DataType::Boolean => Ok(Box::<BooleanArrayDecoder>::default()),
-        DataType::Utf8 => Ok(Box::new(StringArrayDecoder::<i32>::new(coerce_primitive))),
-        DataType::Utf8View => Ok(Box::new(StringViewArrayDecoder::new(coerce_primitive))),
-        DataType::LargeUtf8 => Ok(Box::new(StringArrayDecoder::<i64>::new(coerce_primitive))),
-        DataType::List(_) => Ok(Box::new(ListArrayDecoder::<i32>::new(data_type, coerce_primitive, strict_mode, is_nullable, struct_mode)?)),
-        DataType::LargeList(_) => Ok(Box::new(ListArrayDecoder::<i64>::new(data_type, coerce_primitive, strict_mode, is_nullable, struct_mode)?)),
-        DataType::Struct(_) => Ok(Box::new(StructArrayDecoder::new(data_type, coerce_primitive, strict_mode, is_nullable, struct_mode)?)),
-        DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => {
-            Err(ArrowError::JsonError(format!("{data_type} is not supported by JSON")))
-        }
-        DataType::Map(_, _) => Ok(Box::new(MapArrayDecoder::new(data_type, coerce_primitive, strict_mode, is_nullable, struct_mode)?)),
-        d => Err(ArrowError::NotYetImplemented(format!("Support for {d} in JSON reader")))
+        DataType::Decimal32(p, s) => decimal_decoder!(Decimal32Type, p, s),
+        DataType::Decimal64(p, s) => decimal_decoder!(Decimal64Type, p, s),
+        DataType::Decimal128(p, s) => decimal_decoder!(Decimal128Type, p, s),
+        DataType::Decimal256(p, s) => decimal_decoder!(Decimal256Type, p, s),
+        DataType::Boolean => Ok(Box::new(BooleanArrayDecoder::new(ctx))),
+        DataType::Utf8 => Ok(Box::new(StringArrayDecoder::<i32>::new(ctx))),
+        DataType::Utf8View => Ok(Box::new(StringViewArrayDecoder::new(ctx))),
+        DataType::LargeUtf8 => Ok(Box::new(StringArrayDecoder::<i64>::new(ctx))),
+        DataType::List(_) => Ok(Box::new(ListArrayDecoder::<i32>::new(ctx, data_type, is_nullable)?)),
+        DataType::LargeList(_) => Ok(Box::new(ListArrayDecoder::<i64>::new(ctx, data_type, is_nullable)?)),
+        DataType::ListView(_) => Ok(Box::new(ListViewArrayDecoder::<i32>::new(ctx, data_type, is_nullable)?)),
+        DataType::LargeListView(_) => Ok(Box::new(ListViewArrayDecoder::<i64>::new(ctx, data_type, is_nullable)?)),
+        DataType::FixedSizeList(_, _) => Ok(Box::new(FixedSizeListArrayDecoder::new(ctx, data_type, is_nullable)?)),
+        DataType::Struct(_) => Ok(Box::new(StructArrayDecoder::new(ctx, data_type, is_nullable)?)),
+        DataType::Binary => Ok(Box::new(BinaryArrayDecoder::<i32>::default())),
+        DataType::LargeBinary => Ok(Box::new(BinaryArrayDecoder::<i64>::default())),
+        DataType::FixedSizeBinary(len) => Ok(Box::new(FixedSizeBinaryArrayDecoder::new(len))),
+        DataType::BinaryView => Ok(Box::new(BinaryViewDecoder::default())),
+        DataType::Map(_, _) => Ok(Box::new(MapArrayDecoder::new(ctx, data_type, is_nullable)?)),
+        DataType::RunEndEncoded(ref r, _) => match r.data_type() {
+            DataType::Int16 => Ok(Box::new(RunEndEncodedArrayDecoder::<Int16Type>::new(ctx, data_type, is_nullable)?)),
+            DataType::Int32 => Ok(Box::new(RunEndEncodedArrayDecoder::<Int32Type>::new(ctx, data_type, is_nullable)?)),
+            DataType::Int64 => Ok(Box::new(RunEndEncodedArrayDecoder::<Int64Type>::new(ctx, data_type, is_nullable)?)),
+            d => unreachable!("unsupported run end index type: {d}"),
+        },
+        _ => Err(ArrowError::NotYetImplemented(format!("Support for {data_type} in JSON reader")))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use arrow_array::cast::AsArray;
+    use arrow_array::{
+        Array, BooleanArray, Float64Array, GenericListViewArray, Int32Array, ListArray, MapArray,
+        NullArray, OffsetSizeTrait, StringArray, StringViewArray, StructArray,
+    };
+    use arrow_buffer::{ArrowNativeType, NullBuffer, OffsetBuffer, ScalarBuffer};
+    use arrow_cast::display::{ArrayFormatter, FormatOptions};
+    use arrow_schema::{Field, Fields};
     use serde_json::json;
     use std::fs::File;
     use std::io::{BufReader, Cursor, Seek};
-
-    use arrow_array::cast::AsArray;
-    use arrow_array::{Array, BooleanArray, Float64Array, ListArray, StringArray, StringViewArray};
-    use arrow_buffer::{ArrowNativeType, Buffer};
-    use arrow_cast::display::{ArrayFormatter, FormatOptions};
-    use arrow_data::ArrayDataBuilder;
-    use arrow_schema::{Field, Fields};
+    use std::sync::Mutex;
 
     use super::*;
 
@@ -773,13 +1217,21 @@ mod tests {
         strict_mode: bool,
         schema: SchemaRef,
     ) -> Vec<RecordBatch> {
+        let config = ReaderBuilder::new(schema)
+            .with_batch_size(batch_size)
+            .with_strict_mode(strict_mode)
+            .with_coerce_primitive(coerce_primitive);
+        do_read_config(buf, config)
+    }
+
+    fn do_read_config(buf: &str, builder: ReaderBuilder) -> Vec<RecordBatch> {
         let mut unbuffered = vec![];
 
         // Test with different batch sizes to test for boundary conditions
-        for batch_size in [1, 3, 100, batch_size] {
-            unbuffered = ReaderBuilder::new(schema.clone())
+        for batch_size in [1, 3, 100, builder.batch_size] {
+            unbuffered = builder
+                .clone()
                 .with_batch_size(batch_size)
-                .with_coerce_primitive(coerce_primitive)
                 .build(Cursor::new(buf.as_bytes()))
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
@@ -791,10 +1243,9 @@ mod tests {
 
             // Test with different buffer sizes to test for boundary conditions
             for b in [1, 3, 5] {
-                let buffered = ReaderBuilder::new(schema.clone())
+                let buffered = builder
+                    .clone()
                     .with_batch_size(batch_size)
-                    .with_coerce_primitive(coerce_primitive)
-                    .with_strict_mode(strict_mode)
                     .build(BufReader::with_capacity(b, Cursor::new(buf.as_bytes())))
                     .unwrap()
                     .collect::<Result<Vec<_>, _>>()
@@ -1183,9 +1634,13 @@ mod tests {
         "#;
         let map = Field::new_map(
             "map",
-            "entries",
-            Field::new("key", DataType::Utf8, false),
-            Field::new_list("value", Field::new("element", DataType::Utf8, true), true),
+            Field::MAP_ENTRIES_FIELD_DEFAULT_NAME,
+            Field::new(Field::MAP_KEY_FIELD_DEFAULT_NAME, DataType::Utf8, false),
+            Field::new_list(
+                Field::MAP_VALUE_FIELD_DEFAULT_NAME,
+                Field::new("element", DataType::Utf8, true),
+                true,
+            ),
             false,
             true,
         );
@@ -1215,6 +1670,31 @@ mod tests {
         assert_eq!(formatter.value(0).to_string(), "{a: [foo, null]}");
         assert_eq!(formatter.value(1).to_string(), "{a: [null], b: []}");
         assert_eq!(formatter.value(2).to_string(), "{c: null, a: [baz]}");
+    }
+
+    #[test]
+    fn test_map_non_nullable_value() {
+        let map = Field::new_map(
+            "map",
+            Field::MAP_ENTRIES_FIELD_DEFAULT_NAME,
+            Field::new(Field::MAP_KEY_FIELD_DEFAULT_NAME, DataType::Utf8, false),
+            Field::new(Field::MAP_VALUE_FIELD_DEFAULT_NAME, DataType::Utf8, false),
+            false,
+            false,
+        );
+        let schema = Arc::new(Schema::new(vec![map]));
+        let buf = r#"{"map": {"key": null}}"#;
+
+        let err = ReaderBuilder::new(schema)
+            .build(Cursor::new(buf.as_bytes()))
+            .unwrap()
+            .read()
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Invalid argument error: Found unmasked nulls for non-nullable StructArray field \"value\""
+        );
     }
 
     #[test]
@@ -1323,7 +1803,7 @@ mod tests {
         assert!(col1.is_null(5));
         assert_eq!(
             col1.values(),
-            &[100, 200, 204, 1103420, 0, 0].map(T::Native::usize_as)
+            &[100, 200, 205, 1103420, 0, 0].map(T::Native::usize_as)
         );
 
         let col2 = batches[0].column(1).as_primitive::<T>();
@@ -1343,8 +1823,98 @@ mod tests {
         assert!(col3.is_null(5));
         assert_eq!(
             col3.values(),
-            &[3830, 12345, 0, 0, 0, 0].map(T::Native::usize_as)
+            &[3830, 12346, 0, 0, 0, 0].map(T::Native::usize_as)
         );
+    }
+
+    #[test]
+    fn test_decimal_number_formats() {
+        // Rounding half away from zero, exponent notation (a valid JSON
+        // number syntax), surrounding whitespace in strings and negative
+        // scales are all accepted
+        let buf = r#"
+        {"a": 0e0, "b": " 1.5 ", "c": 1234.5}
+        {"a": 1.5E2, "b": "-0.005", "c": -150}
+        {"a": 1e-3, "b": "1e2", "c": 1E2}
+        {"a": -0E+0, "b": "+.5", "c": 5}
+        "#;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Decimal128(10, 2), true),
+            Field::new("b", DataType::Decimal64(18, 2), true),
+            Field::new("c", DataType::Decimal128(10, -2), true),
+        ]));
+        let batches = do_read(buf, 1024, true, false, schema);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0]
+                .column(0)
+                .as_primitive::<Decimal128Type>()
+                .values(),
+            &[0, 15000, 0, 0]
+        );
+        assert_eq!(
+            batches[0]
+                .column(1)
+                .as_primitive::<Decimal64Type>()
+                .values(),
+            &[150, -1, 10000, 50]
+        );
+        assert_eq!(
+            batches[0]
+                .column(2)
+                .as_primitive::<Decimal128Type>()
+                .values(),
+            &[12, -2, 1, 0]
+        );
+
+        // Invalid and out-of-range values are errors (or nulls when type
+        // conflicts are ignored), never panics
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "a",
+            DataType::Decimal128(5, 2),
+            true,
+        )]));
+        let long = "1".repeat(300);
+        for (buf, expected) in [
+            (
+                r#"{"a": "abc"}"#.to_string(),
+                "Invalid decimal format: \"abc\"",
+            ),
+            (
+                r#"{"a": 123456789}"#.to_string(),
+                "does not fit in Decimal128(5, 2)",
+            ),
+            (
+                r#"{"a": 1e99999}"#.to_string(),
+                "does not fit in Decimal128(5, 2)",
+            ),
+            (
+                format!(r#"{{"a": {long}}}"#),
+                "does not fit in Decimal128(5, 2)",
+            ),
+            (
+                r#"{"a": 4825037936439135476.2609835314269495255615E-14}"#.to_string(),
+                "does not fit in Decimal128(5, 2)",
+            ),
+        ] {
+            let err = ReaderBuilder::new(schema.clone())
+                .build(Cursor::new(buf.as_bytes()))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expected), "{buf}: {err}");
+
+            let batch = ReaderBuilder::new(schema.clone())
+                .with_ignore_type_conflicts(true)
+                .build(Cursor::new(buf.as_bytes()))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap();
+            assert!(batch.column(0).is_null(0), "{buf}");
+        }
     }
 
     #[test]
@@ -1438,6 +2008,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // Takes too long
     fn test_timestamps() {
         test_timestamp::<TimestampSecondType>();
         test_timestamp::<TimestampMillisecondType>();
@@ -1456,9 +2027,8 @@ mod tests {
         {"c": "14:26:56.123"}
         "#;
 
-        let unit = match T::DATA_TYPE {
-            DataType::Time32(unit) | DataType::Time64(unit) => unit,
-            _ => unreachable!(),
+        let (DataType::Time32(unit) | DataType::Time64(unit)) = T::DATA_TYPE else {
+            unreachable!()
         };
 
         let unit_in_nanos = match unit {
@@ -2072,12 +2642,13 @@ mod tests {
             None,
             None,
         ]);
-        let c = ArrayDataBuilder::new(c_field.data_type().clone())
-            .len(7)
-            .add_child_data(d.to_data())
-            .null_bit_buffer(Some(Buffer::from([0b00111011])))
-            .build()
-            .unwrap();
+        let c = StructArray::new(
+            vec![Field::new("d", DataType::Utf8, true)].into(),
+            vec![Arc::new(d.clone()) as ArrayRef],
+            Some(NullBuffer::from(vec![
+                true, true, false, true, true, true, false,
+            ])),
+        );
         let b = BooleanArray::from(vec![
             Some(true),
             Some(false),
@@ -2087,21 +2658,22 @@ mod tests {
             Some(true),
             None,
         ]);
-        let a = ArrayDataBuilder::new(a_struct_field.data_type().clone())
-            .len(7)
-            .add_child_data(b.to_data())
-            .add_child_data(c.clone())
-            .null_bit_buffer(Some(Buffer::from([0b00111111])))
-            .build()
-            .unwrap();
-        let a_list = ArrayDataBuilder::new(a_field.data_type().clone())
-            .len(6)
-            .add_buffer(Buffer::from_slice_ref([0i32, 2, 3, 6, 6, 6, 7]))
-            .add_child_data(a)
-            .null_bit_buffer(Some(Buffer::from([0b00110111])))
-            .build()
-            .unwrap();
-        let expected = make_array(a_list);
+        let a = StructArray::new(
+            vec![Field::new("b", DataType::Boolean, true), c_field.clone()].into(),
+            vec![
+                Arc::new(b.clone()) as ArrayRef,
+                Arc::new(c.clone()) as ArrayRef,
+            ],
+            Some(NullBuffer::from(vec![
+                true, true, true, true, true, true, false,
+            ])),
+        );
+        let a_list = ListArray::new(
+            Arc::new(a_struct_field.clone()),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2, 3, 6, 6, 6, 7])),
+            Arc::new(a),
+            Some(NullBuffer::from(vec![true, true, true, false, true, true])),
+        );
 
         // compare `a` with result from json reader
         let batch = reader.next().unwrap().unwrap();
@@ -2109,7 +2681,7 @@ mod tests {
         assert_eq!(read.len(), 6);
         // compare the arrays the long way around, to better detect differences
         let read: &ListArray = read.as_list::<i32>();
-        let expected = expected.as_list::<i32>();
+        let expected = &a_list;
         assert_eq!(read.value_offsets(), &[0, 2, 3, 6, 6, 6, 7]);
         // compare list null buffers
         assert_eq!(read.nulls(), expected.nulls());
@@ -2127,12 +2699,283 @@ mod tests {
         let read_b = struct_array.column(0);
         assert_eq!(read_b.as_ref(), &b);
         let read_c = struct_array.column(1);
-        assert_eq!(read_c.to_data(), c);
+        assert_eq!(read_c.as_struct(), &c);
         let read_c = read_c.as_struct();
         let read_d = read_c.column(0);
         assert_eq!(read_d.as_ref(), &d);
 
         assert_eq!(read, expected);
+    }
+
+    fn assert_read_list_view<O: OffsetSizeTrait>() {
+        let field = Arc::new(Field::new("item", DataType::Int32, true));
+        let data_type = GenericListViewArray::<O>::DATA_TYPE_CONSTRUCTOR(field.clone());
+        let schema = Arc::new(Schema::new(vec![Field::new("lv", data_type, true)]));
+
+        let buf = r#"
+        {"lv": [1, 2, 3]}
+        {"lv": [4, null]}
+        {"lv": null}
+        {"lv": [6]}
+        {"lv": []}
+        "#;
+
+        let batches = do_read(buf, 1024, false, false, schema);
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        let col = batch.column(0);
+        let list_view = col
+            .as_any()
+            .downcast_ref::<GenericListViewArray<O>>()
+            .unwrap();
+
+        assert_eq!(list_view.len(), 5);
+
+        // Check offsets and sizes
+        let expected_offsets: Vec<O> = vec![0, 3, 5, 5, 6]
+            .into_iter()
+            .map(|v| O::usize_as(v))
+            .collect();
+        let expected_sizes: Vec<O> = vec![3, 2, 0, 1, 0]
+            .into_iter()
+            .map(|v| O::usize_as(v))
+            .collect();
+        assert_eq!(list_view.value_offsets(), &expected_offsets);
+        assert_eq!(list_view.value_sizes(), &expected_sizes);
+
+        // Row 0: [1, 2, 3]
+        assert!(list_view.is_valid(0));
+        let vals = list_view.value(0);
+        let ints = vals.as_primitive::<Int32Type>();
+        assert_eq!(ints.values(), &[1, 2, 3]);
+
+        // Row 1: [4, null]
+        assert!(list_view.is_valid(1));
+        let vals = list_view.value(1);
+        let ints = vals.as_primitive::<Int32Type>();
+        assert_eq!(ints.len(), 2);
+        assert_eq!(ints.value(0), 4);
+        assert!(ints.is_null(1));
+
+        // Row 2: null
+        assert!(list_view.is_null(2));
+
+        // Row 3: [6]
+        assert!(list_view.is_valid(3));
+        let vals = list_view.value(3);
+        let ints = vals.as_primitive::<Int32Type>();
+        assert_eq!(ints.values(), &[6]);
+
+        // Row 4: []
+        assert!(list_view.is_valid(4));
+        let vals = list_view.value(4);
+        assert_eq!(vals.len(), 0);
+    }
+
+    #[test]
+    fn test_read_list_view() {
+        assert_read_list_view::<i32>();
+        assert_read_list_view::<i64>();
+    }
+
+    #[test]
+    fn test_read_list_view_rejects_null_non_nullable_child() {
+        let field = Arc::new(Field::new("item", DataType::Int32, false));
+        for (data_type, array_type) in [
+            (DataType::ListView(field.clone()), "ListViewArray"),
+            (DataType::LargeListView(field.clone()), "LargeListViewArray"),
+        ] {
+            let schema = Arc::new(Schema::new(vec![Field::new("lv", data_type, true)]));
+            let buf = r#"
+            {"lv": [1, 2, 3]}
+            {"lv": [4, null]}
+            "#;
+
+            let error = ReaderBuilder::new(schema)
+                .build(Cursor::new(buf.as_bytes()))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap_err();
+
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Invalid argument error: Non-nullable field of {array_type} \"item\" cannot contain nulls"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn test_fixed_size_list() {
+        let buf = r#"
+        {"a": [1, 2, 3]}
+        {"a": [4, 5, 6]}
+        {"a": [7, 8, 9]}
+        "#;
+
+        let field = Field::new_list_field(DataType::Int32, true);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "a",
+            DataType::FixedSizeList(Arc::new(field), 3),
+            false,
+        )]));
+
+        let batches = do_read(buf, 1024, false, false, schema);
+        assert_eq!(batches.len(), 1);
+
+        let col = batches[0].column(0).as_fixed_size_list();
+        assert_eq!(col.len(), 3);
+        assert_eq!(col.value_length(), 3);
+
+        let values = col.values().as_primitive::<Int32Type>();
+        assert_eq!(values.values(), &[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn test_fixed_size_list_nullable() {
+        let buf = r#"
+        {"a": [1, 2]}
+        {"a": null}
+        {"a": [3, null]}
+        "#;
+
+        let field = Field::new_list_field(DataType::Int32, true);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "a",
+            DataType::FixedSizeList(Arc::new(field), 2),
+            true,
+        )]));
+
+        let batches = do_read(buf, 1024, false, false, schema);
+        assert_eq!(batches.len(), 1);
+
+        let col = batches[0].column(0).as_fixed_size_list();
+        assert_eq!(col.len(), 3);
+        assert!(col.is_valid(0));
+        assert!(col.is_null(1));
+        assert!(col.is_valid(2));
+
+        let values = col.values().as_primitive::<Int32Type>();
+        assert_eq!(values.value(0), 1);
+        assert_eq!(values.value(1), 2);
+        assert_eq!(values.value(4), 3);
+        assert!(values.is_null(5));
+    }
+
+    #[test]
+    fn test_fixed_size_list_zero_size_non_nullable() {
+        let buf = r#"
+        {"a": []}
+        {"a": []}
+        {"a": []}
+        "#;
+
+        let field = Field::new_list_field(DataType::Int32, true);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "a",
+            DataType::FixedSizeList(Arc::new(field), 0),
+            false,
+        )]));
+
+        let batches = do_read(buf, 1024, false, false, schema);
+        assert_eq!(batches.len(), 1);
+
+        let col = batches[0].column(0).as_fixed_size_list();
+        assert_eq!(col.len(), 3);
+        assert_eq!(col.value_length(), 0);
+
+        let values = col.values().as_primitive::<Int32Type>();
+        assert!(values.values().is_empty());
+    }
+
+    #[test]
+    fn test_fixed_size_list_wrong_size() {
+        let buf = r#"{"a": [1, 2, 3]}"#;
+
+        let field = Field::new_list_field(DataType::Int32, true);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "a",
+            DataType::FixedSizeList(Arc::new(field), 2),
+            false,
+        )]));
+
+        let err = ReaderBuilder::new(schema)
+            .build(Cursor::new(buf.as_bytes()))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap_err();
+
+        assert!(err.to_string().contains("expected 2 but got 3"), "{}", err);
+    }
+
+    #[test]
+    fn test_fixed_size_list_nested() {
+        let buf = r#"
+        {"a": [[1, 2], [3, 4]]}
+        {"a": [[5, 6], [7, 8]]}
+        "#;
+
+        let inner_field = Field::new_list_field(DataType::Int32, true);
+        let inner_type = DataType::FixedSizeList(Arc::new(inner_field), 2);
+        let outer_field = Arc::new(Field::new_list_field(inner_type.clone(), true));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "a",
+            DataType::FixedSizeList(outer_field, 2),
+            false,
+        )]));
+
+        let batches = do_read(buf, 1024, false, false, schema);
+        assert_eq!(batches.len(), 1);
+
+        let col = batches[0].column(0).as_fixed_size_list();
+        assert_eq!(col.len(), 2);
+        assert_eq!(col.value_length(), 2);
+
+        let inner = col.values().as_fixed_size_list();
+        assert_eq!(inner.len(), 4);
+        assert_eq!(inner.value_length(), 2);
+
+        let values = inner.values().as_primitive::<Int32Type>();
+        assert_eq!(values.values(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn test_fixed_size_list_ignore_type_conflicts() {
+        let field = Field::new("item", DataType::Int32, true);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "a",
+            DataType::FixedSizeList(Arc::new(field), 2),
+            true,
+        )]));
+
+        let json = vec![
+            json!({"a": [1, 2]}),
+            json!({"a": "not a list"}),
+            json!({"a": 42}),
+            json!({"a": [6, 7]}),
+        ];
+
+        let mut decoder = ReaderBuilder::new(schema)
+            .with_ignore_type_conflicts(true)
+            .build_decoder()
+            .unwrap();
+        decoder.serialize(&json).unwrap();
+        let batch = decoder.flush().unwrap().unwrap();
+
+        let col = batch.column(0).as_fixed_size_list();
+        assert_eq!(col.len(), 4);
+        assert!(col.is_valid(0));
+        assert!(col.is_null(1)); // string -> null
+        assert!(col.is_null(2)); // number -> null
+        assert!(col.is_valid(3));
+
+        let values = col.values().as_primitive::<Int32Type>();
+        assert_eq!(values.value(0), 1);
+        assert_eq!(values.value(1), 2);
+        assert_eq!(values.value(6), 6);
+        assert_eq!(values.value(7), 7);
     }
 
     #[test]
@@ -2333,7 +3176,7 @@ mod tests {
         )]));
 
         let mut decoder = ReaderBuilder::new(schema.clone()).build_decoder().unwrap();
-        let _ = decoder.decode(r#"{"a": { "child":"#.as_bytes()).unwrap();
+        let _ = decoder.decode(br#"{"a": { "child":"#).unwrap();
         assert!(decoder.tape_decoder.has_partial_row());
         assert_eq!(decoder.tape_decoder.num_buffered_rows(), 1);
         let _ = decoder.flush().unwrap_err();
@@ -2550,6 +3393,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_serialize_f32_into_string() {
+        // Coercing an f32 into a string column must render the value, not its raw bit pattern.
+        let field = Field::new("f", DataType::Utf8, true);
+        let mut decoder = ReaderBuilder::new_with_field(field)
+            .with_coerce_primitive(true)
+            .build_decoder()
+            .unwrap();
+        decoder.serialize(&[1.5_f32, -2.25_f32]).unwrap();
+        let batch = decoder.flush().unwrap().unwrap();
+        let values = batch.column(0).as_string::<i32>();
+        assert_eq!(values.value(0), "1.5");
+        assert_eq!(values.value(1), "-2.25");
+    }
+
     // Parse the given `row` in `struct_mode` as a type given by fields.
     //
     // If as_struct == true, wrap the fields in a Struct field with name "r".
@@ -2644,9 +3502,9 @@ mod tests {
             Field::new("b", DataType::new_list(DataType::Int32, true), true),
             Field::new_map(
                 "c",
-                "entries",
-                Field::new("keys", DataType::Utf8, false),
-                Field::new("values", DataType::Int32, true),
+                Field::MAP_ENTRIES_FIELD_DEFAULT_NAME,
+                Field::new(Field::MAP_KEY_FIELD_DEFAULT_NAME, DataType::Utf8, false),
+                Field::new(Field::MAP_VALUE_FIELD_DEFAULT_NAME, DataType::Int32, true),
                 false,
                 false,
             ),
@@ -2809,5 +3667,777 @@ mod tests {
                 .to_string(),
             "Json error: whilst decoding field 'a': failed to parse \"a\" as Int32".to_owned()
         );
+    }
+
+    #[test]
+    fn test_type_conflict_nulls() {
+        let schema = Schema::new(vec![
+            Field::new("null", DataType::Null, true),
+            Field::new("bool", DataType::Boolean, true),
+            Field::new("primitive", DataType::Int32, true),
+            Field::new("numeric", DataType::Decimal128(10, 3), true),
+            Field::new("string", DataType::Utf8, true),
+            Field::new("string_view", DataType::Utf8View, true),
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Second, None),
+                true,
+            ),
+            Field::new(
+                "array",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            ),
+            Field::new(
+                "map",
+                DataType::Map(
+                    Arc::new(Field::new(
+                        Field::MAP_ENTRIES_FIELD_DEFAULT_NAME,
+                        DataType::Struct(Fields::from(vec![
+                            Field::new(Field::MAP_KEY_FIELD_DEFAULT_NAME, DataType::Utf8, false),
+                            Field::new(Field::MAP_VALUE_FIELD_DEFAULT_NAME, DataType::Utf8, true),
+                        ])),
+                        false, // not nullable
+                    )),
+                    false, // not sorted
+                ),
+                true, // nullable
+            ),
+            Field::new(
+                "struct",
+                DataType::Struct(Fields::from(vec![Field::new("a", DataType::Int32, true)])),
+                true,
+            ),
+        ]);
+
+        // A compatible value for each schema field above, in schema order
+        let json_values = vec![
+            json!(null),
+            json!(true),
+            json!(42),
+            json!(1.234),
+            json!("hi"),
+            json!("ho"),
+            json!("1970-01-01T00:00:00+02:00"),
+            json!([1, "ho", 3]),
+            json!({"k": "value"}),
+            json!({"a": 1}),
+        ];
+
+        // Create a set of JSON rows that rotates each value past every field
+        let json: Vec<_> = (0..json_values.len())
+            .map(|i| {
+                let pairs = json_values[i..]
+                    .iter()
+                    .chain(json_values[..i].iter())
+                    .zip(&schema.fields)
+                    .map(|(v, f)| (f.name().clone(), v.clone()))
+                    .collect();
+                serde_json::Value::Object(pairs)
+            })
+            .collect();
+        let mut decoder = ReaderBuilder::new(Arc::new(schema))
+            .with_ignore_type_conflicts(true)
+            .with_coerce_primitive(true)
+            .build_decoder()
+            .unwrap();
+        decoder.serialize(&json).unwrap();
+        let batch = decoder.flush().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 10);
+        assert_eq!(batch.num_columns(), 10);
+
+        // NOTE: NullArray doesn't materialize any values (they're all NULL by definition)
+        let _ = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<NullArray>()
+            .unwrap();
+
+        assert!(
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .iter()
+                .eq([
+                    Some(true),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None
+                ])
+        );
+
+        assert!(batch.column(2).as_primitive::<Int32Type>().iter().eq([
+            Some(42),
+            Some(1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None
+        ]));
+
+        assert!(batch.column(3).as_primitive::<Decimal128Type>().iter().eq([
+            Some(1234),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(42000)
+        ]));
+
+        assert!(
+            batch
+                .column(4)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .eq([
+                    Some("hi"),
+                    Some("ho"),
+                    Some("1970-01-01T00:00:00+02:00"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("true"),
+                    Some("42"),
+                    Some("1.234"),
+                ])
+        );
+
+        assert!(
+            batch
+                .column(5)
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap()
+                .iter()
+                .eq([
+                    Some("ho"),
+                    Some("1970-01-01T00:00:00+02:00"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("true"),
+                    Some("42"),
+                    Some("1.234"),
+                    Some("hi"),
+                ])
+        );
+
+        assert!(
+            batch
+                .column(6)
+                .as_primitive::<TimestampSecondType>()
+                .iter()
+                .eq([
+                    Some(-7200),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(42),
+                    None,
+                    None,
+                    None,
+                ])
+        );
+
+        let arrays = batch
+            .column(7)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(
+            arrays.nulls(),
+            Some(&NullBuffer::from(
+                &[
+                    true, false, false, false, false, false, false, false, false, false
+                ][..]
+            ))
+        );
+        assert_eq!(arrays.offsets()[1], 3);
+        let array_values = arrays
+            .values()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert!(array_values.iter().eq([Some(1), None, Some(3)]));
+
+        let maps = batch.column(8).as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(
+            maps.nulls(),
+            Some(&NullBuffer::from(
+                // Both map and struct can parse
+                &[
+                    true, true, false, false, false, false, false, false, false, false
+                ][..]
+            ))
+        );
+        let map_keys = maps.keys().as_any().downcast_ref::<StringArray>().unwrap();
+        assert!(map_keys.iter().eq([Some("k"), Some("a")]));
+        let map_values = maps
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(map_values.iter().eq([Some("value"), Some("1")]));
+
+        let structs = batch
+            .column(9)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(
+            structs.nulls(),
+            Some(&NullBuffer::from(
+                // Both map and struct can parse
+                &[
+                    true, false, false, false, false, false, false, false, false, true
+                ][..]
+            ))
+        );
+        let struct_fields = structs
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert!(struct_fields.slice(0, 2).iter().eq([Some(1), None]));
+    }
+
+    #[test]
+    fn test_type_conflict_non_nullable() {
+        let fields = [
+            Field::new("bool", DataType::Boolean, false),
+            Field::new("primitive", DataType::Int32, false),
+            Field::new("numeric", DataType::Decimal128(10, 3), false),
+            Field::new("string", DataType::Utf8, false),
+            Field::new("string_view", DataType::Utf8View, false),
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Second, None),
+                false,
+            ),
+            Field::new(
+                "array",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                false,
+            ),
+            Field::new(
+                "fixed_size_list",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 2),
+                false,
+            ),
+            Field::new(
+                "map",
+                DataType::Map(
+                    Arc::new(Field::new(
+                        Field::MAP_ENTRIES_FIELD_DEFAULT_NAME,
+                        DataType::Struct(Fields::from(vec![
+                            Field::new(Field::MAP_KEY_FIELD_DEFAULT_NAME, DataType::Utf8, false),
+                            Field::new(Field::MAP_VALUE_FIELD_DEFAULT_NAME, DataType::Utf8, true),
+                        ])),
+                        false, // not nullable
+                    )),
+                    false, // not sorted
+                ),
+                false, // not nullable
+            ),
+            Field::new(
+                "struct",
+                DataType::Struct(Fields::from(vec![Field::new("a", DataType::Int32, true)])),
+                false,
+            ),
+        ];
+
+        // Every field above will have a type conflict with at least one of these values
+        let json_values = vec![json!(true), json!({"a": 1})];
+
+        for field in fields {
+            let mut decoder = ReaderBuilder::new_with_field(field)
+                .with_ignore_type_conflicts(true)
+                .build_decoder()
+                .unwrap();
+            decoder.serialize(&json_values).unwrap();
+            decoder
+                .flush()
+                .expect_err("type conflict on non-nullable type");
+        }
+    }
+
+    #[test]
+    fn test_ignore_type_conflicts_disabled() {
+        let fields = [
+            Field::new("null", DataType::Null, true),
+            Field::new("bool", DataType::Boolean, true),
+            Field::new("primitive", DataType::Int32, true),
+            Field::new("numeric", DataType::Decimal128(10, 3), true),
+            Field::new("string", DataType::Utf8, true),
+            Field::new("string_view", DataType::Utf8View, true),
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Second, None),
+                true,
+            ),
+            Field::new(
+                "array",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            ),
+            Field::new(
+                "fixed_size_list",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 2),
+                true,
+            ),
+            Field::new(
+                "map",
+                DataType::Map(
+                    Arc::new(Field::new(
+                        Field::MAP_ENTRIES_FIELD_DEFAULT_NAME,
+                        DataType::Struct(Fields::from(vec![
+                            Field::new(Field::MAP_KEY_FIELD_DEFAULT_NAME, DataType::Utf8, false),
+                            Field::new(Field::MAP_VALUE_FIELD_DEFAULT_NAME, DataType::Utf8, true),
+                        ])),
+                        false, // not nullable
+                    )),
+                    false, // not sorted
+                ),
+                true, // not nullable
+            ),
+            Field::new(
+                "struct",
+                DataType::Struct(Fields::from(vec![Field::new("a", DataType::Int32, true)])),
+                true,
+            ),
+        ];
+
+        // Every field above will have a type conflict with at least one of these values
+        let json_values = vec![json!(true), json!({"a": 1})];
+
+        for field in fields {
+            let mut decoder = ReaderBuilder::new_with_field(field)
+                .build_decoder()
+                .unwrap();
+            decoder.serialize(&json_values).unwrap();
+            decoder
+                .flush()
+                .expect_err("type conflict on non-nullable type");
+        }
+    }
+
+    #[test]
+    fn test_read_run_end_encoded() {
+        let buf = r#"
+        {"a": "x"}
+        {"a": "x"}
+        {"a": "y"}
+        {"a": "y"}
+        {"a": "y"}
+        "#;
+
+        let ree_type = DataType::RunEndEncoded(
+            Arc::new(Field::new(
+                Field::REE_RUN_ENDS_FIELD_DEFAULT_NAME,
+                DataType::Int32,
+                false,
+            )),
+            Arc::new(Field::new(
+                Field::REE_VALUES_FIELD_DEFAULT_NAME,
+                DataType::Utf8,
+                true,
+            )),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new("a", ree_type, true)]));
+        let batches = do_read(buf, 1024, false, false, schema);
+        assert_eq!(batches.len(), 1);
+
+        let col = batches[0].column(0);
+        let run_array = col.as_run::<arrow_array::types::Int32Type>();
+
+        // 5 logical values compressed into 2 runs
+        assert_eq!(run_array.len(), 5);
+        assert_eq!(run_array.run_ends().values(), &[2, 5]);
+
+        let values = run_array.values().as_string::<i32>();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values.value(0), "x");
+        assert_eq!(values.value(1), "y");
+    }
+
+    #[test]
+    fn test_read_run_end_encoded_consecutive_nulls() {
+        let buf = r#"
+        {"a": "x"}
+        {}
+        {}
+        {}
+        {"a": "y"}
+        "#;
+
+        let ree_type = DataType::RunEndEncoded(
+            Arc::new(Field::new(
+                Field::REE_RUN_ENDS_FIELD_DEFAULT_NAME,
+                DataType::Int32,
+                false,
+            )),
+            Arc::new(Field::new(
+                Field::REE_VALUES_FIELD_DEFAULT_NAME,
+                DataType::Utf8,
+                true,
+            )),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new("a", ree_type, true)]));
+        let batches = do_read(buf, 1024, false, false, schema);
+        assert_eq!(batches.len(), 1);
+
+        let col = batches[0].column(0);
+        let run_array = col.as_run::<arrow_array::types::Int32Type>();
+
+        // 5 logical values: "x", null, null, null, "y" → 3 runs
+        assert_eq!(run_array.len(), 5);
+        assert_eq!(run_array.run_ends().values(), &[1, 4, 5]);
+
+        let values = run_array.values().as_string::<i32>();
+        assert_eq!(values.len(), 3);
+        assert_eq!(values.value(0), "x");
+        assert!(values.is_null(1));
+        assert_eq!(values.value(2), "y");
+    }
+
+    #[test]
+    fn test_read_run_end_encoded_nullability() {
+        for field_nullable in [false, true] {
+            for values_nullable in [false, true] {
+                let ree_type = DataType::RunEndEncoded(
+                    Arc::new(Field::new(
+                        Field::REE_RUN_ENDS_FIELD_DEFAULT_NAME,
+                        DataType::Int32,
+                        false,
+                    )),
+                    Arc::new(Field::new(
+                        Field::REE_VALUES_FIELD_DEFAULT_NAME,
+                        DataType::Utf8,
+                        values_nullable,
+                    )),
+                );
+                let schema = Arc::new(Schema::new(vec![Field::new("a", ree_type, field_nullable)]));
+
+                for buf in [
+                    r#"{"a": "x"}
+                    {"a": null}
+                    {"a": "y"}"#,
+                    r#"{"a": "x"}
+                    {}
+                    {"a": "y"}"#,
+                ] {
+                    let mut decoder = ReaderBuilder::new(schema.clone()).build_decoder().unwrap();
+                    let result = decoder.decode(buf.as_bytes()).and_then(|_| decoder.flush());
+
+                    if field_nullable && values_nullable {
+                        result.expect("REE field and values are both nullable");
+                    } else {
+                        let err = result.expect_err(
+                            "REE nulls require both the field and values to be nullable",
+                        );
+                        assert!(
+                            err.to_string().contains(
+                                "Encountered nulls in non-nullable values of RunEndEncoded"
+                            ),
+                            "unexpected error: {err}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_read_run_end_encoded_all_unique() {
+        let buf = r#"
+        {"a": 1}
+        {"a": 2}
+        {"a": 3}
+        "#;
+
+        let ree_type = DataType::RunEndEncoded(
+            Arc::new(Field::new(
+                Field::REE_RUN_ENDS_FIELD_DEFAULT_NAME,
+                DataType::Int32,
+                false,
+            )),
+            Arc::new(Field::new(
+                Field::REE_VALUES_FIELD_DEFAULT_NAME,
+                DataType::Int32,
+                true,
+            )),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new("a", ree_type, true)]));
+        let batches = do_read(buf, 1024, false, false, schema);
+        assert_eq!(batches.len(), 1);
+
+        let col = batches[0].column(0);
+        let run_array = col.as_run::<arrow_array::types::Int32Type>();
+
+        // No compression: 3 unique values → 3 runs
+        assert_eq!(run_array.len(), 3);
+        assert_eq!(run_array.run_ends().values(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn test_read_run_end_encoded_int16_run_ends() {
+        let buf = r#"
+        {"a": "x"}
+        {"a": "x"}
+        {"a": "y"}
+        "#;
+
+        let ree_type = DataType::RunEndEncoded(
+            Arc::new(Field::new(
+                Field::REE_RUN_ENDS_FIELD_DEFAULT_NAME,
+                DataType::Int16,
+                false,
+            )),
+            Arc::new(Field::new(
+                Field::REE_VALUES_FIELD_DEFAULT_NAME,
+                DataType::Utf8,
+                true,
+            )),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new("a", ree_type, true)]));
+        let batches = do_read(buf, 1024, false, false, schema);
+        assert_eq!(batches.len(), 1);
+
+        let col = batches[0].column(0);
+        let run_array = col.as_run::<arrow_array::types::Int16Type>();
+
+        assert_eq!(run_array.len(), 3);
+        assert_eq!(run_array.run_ends().values(), &[2i16, 3]);
+    }
+
+    #[test]
+    fn test_read_nested_run_end_encoded() {
+        let buf = r#"
+        {"a": "x"}
+        {"a": "x"}
+        {"a": "y"}
+        "#;
+
+        // The outer REE compresses whole rows, while the inner REE compresses the
+        // repeated string values produced by decoding those rows.
+        let inner_type = DataType::RunEndEncoded(
+            Arc::new(Field::new(
+                Field::REE_RUN_ENDS_FIELD_DEFAULT_NAME,
+                DataType::Int64,
+                false,
+            )),
+            Arc::new(Field::new(
+                Field::REE_VALUES_FIELD_DEFAULT_NAME,
+                DataType::Utf8,
+                true,
+            )),
+        );
+        let outer_type = DataType::RunEndEncoded(
+            Arc::new(Field::new(
+                Field::REE_RUN_ENDS_FIELD_DEFAULT_NAME,
+                DataType::Int64,
+                false,
+            )),
+            Arc::new(Field::new(
+                Field::REE_VALUES_FIELD_DEFAULT_NAME,
+                inner_type,
+                true,
+            )),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new("a", outer_type, true)]));
+        let batches = do_read(buf, 1024, false, false, schema);
+        assert_eq!(batches.len(), 1);
+
+        let col = batches[0].column(0);
+        let outer = col.as_run::<arrow_array::types::Int64Type>();
+        // Three logical rows compress to two outer runs: ["x", "x"] and ["y"].
+        assert_eq!(outer.len(), 3);
+        assert_eq!(outer.run_ends().values(), &[2, 3]);
+
+        let nested = outer.values().as_run::<arrow_array::types::Int64Type>();
+        // The physical values of the outer REE are themselves a two-element REE.
+        assert_eq!(nested.len(), 2);
+        assert_eq!(nested.run_ends().values(), &[1, 2]);
+
+        let nested_values = nested.values().as_string::<i32>();
+        assert_eq!(nested_values.len(), 2);
+        assert_eq!(nested_values.value(0), "x");
+        assert_eq!(nested_values.value(1), "y");
+    }
+
+    #[test]
+    fn test_flatten_top_level_arrays() {
+        let buf = r#"
+            [
+                {"a": 1},
+                {"a": 2}
+            ]
+            {"a": 3}
+            [{"a": 4}, {"a": 5}, {"a": 6}]
+            "#;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+        let batches = do_read_config(buf, ReaderBuilder::new(schema).with_flatten(true));
+        assert_eq!(batches.len(), 1);
+
+        let col = batches[0].column(0);
+        let col = col.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(col.len(), 6);
+        for i in 0..6 {
+            assert_eq!(col.value(i), (i as i32) + 1);
+        }
+    }
+
+    /// Declining everything must be indistinguishable from no factory at all.
+    #[test]
+    fn test_decoder_factory_declining_everything_is_transparent() {
+        #[derive(Debug, Default)]
+        struct DeclineAll {
+            seen: Mutex<Vec<FieldRef>>,
+        }
+
+        impl DecoderFactory for DeclineAll {
+            fn make_default_decoder(
+                &self,
+                _ctx: &DecoderContext,
+                field: &FieldRef,
+                _is_nullable: bool,
+            ) -> Result<Option<Box<dyn ArrayDecoder>>, ArrowError> {
+                self.seen.lock().unwrap().push(field.clone());
+                Ok(None)
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Utf8, true),
+            Field::new_list("c", Field::new("item", DataType::Float64, true), true),
+        ]));
+        let buf = r#"{"a": 1, "b": "x", "c": [1.5, 2.5]}
+        {"a": null, "c": []}
+        "#;
+
+        let read = |factory: Option<Arc<dyn DecoderFactory>>| {
+            let mut builder = ReaderBuilder::new(schema.clone());
+            if let Some(factory) = factory {
+                builder = builder.with_decoder_factory(factory);
+            }
+            builder
+                .build(Cursor::new(buf.as_bytes()))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+        };
+
+        let factory = Arc::new(DeclineAll::default());
+        assert_eq!(read(None), read(Some(factory.clone())));
+
+        // Consulted for the root struct and every leaf, with names attached; the
+        // root is the documented synthesized nameless struct
+        let seen = factory.seen.lock().unwrap();
+        assert!(
+            matches!(seen[0].data_type(), DataType::Struct(_)),
+            "{seen:?}"
+        );
+        assert_eq!(seen[0].name(), "", "root field should be nameless");
+
+        let by_name: Vec<(&str, &DataType)> = seen
+            .iter()
+            .map(|f| (f.name().as_str(), f.data_type()))
+            .collect();
+        for expected in [
+            ("a", &DataType::Int32),
+            ("b", &DataType::Utf8),
+            ("item", &DataType::Float64),
+        ] {
+            assert!(
+                by_name.contains(&expected),
+                "{expected:?} missing from {by_name:?}"
+            );
+        }
+    }
+
+    /// A custom decoder's output is not trusted: the arrays built from it are
+    /// constructed without further validation, so a mismatch must be caught here.
+    #[test]
+    fn test_decoder_factory_output_is_validated() {
+        /// Returns either the wrong data type or the wrong number of rows
+        struct Bad {
+            wrong_type: bool,
+        }
+
+        impl ArrayDecoder for Bad {
+            fn decode(&mut self, _tape: &Tape<'_>, pos: &[u32]) -> Result<ArrayRef, ArrowError> {
+                Ok(match self.wrong_type {
+                    true => Arc::new(StringViewArray::from(vec!["x"; pos.len()])) as ArrayRef,
+                    false => Arc::new(StringArray::from(Vec::<&str>::new())),
+                })
+            }
+        }
+
+        #[derive(Debug)]
+        struct BadFactory {
+            wrong_type: bool,
+        }
+
+        impl DecoderFactory for BadFactory {
+            fn make_default_decoder(
+                &self,
+                _ctx: &DecoderContext,
+                field: &FieldRef,
+                _is_nullable: bool,
+            ) -> Result<Option<Box<dyn ArrayDecoder>>, ArrowError> {
+                match field.data_type() {
+                    DataType::Utf8 => Ok(Some(Box::new(Bad {
+                        wrong_type: self.wrong_type,
+                    }))),
+                    _ => Ok(None),
+                }
+            }
+        }
+
+        let read = |wrong_type: bool| {
+            let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+            ReaderBuilder::new(schema)
+                .with_decoder_factory(Arc::new(BadFactory { wrong_type }))
+                .build(Cursor::new(br#"{"s": "hello"}"#.as_slice()))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+        };
+
+        let err = read(true);
+        assert!(
+            err.contains("returned Utf8View for a field of type Utf8"),
+            "{err}"
+        );
+
+        let err = read(false);
+        assert!(err.contains("returned 0 values for 1 rows"), "{err}");
     }
 }

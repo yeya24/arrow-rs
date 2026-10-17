@@ -17,6 +17,7 @@
 
 //! Defines temporal kernels for time and date related functions.
 
+use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
@@ -61,6 +62,10 @@ pub enum DatePart {
     DayOfWeekSunday0,
     /// Day of the week, in range `0..=6`, where Monday is `0`
     DayOfWeekMonday0,
+    /// Day of the week, in range `1..=7`, where Sunday is `1`
+    DayOfWeekSunday1,
+    /// ISO day of the week, in range `1..=7`, where Monday is `1`
+    DayOfWeekMonday1,
     /// Day of year, in range `1..=366`
     DayOfYear,
     /// Hour of the day, in range `0..=23`
@@ -83,6 +88,57 @@ impl std::fmt::Display for DatePart {
     }
 }
 
+/// Parses a string into a [`DatePart`].
+///
+/// Matching is case-insensitive. The accepted names follow PostgreSQL's
+/// `EXTRACT` / `date_part` conventions (see
+/// <https://www.postgresql.org/docs/current/functions-datetime.html#FUNCTIONS-DATETIME-EXTRACT>)
+/// and are aligned with the alias set accepted by `arrow-cast`'s
+/// `IntervalUnit::from_str` (plurals, short forms like `y`, `mon`, `ms`,
+/// `us`) so the two parsers round-trip on the names they share.
+///
+/// Names that do not map one-to-one onto a [`DatePart`] variant are
+/// intentionally not recognized:
+/// - `epoch` — a derived computation, not a date part.
+/// - `century`, `decade`, `millennium` — no matching [`DatePart`] variant.
+/// - `timezone`, `timezone_hour`, `timezone_minute` — not modeled by
+///   [`DatePart`].
+impl FromStr for DatePart {
+    type Err = ArrowError;
+
+    fn from_str(s: &str) -> Result<Self, ArrowError> {
+        Ok(match s.to_lowercase().as_str() {
+            "y" | "yr" | "yrs" | "year" | "years" => Self::Year,
+            "isoyear" => Self::YearISO,
+            "qtr" | "quarter" | "quarters" => Self::Quarter,
+            "mon" | "mons" | "month" | "months" => Self::Month,
+            "w" | "week" | "weeks" => Self::Week,
+            "isoweek" => Self::WeekISO,
+            "d" | "day" | "days" => Self::Day,
+            "dow" | "dayofweek" => Self::DayOfWeekSunday0,
+            "dow1" | "dayofweek1" => Self::DayOfWeekSunday1,
+            "isodow0" => Self::DayOfWeekMonday0,
+            "isodow" => Self::DayOfWeekMonday1,
+            "doy" | "dayofyear" => Self::DayOfYear,
+            "h" | "hr" | "hrs" | "hour" | "hours" => Self::Hour,
+            "m" | "min" | "mins" | "minute" | "minutes" => Self::Minute,
+            "s" | "sec" | "secs" | "second" | "seconds" => Self::Second,
+            "ms" | "msec" | "msecs" | "msecond" | "mseconds" | "millisecond" | "milliseconds" => {
+                Self::Millisecond
+            }
+            "us" | "usec" | "usecs" | "usecond" | "useconds" | "microsecond" | "microseconds" => {
+                Self::Microsecond
+            }
+            "nanosecond" | "nanoseconds" => Self::Nanosecond,
+            _ => {
+                return Err(ArrowError::InvalidArgumentError(format!(
+                    "Unknown date part: {s}"
+                )));
+            }
+        })
+    }
+}
+
 /// Returns function to extract relevant [`DatePart`] from types like a
 /// [`NaiveDateTime`] or [`DateTime`].
 ///
@@ -93,14 +149,18 @@ where
     T: ChronoDateExt + Datelike + Timelike,
 {
     match part {
-        DatePart::Quarter => |d| d.quarter() as i32,
         DatePart::Year => |d| d.year(),
+        // Datelike and ChronoDataExt does export .quarter() function
+        // for this case we needs to be clarified which version are we using
+        DatePart::Quarter => |d| Datelike::quarter(&d) as i32,
         DatePart::YearISO => |d| d.iso_week().year(),
         DatePart::Month => |d| d.month() as i32,
         DatePart::Week | DatePart::WeekISO => |d| d.iso_week().week() as i32,
         DatePart::Day => |d| d.day() as i32,
         DatePart::DayOfWeekSunday0 => |d| d.num_days_from_sunday(),
         DatePart::DayOfWeekMonday0 => |d| d.num_days_from_monday(),
+        DatePart::DayOfWeekSunday1 => |d| d.num_days_from_sunday() + 1,
+        DatePart::DayOfWeekMonday1 => |d| d.num_days_from_monday() + 1,
         DatePart::DayOfYear => |d| d.ordinal() as i32,
         DatePart::Hour => |d| d.hour() as i32,
         DatePart::Minute => |d| d.minute() as i32,
@@ -123,6 +183,10 @@ where
 ///
 /// Returns an [`Int32Array`] unless input was a dictionary type, in which case returns
 /// the dictionary but with this function applied onto its values.
+///
+/// Null inputs produce null outputs. A timestamp outside the supported calendar
+/// range also produces null, except that for timestamps without a timezone the
+/// time parts (`Hour` through `Nanosecond`) are defined for every value.
 ///
 /// If array passed in is not of the above listed types (or is a dictionary array where the
 /// values array isn't of the above listed types), then this function will return an error.
@@ -189,7 +253,12 @@ pub fn date_part(array: &dyn Array, part: DatePart) -> Result<ArrayRef, ArrowErr
         DataType::Dictionary(_, _) => {
             let array = array.as_any_dictionary();
             let values = date_part(array.values(), part)?;
-            let values = Arc::new(values) as ArrayRef;
+            let new_array = array.with_values(values);
+            Ok(new_array)
+        }
+        DataType::RunEndEncoded(_, _) => {
+            let array = array.as_any_ree();
+            let values = date_part(array.values(), part)?;
             let new_array = array.with_values(values);
             Ok(new_array)
         }
@@ -350,6 +419,62 @@ impl ExtractDatePartExt for PrimitiveArray<Date64Type> {
     }
 }
 
+/// Number of ticks in one second for timestamps of type `T`.
+const fn units_per_second<T: ArrowTimestampType>() -> i64 {
+    match T::UNIT {
+        TimeUnit::Second => 1,
+        TimeUnit::Millisecond => MILLISECONDS,
+        TimeUnit::Microsecond => MICROSECONDS,
+        TimeUnit::Nanosecond => NANOSECONDS,
+    }
+}
+
+/// Extracts a time-of-day part from a timestamp array without a timezone using
+/// integer arithmetic. Returns `None` for parts that require a calendar
+/// conversion.
+///
+/// `div_euclid` rounds toward negative infinity and `rem_euclid` yields a
+/// nonnegative remainder, so pre-epoch values produce in-range components:
+/// -1 ms is 1969-12-31 23:59:59.999, whose second is 59 and millisecond is 999.
+fn timestamp_time_part<T: ArrowTimestampType>(
+    array: &PrimitiveArray<T>,
+    part: DatePart,
+) -> Option<Int32Array> {
+    Some(match part {
+        DatePart::Hour => {
+            array.unary(|v| v.div_euclid(units_per_second::<T>() * 3_600).rem_euclid(24) as i32)
+        }
+        DatePart::Minute => {
+            array.unary(|v| v.div_euclid(units_per_second::<T>() * 60).rem_euclid(60) as i32)
+        }
+        DatePart::Second => {
+            array.unary(|v| v.div_euclid(units_per_second::<T>()).rem_euclid(60) as i32)
+        }
+        DatePart::Millisecond => {
+            array.unary(|v| subsecond(v, units_per_second::<T>(), MILLISECONDS))
+        }
+        DatePart::Microsecond => {
+            array.unary(|v| subsecond(v, units_per_second::<T>(), MICROSECONDS))
+        }
+        DatePart::Nanosecond => array.unary(|v| subsecond(v, units_per_second::<T>(), NANOSECONDS)),
+        _ => return None,
+    })
+}
+
+/// Fractional second of `v`, counted in `units` per second, rescaled to `target`
+/// per second. Both scales divide one second evenly, so the conversion is exact
+/// when scaling up and truncating when scaling down.
+#[inline]
+fn subsecond(v: i64, units: i64, target: i64) -> i32 {
+    let fraction = v.rem_euclid(units);
+    let scaled = if target >= units {
+        fraction * (target / units)
+    } else {
+        fraction / (units / target)
+    };
+    scaled as i32
+}
+
 impl ExtractDatePartExt for PrimitiveArray<TimestampSecondType> {
     fn date_part(&self, part: DatePart) -> Result<Int32Array, ArrowError> {
         // TimestampSecond only encodes number of seconds, so these will always be 0
@@ -363,6 +488,8 @@ impl ExtractDatePartExt for PrimitiveArray<TimestampSecondType> {
                         .map(|c| Utc.from_utc_datetime(&c).with_timezone(&tz))
                         .map(map_func)
                 })
+            } else if let Some(array) = timestamp_time_part(self, part) {
+                array
             } else {
                 let map_func = get_date_time_part_extract_fn(part);
                 self.unary_opt(|d| timestamp_s_to_datetime(d).map(map_func))
@@ -380,6 +507,8 @@ impl ExtractDatePartExt for PrimitiveArray<TimestampMillisecondType> {
                     .map(|c| Utc.from_utc_datetime(&c).with_timezone(&tz))
                     .map(map_func)
             })
+        } else if let Some(array) = timestamp_time_part(self, part) {
+            array
         } else {
             let map_func = get_date_time_part_extract_fn(part);
             self.unary_opt(|d| timestamp_ms_to_datetime(d).map(map_func))
@@ -397,6 +526,8 @@ impl ExtractDatePartExt for PrimitiveArray<TimestampMicrosecondType> {
                     .map(|c| Utc.from_utc_datetime(&c).with_timezone(&tz))
                     .map(map_func)
             })
+        } else if let Some(array) = timestamp_time_part(self, part) {
+            array
         } else {
             let map_func = get_date_time_part_extract_fn(part);
             self.unary_opt(|d| timestamp_us_to_datetime(d).map(map_func))
@@ -414,6 +545,8 @@ impl ExtractDatePartExt for PrimitiveArray<TimestampNanosecondType> {
                     .map(|c| Utc.from_utc_datetime(&c).with_timezone(&tz))
                     .map(map_func)
             })
+        } else if let Some(array) = timestamp_time_part(self, part) {
+            array
         } else {
             let map_func = get_date_time_part_extract_fn(part);
             self.unary_opt(|d| timestamp_ns_to_datetime(d).map(map_func))
@@ -435,6 +568,8 @@ impl ExtractDatePartExt for PrimitiveArray<IntervalYearMonthType> {
             | DatePart::Day
             | DatePart::DayOfWeekSunday0
             | DatePart::DayOfWeekMonday0
+            | DatePart::DayOfWeekSunday1
+            | DatePart::DayOfWeekMonday1
             | DatePart::DayOfYear
             | DatePart::Hour
             | DatePart::Minute
@@ -471,6 +606,8 @@ impl ExtractDatePartExt for PrimitiveArray<IntervalDayTimeType> {
             | DatePart::Month
             | DatePart::DayOfWeekSunday0
             | DatePart::DayOfWeekMonday0
+            | DatePart::DayOfWeekSunday1
+            | DatePart::DayOfWeekMonday1
             | DatePart::DayOfYear => {
                 return_compute_error_with!(format!("{part} does not support"), self.data_type())
             }
@@ -513,6 +650,8 @@ impl ExtractDatePartExt for PrimitiveArray<IntervalMonthDayNanoType> {
             | DatePart::YearISO
             | DatePart::DayOfWeekSunday0
             | DatePart::DayOfWeekMonday0
+            | DatePart::DayOfWeekSunday1
+            | DatePart::DayOfWeekMonday1
             | DatePart::DayOfYear => {
                 return_compute_error_with!(format!("{part} does not support"), self.data_type())
             }
@@ -528,15 +667,13 @@ impl ExtractDatePartExt for PrimitiveArray<DurationSecondType> {
             DatePart::Hour => Ok(self.unary_opt(|d| (d / (60 * 60)).try_into().ok())),
             DatePart::Minute => Ok(self.unary_opt(|d| (d / 60).try_into().ok())),
             DatePart::Second => Ok(self.unary_opt(|d| d.try_into().ok())),
-            DatePart::Millisecond => {
-                Ok(self.unary_opt(|d| d.checked_mul(1_000).and_then(|d| d.try_into().ok())))
-            }
+            DatePart::Millisecond => Ok(self.unary_opt(|d| d.checked_mul(1_000)?.try_into().ok())),
             DatePart::Microsecond => {
-                Ok(self.unary_opt(|d| d.checked_mul(1_000_000).and_then(|d| d.try_into().ok())))
+                Ok(self.unary_opt(|d| d.checked_mul(1_000_000)?.try_into().ok()))
             }
-            DatePart::Nanosecond => Ok(
-                self.unary_opt(|d| d.checked_mul(1_000_000_000).and_then(|d| d.try_into().ok()))
-            ),
+            DatePart::Nanosecond => {
+                Ok(self.unary_opt(|d| d.checked_mul(1_000_000_000)?.try_into().ok()))
+            }
 
             DatePart::Year
             | DatePart::YearISO
@@ -545,6 +682,8 @@ impl ExtractDatePartExt for PrimitiveArray<DurationSecondType> {
             | DatePart::Month
             | DatePart::DayOfWeekSunday0
             | DatePart::DayOfWeekMonday0
+            | DatePart::DayOfWeekSunday1
+            | DatePart::DayOfWeekMonday1
             | DatePart::DayOfYear => {
                 return_compute_error_with!(format!("{part} does not support"), self.data_type())
             }
@@ -563,11 +702,9 @@ impl ExtractDatePartExt for PrimitiveArray<DurationMillisecondType> {
             DatePart::Minute => Ok(self.unary_opt(|d| (d / (1_000 * 60)).try_into().ok())),
             DatePart::Second => Ok(self.unary_opt(|d| (d / 1_000).try_into().ok())),
             DatePart::Millisecond => Ok(self.unary_opt(|d| d.try_into().ok())),
-            DatePart::Microsecond => {
-                Ok(self.unary_opt(|d| d.checked_mul(1_000).and_then(|d| d.try_into().ok())))
-            }
+            DatePart::Microsecond => Ok(self.unary_opt(|d| d.checked_mul(1_000)?.try_into().ok())),
             DatePart::Nanosecond => {
-                Ok(self.unary_opt(|d| d.checked_mul(1_000_000).and_then(|d| d.try_into().ok())))
+                Ok(self.unary_opt(|d| d.checked_mul(1_000_000)?.try_into().ok()))
             }
 
             DatePart::Year
@@ -577,6 +714,8 @@ impl ExtractDatePartExt for PrimitiveArray<DurationMillisecondType> {
             | DatePart::Month
             | DatePart::DayOfWeekSunday0
             | DatePart::DayOfWeekMonday0
+            | DatePart::DayOfWeekSunday1
+            | DatePart::DayOfWeekMonday1
             | DatePart::DayOfYear => {
                 return_compute_error_with!(format!("{part} does not support"), self.data_type())
             }
@@ -598,9 +737,7 @@ impl ExtractDatePartExt for PrimitiveArray<DurationMicrosecondType> {
             DatePart::Second => Ok(self.unary_opt(|d| (d / 1_000_000).try_into().ok())),
             DatePart::Millisecond => Ok(self.unary_opt(|d| (d / 1_000).try_into().ok())),
             DatePart::Microsecond => Ok(self.unary_opt(|d| d.try_into().ok())),
-            DatePart::Nanosecond => {
-                Ok(self.unary_opt(|d| d.checked_mul(1_000).and_then(|d| d.try_into().ok())))
-            }
+            DatePart::Nanosecond => Ok(self.unary_opt(|d| d.checked_mul(1_000)?.try_into().ok())),
 
             DatePart::Year
             | DatePart::YearISO
@@ -609,6 +746,8 @@ impl ExtractDatePartExt for PrimitiveArray<DurationMicrosecondType> {
             | DatePart::Month
             | DatePart::DayOfWeekSunday0
             | DatePart::DayOfWeekMonday0
+            | DatePart::DayOfWeekSunday1
+            | DatePart::DayOfWeekMonday1
             | DatePart::DayOfYear => {
                 return_compute_error_with!(format!("{part} does not support"), self.data_type())
             }
@@ -641,6 +780,8 @@ impl ExtractDatePartExt for PrimitiveArray<DurationNanosecondType> {
             | DatePart::Month
             | DatePart::DayOfWeekSunday0
             | DatePart::DayOfWeekMonday0
+            | DatePart::DayOfWeekSunday1
+            | DatePart::DayOfWeekMonday1
             | DatePart::DayOfYear => {
                 return_compute_error_with!(format!("{part} does not support"), self.data_type())
             }
@@ -679,6 +820,9 @@ impl<T: Datelike> ChronoDateExt for T {
 mod tests {
     use super::*;
 
+    use arrow_array::temporal_conversions::as_datetime;
+    use chrono::NaiveDate;
+
     /// Used to integrate new [`date_part()`] method with deprecated shims such as
     /// [`hour()`] and [`week()`].
     fn date_part_primitive<T: ArrowTemporalType>(
@@ -687,6 +831,119 @@ mod tests {
     ) -> Result<Int32Array, ArrowError> {
         let array = date_part(array, part)?;
         Ok(array.as_primitive::<Int32Type>().to_owned())
+    }
+
+    /// Time-of-day parts of a timestamp.
+    const TIME_PARTS: [DatePart; 6] = [
+        DatePart::Hour,
+        DatePart::Minute,
+        DatePart::Second,
+        DatePart::Millisecond,
+        DatePart::Microsecond,
+        DatePart::Nanosecond,
+    ];
+
+    /// Checks time part extraction against the calendar conversion for values within
+    /// its supported range. Covers component boundaries, negative timestamps, nulls
+    /// and slices, plus timezone dispatch and invalid timezone metadata.
+    fn check_timestamp_time_parts<T: ArrowTimestampType>(units_per_second: i64) {
+        let mut values = vec![i64::MIN, i64::MAX];
+        for boundary in [1_000, 1_000_000] {
+            for delta in [-1, 0, 1] {
+                values.extend([boundary + delta, -boundary + delta]);
+            }
+        }
+        for base in [0, 60, 3_600, 86_400] {
+            for delta in [-1, 0, 1] {
+                for seconds in [base + delta, -base + delta] {
+                    for fraction in [-1, 0, 1, units_per_second - 1] {
+                        let value = i128::from(seconds) * i128::from(units_per_second)
+                            + i128::from(fraction);
+                        if let Ok(value) = i64::try_from(value) {
+                            values.push(value);
+                        }
+                    }
+                }
+            }
+        }
+        // Sample both the full i64 domain and dates near the epoch: most full-range
+        // second and millisecond timestamps are outside the supported calendar range.
+        let mut seed = 42_u64;
+        for _ in 0..256 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            values.push(seed as i64);
+            let seconds = (seed % 4_000_000_000) as i64 - 2_000_000_000;
+            values.push(seconds * units_per_second + (seed % units_per_second as u64) as i64);
+        }
+        // The calendar conversion provides expected values only within its range.
+        // Behavior at the i64 extremes is checked separately.
+        values.retain(|&v| as_datetime::<T>(v).is_some());
+        let no_nulls = PrimitiveArray::<T>::new(values.clone().into(), None);
+        let mixed = PrimitiveArray::<T>::from_iter(
+            values
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| (i % 5 != 0).then_some(v)),
+        );
+        for array in [no_nulls, mixed.slice(1, mixed.len() - 2)] {
+            for part in TIME_PARTS {
+                let map_func = get_date_time_part_extract_fn(part);
+                let expected: Int32Array = array.unary_opt(|v| as_datetime::<T>(v).map(map_func));
+                let actual = date_part(&array, part).unwrap();
+                assert_eq!(
+                    actual.as_primitive::<Int32Type>(),
+                    &expected,
+                    "{} {part}",
+                    T::DATA_TYPE
+                );
+            }
+        }
+
+        // An offset that changes both hour and minute checks that timezone metadata
+        // still routes through the calendar conversion.
+        let zoned = PrimitiveArray::<T>::from_iter_values([0]).with_timezone("+05:45");
+        for (part, expected) in [(DatePart::Hour, 5), (DatePart::Minute, 45)] {
+            assert_eq!(
+                date_part_primitive(&zoned, part).unwrap(),
+                Int32Array::from(vec![expected])
+            );
+        }
+        let invalid = PrimitiveArray::<T>::from_iter_values([0]).with_timezone("invalid timezone");
+        assert!(date_part(&invalid, DatePart::Second).is_err());
+    }
+
+    #[test]
+    fn test_timestamp_time_parts_match_chrono() {
+        check_timestamp_time_parts::<TimestampSecondType>(1);
+        check_timestamp_time_parts::<TimestampMillisecondType>(MILLISECONDS);
+        check_timestamp_time_parts::<TimestampMicrosecondType>(MICROSECONDS);
+        check_timestamp_time_parts::<TimestampNanosecondType>(NANOSECONDS);
+    }
+
+    #[test]
+    fn test_timestamp_time_parts_extremes() {
+        /// `(hour, minute, second, nanosecond)` expected at `i64::MIN` and `i64::MAX`.
+        fn check<T: ArrowTimestampType>(min: (u32, u32, u32, u32), max: (u32, u32, u32, u32)) {
+            let time = |(h, m, s, ns)| NaiveDate::default().and_hms_nano_opt(h, m, s, ns).unwrap();
+            let expected = [Some(time(min)), None, Some(time(max))];
+            let array = PrimitiveArray::<T>::from_iter([Some(i64::MIN), None, Some(i64::MAX)]);
+            for part in TIME_PARTS {
+                let map_func = get_date_time_part_extract_fn(part);
+                assert_eq!(
+                    date_part_primitive(&array, part).unwrap(),
+                    Int32Array::from_iter(expected.iter().map(|t| t.map(map_func))),
+                    "{} {part}",
+                    T::DATA_TYPE
+                );
+            }
+        }
+
+        // These values lie outside the supported calendar range for these units, so
+        // the expectations cannot be derived from the calendar conversion. Nanosecond
+        // extremes are within range and are covered by the comparison against it.
+        check::<TimestampSecondType>((8, 29, 52, 0), (15, 30, 7, 0));
+        check::<TimestampMillisecondType>((16, 47, 4, 192_000_000), (7, 12, 55, 807_000_000));
+        check::<TimestampMicrosecondType>((19, 59, 5, 224_192_000), (4, 0, 54, 775_807_000));
     }
 
     #[test]
@@ -793,6 +1050,76 @@ mod tests {
     }
 
     #[test]
+    fn test_all_quarters_date64() {
+        // verify all 4 quarters return 1-4 (not 0-indexed!)
+        // 1767225600000 -> 2026-01-01 (Q1)
+        // 1775001600000 -> 2026-04-01 (Q2, +90 days: jan31+feb28+mar31)
+        // 1782864000000 -> 2026-07-01 (Q3, +181 days)
+        // 1790812800000 -> 2026-10-01 (Q4, +273 days)
+        let a: PrimitiveArray<Date64Type> = vec![
+            Some(1767225600000),
+            Some(1775001600000),
+            Some(1782864000000),
+            Some(1790812800000),
+            None,
+        ]
+        .into();
+
+        let b = date_part_primitive(&a, DatePart::Quarter).unwrap();
+        assert_eq!(1, b.value(0)); // jan -> q1
+        assert_eq!(2, b.value(1)); // apr -> q2
+        assert_eq!(3, b.value(2)); // jul -> q3
+        assert_eq!(4, b.value(3)); // oct -> q4
+        assert!(!b.is_valid(4));
+    }
+
+    #[test]
+    fn test_all_quarters_date32() {
+        // verify all 4 quarters for Date32 (days since epoch)
+        // 20454 -> 2026-01-01 (Q1)
+        // 20544 -> 2026-04-01 (Q2, +90 days)
+        // 20635 -> 2026-07-01 (Q3, +181 days)
+        // 20727 -> 2026-10-01 (Q4, +273 days)
+        let a: PrimitiveArray<Date32Type> =
+            vec![Some(20454), Some(20544), Some(20635), Some(20727), None].into();
+
+        let b = date_part_primitive(&a, DatePart::Quarter).unwrap();
+        assert_eq!(1, b.value(0));
+        assert_eq!(2, b.value(1));
+        assert_eq!(3, b.value(2));
+        assert_eq!(4, b.value(3));
+        assert!(!b.is_valid(4));
+    }
+
+    #[test]
+    fn test_quarter_timestamp_microsecond() {
+        // timestamps are in microseconds (ms * 1000)
+        // 1767225600000000 -> 2026-01-01 (Q1)
+        // 1782864000000000 -> 2026-07-01 (Q3)
+        let a: TimestampMicrosecondArray =
+            vec![Some(1767225600000000), None, Some(1782864000000000)].into();
+
+        let b = date_part_primitive(&a, DatePart::Quarter).unwrap();
+        assert_eq!(1, b.value(0));
+        assert!(!b.is_valid(1));
+        assert_eq!(3, b.value(2));
+    }
+
+    #[test]
+    fn test_quarter_timestamp_nanosecond() {
+        // same as `test_quarter_timestamp_microsecond` but nanosecond precision (ms * 1_000_000)
+        // 1775001600000000000 -> 2026-04-01 (Q2)
+        // 1790812800000000000 -> 2026-10-01 (Q4)
+        let a: TimestampNanosecondArray =
+            vec![Some(1775001600000000000), None, Some(1790812800000000000)].into();
+
+        let b = date_part_primitive(&a, DatePart::Quarter).unwrap();
+        assert_eq!(2, b.value(0));
+        assert!(!b.is_valid(1));
+        assert_eq!(4, b.value(2));
+    }
+
+    #[test]
     fn test_temporal_array_date64_month() {
         //1514764800000 -> 2018-01-01
         //1550636625000 -> 2019-02-20
@@ -848,6 +1175,46 @@ mod tests {
         assert_eq!(0, b.value(0));
         assert!(!b.is_valid(1));
         assert_eq!(2, b.value(2));
+    }
+
+    #[test]
+    fn test_temporal_array_date64_dayofweek1() {
+        //1514764800000 -> 2018-01-01 (Monday)
+        //1550636625000 -> 2019-02-20 (Wednesday)
+        //1483228800000 -> 2017-01-01 (Sunday)
+        let a: PrimitiveArray<Date64Type> = vec![
+            Some(1514764800000),
+            None,
+            Some(1550636625000),
+            Some(1483228800000),
+        ]
+        .into();
+
+        let b = date_part_primitive(&a, DatePart::DayOfWeekSunday1).unwrap();
+        assert_eq!(2, b.value(0));
+        assert!(!b.is_valid(1));
+        assert_eq!(4, b.value(2));
+        assert_eq!(1, b.value(3));
+    }
+
+    #[test]
+    fn test_temporal_array_date64_isodow() {
+        //1514764800000 -> 2018-01-01 (Monday)
+        //1550636625000 -> 2019-02-20 (Wednesday)
+        //1483228800000 -> 2017-01-01 (Sunday)
+        let a: PrimitiveArray<Date64Type> = vec![
+            Some(1514764800000),
+            None,
+            Some(1550636625000),
+            Some(1483228800000),
+        ]
+        .into();
+
+        let b = date_part_primitive(&a, DatePart::DayOfWeekMonday1).unwrap();
+        assert_eq!(1, b.value(0));
+        assert!(!b.is_valid(1));
+        assert_eq!(3, b.value(2));
+        assert_eq!(7, b.value(3));
     }
 
     #[test]
@@ -1444,11 +1811,15 @@ mod tests {
             let invalid_parts = [
                 DatePart::Quarter,
                 DatePart::Year,
+                DatePart::YearISO,
                 DatePart::Month,
                 DatePart::Week,
+                DatePart::WeekISO,
                 DatePart::Day,
                 DatePart::DayOfWeekSunday0,
                 DatePart::DayOfWeekMonday0,
+                DatePart::DayOfWeekSunday1,
+                DatePart::DayOfWeekMonday1,
                 DatePart::DayOfYear,
             ];
 
@@ -1678,8 +2049,12 @@ mod tests {
         fn ensure_returns_error(array: &dyn Array) {
             let invalid_parts = [
                 DatePart::Quarter,
+                DatePart::YearISO,
+                DatePart::WeekISO,
                 DatePart::DayOfWeekSunday0,
                 DatePart::DayOfWeekMonday0,
+                DatePart::DayOfWeekSunday1,
+                DatePart::DayOfWeekMonday1,
                 DatePart::DayOfYear,
             ];
 
@@ -1821,10 +2196,14 @@ mod tests {
         fn ensure_returns_error(array: &dyn Array) {
             let invalid_parts = [
                 DatePart::Year,
+                DatePart::YearISO,
                 DatePart::Quarter,
                 DatePart::Month,
+                DatePart::WeekISO,
                 DatePart::DayOfWeekSunday0,
                 DatePart::DayOfWeekMonday0,
+                DatePart::DayOfWeekSunday1,
+                DatePart::DayOfWeekMonday1,
                 DatePart::DayOfYear,
             ];
 
@@ -1968,5 +2347,124 @@ mod tests {
         assert_eq!(2015, actual.value(0));
         assert_eq!(2015, actual.value(1));
         assert_eq!(2016, actual.value(2));
+    }
+
+    #[test]
+    fn test_ree_timestamp_year() {
+        let vals: TimestampSecondArray =
+            vec![Some(1514764800), Some(1550636625), Some(1550636625)].into();
+        let run_ends = Int32Array::from(vec![1, 2, 3]);
+        let ree = RunArray::try_new(&run_ends, &vals).unwrap();
+
+        let b = date_part(&ree, DatePart::Year).unwrap();
+        let ree_result = b.as_run_opt::<Int32Type>().unwrap();
+        let values = ree_result.values().as_primitive::<Int32Type>();
+        assert_eq!(2018, values.value(0));
+        assert_eq!(2019, values.value(1));
+        assert_eq!(2019, values.value(2));
+    }
+
+    #[test]
+    fn test_ree_date64_month() {
+        let vals: PrimitiveArray<Date64Type> =
+            vec![Some(1514764800000), Some(1550636625000)].into();
+        let run_ends = Int64Array::from(vec![2, 4]);
+        let ree = RunArray::try_new(&run_ends, &vals).unwrap();
+
+        let b = date_part(&ree, DatePart::Month).unwrap();
+        let ree_result = b.as_run_opt::<Int64Type>().unwrap();
+        let values = ree_result.values().as_primitive::<Int32Type>();
+        assert_eq!(1, values.value(0));
+        assert_eq!(2, values.value(1));
+    }
+
+    #[test]
+    fn test_date_part_from_str() {
+        let cases = [
+            ("y", DatePart::Year),
+            ("yr", DatePart::Year),
+            ("year", DatePart::Year),
+            ("years", DatePart::Year),
+            ("YEAR", DatePart::Year),
+            ("isoyear", DatePart::YearISO),
+            ("qtr", DatePart::Quarter),
+            ("quarter", DatePart::Quarter),
+            ("quarters", DatePart::Quarter),
+            ("mon", DatePart::Month),
+            ("mons", DatePart::Month),
+            ("month", DatePart::Month),
+            ("MONTHS", DatePart::Month),
+            ("w", DatePart::Week),
+            ("week", DatePart::Week),
+            ("isoweek", DatePart::WeekISO),
+            ("d", DatePart::Day),
+            ("day", DatePart::Day),
+            ("dow", DatePart::DayOfWeekSunday0),
+            ("DayOfWeek", DatePart::DayOfWeekSunday0),
+            ("dow1", DatePart::DayOfWeekSunday1),
+            ("dayofweek1", DatePart::DayOfWeekSunday1),
+            ("DAYOFWEEK1", DatePart::DayOfWeekSunday1),
+            ("isodow", DatePart::DayOfWeekMonday1),
+            ("ISODOW", DatePart::DayOfWeekMonday1),
+            ("doy", DatePart::DayOfYear),
+            ("DayOfYear", DatePart::DayOfYear),
+            ("h", DatePart::Hour),
+            ("hr", DatePart::Hour),
+            ("hour", DatePart::Hour),
+            // Pin the famous `m`/`mon` ambiguity: `m` resolves to Minute,
+            // matching `arrow-cast`'s `IntervalUnit::from_str`. Use `mon`
+            // (or `month`) for Month.
+            ("m", DatePart::Minute),
+            ("min", DatePart::Minute),
+            ("mins", DatePart::Minute),
+            ("minute", DatePart::Minute),
+            ("s", DatePart::Second),
+            ("sec", DatePart::Second),
+            ("second", DatePart::Second),
+            ("ms", DatePart::Millisecond),
+            ("msec", DatePart::Millisecond),
+            ("mseconds", DatePart::Millisecond),
+            ("millisecond", DatePart::Millisecond),
+            ("us", DatePart::Microsecond),
+            ("usec", DatePart::Microsecond),
+            ("useconds", DatePart::Microsecond),
+            ("microsecond", DatePart::Microsecond),
+            ("nanosecond", DatePart::Nanosecond),
+            ("nanoseconds", DatePart::Nanosecond),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                DatePart::from_str(input).unwrap(),
+                expected,
+                "parsing {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_date_part_from_str_unknown() {
+        // Names intentionally rejected — see the FromStr doc comment for why.
+        let unknown = [
+            "epoch",
+            "century",
+            "decade",
+            "millennium",
+            "timezone",
+            "timezone_hour",
+            "timezone_minute",
+            // Whitespace is not trimmed — pin this so the behavior doesn't
+            // change silently. Callers should trim before parsing.
+            " year ",
+            "year ",
+            "",
+            "nope",
+        ];
+        for s in unknown {
+            let err = DatePart::from_str(s).unwrap_err();
+            assert!(
+                matches!(err, ArrowError::InvalidArgumentError(_)),
+                "expected InvalidArgumentError for {s:?}, got: {err}"
+            );
+        }
     }
 }

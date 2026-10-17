@@ -57,7 +57,7 @@ The `thrift_enum` macro can be used in this instance.
 
 ```rust
 thrift_enum!(
-    enum Type {
+enum Type {
   BOOLEAN = 0;
   INT32 = 1;
   INT64 = 2;
@@ -84,6 +84,8 @@ pub enum Type {
   FIXED_LEN_BYTE_ARRAY,
 }
 ```
+
+All Rust `enum`s produced with this macro will have `pub` visibility.
 
 ### Unions
 
@@ -174,6 +176,9 @@ pub enum ColumnCryptoMetaData {
     ENCRYPTION_WITH_COLUMN_KEY(EncryptionWithColumnKey),
 }
 ```
+
+All Rust `enum`s produced with either macro will have `pub` visibility. `thrift_union` also allows
+for lifetime annotations, but this capability is not currently utilized.
 
 ### Structs
 
@@ -274,7 +279,7 @@ impl<'a, R: ThriftCompactInputProtocol<'a>> ReadThrift<'a, R> for ConvertedType 
 ```
 
 The default behavior is to return an error when an unexpected field is encountered. One could,
-however, provide an `Unknown` variant if forward compatibility is neeeded in the case of an
+however, provide an `Unknown` variant if forward compatibility is needed in the case of an
 evolving enum.
 
 Deserializing structs is more involved, but still fairly easy. A thrift struct is serialized as
@@ -404,6 +409,32 @@ optional fields it is. A typical `write_thrift` implementation will look like:
         // write end of struct
         writer.write_struct_end()
     }
+```
+
+In most instances, the `WriteThriftField` implementation can be handled by the `write_thrift_field`
+macro. The first argument is the unqualified name of an object that implements `WriteThrift`, and
+the second is the field type (which will be `FieldType::Struct` for Thrift structs and unions,
+and `FieldType::I32` for Thrift enums).
+
+```rust
+write_thrift_field!(MyNewStruct, FieldType::Struct);
+```
+
+which expands to:
+
+```rust
+impl WriteThriftField for MyNewStruct {
+    fn write_thrift_field<W: Write>(
+        &self,
+        writer: &mut ThriftCompactOutputProtocol<W>,
+        field_id: i16,
+        last_field_id: i16,
+    ) -> Result<i16> {
+        writer.write_field_begin(FieldType::Struct, field_id, last_field_id)?;
+        self.write_thrift(writer)?;
+        Ok(field_id)
+    }
+}
 ```
 
 ### Handling for lists

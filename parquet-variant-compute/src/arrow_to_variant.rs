@@ -15,28 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::type_conversion::{CastOptions, decimal_to_variant_decimal};
 use arrow::array::{
     Array, AsArray, FixedSizeListArray, GenericBinaryArray, GenericListArray, GenericListViewArray,
-    GenericStringArray, OffsetSizeTrait, PrimitiveArray,
+    GenericStringArray, ListLikeArray, OffsetSizeTrait, PrimitiveArray,
 };
-use arrow::compute::kernels::cast;
+use arrow::compute::{CastOptions, kernels::cast};
 use arrow::datatypes::{
-    ArrowNativeType, ArrowPrimitiveType, ArrowTemporalType, ArrowTimestampType, Date32Type,
-    Date64Type, Float16Type, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type,
-    RunEndIndexType, Time32MillisecondType, Time32SecondType, Time64MicrosecondType,
-    Time64NanosecondType, TimestampMicrosecondType, TimestampMillisecondType,
-    TimestampNanosecondType, TimestampSecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+    self as datatypes, ArrowNativeType, ArrowPrimitiveType, ArrowTemporalType, ArrowTimestampType,
+    DecimalType, RunEndIndexType,
 };
 use arrow::temporal_conversions::{as_date, as_datetime, as_time};
 use arrow_schema::{ArrowError, DataType, TimeUnit};
 use chrono::{DateTime, TimeZone, Utc};
 use parquet_variant::{
     ObjectFieldBuilder, Variant, VariantBuilderExt, VariantDecimal4, VariantDecimal8,
-    VariantDecimal16,
+    VariantDecimal16, VariantDecimalType,
 };
 use std::collections::HashMap;
-use std::ops::Range;
 
 // ============================================================================
 // Row-oriented builders for efficient Arrow-to-Variant conversion
@@ -46,31 +41,31 @@ use std::ops::Range;
 pub(crate) enum ArrowToVariantRowBuilder<'a> {
     Null(NullArrowToVariantBuilder),
     Boolean(BooleanArrowToVariantBuilder<'a>),
-    PrimitiveInt8(PrimitiveArrowToVariantBuilder<'a, Int8Type>),
-    PrimitiveInt16(PrimitiveArrowToVariantBuilder<'a, Int16Type>),
-    PrimitiveInt32(PrimitiveArrowToVariantBuilder<'a, Int32Type>),
-    PrimitiveInt64(PrimitiveArrowToVariantBuilder<'a, Int64Type>),
-    PrimitiveUInt8(PrimitiveArrowToVariantBuilder<'a, UInt8Type>),
-    PrimitiveUInt16(PrimitiveArrowToVariantBuilder<'a, UInt16Type>),
-    PrimitiveUInt32(PrimitiveArrowToVariantBuilder<'a, UInt32Type>),
-    PrimitiveUInt64(PrimitiveArrowToVariantBuilder<'a, UInt64Type>),
-    PrimitiveFloat16(PrimitiveArrowToVariantBuilder<'a, Float16Type>),
-    PrimitiveFloat32(PrimitiveArrowToVariantBuilder<'a, Float32Type>),
-    PrimitiveFloat64(PrimitiveArrowToVariantBuilder<'a, Float64Type>),
-    Decimal32(Decimal32ArrowToVariantBuilder<'a>),
-    Decimal64(Decimal64ArrowToVariantBuilder<'a>),
-    Decimal128(Decimal128ArrowToVariantBuilder<'a>),
+    PrimitiveInt8(PrimitiveArrowToVariantBuilder<'a, datatypes::Int8Type>),
+    PrimitiveInt16(PrimitiveArrowToVariantBuilder<'a, datatypes::Int16Type>),
+    PrimitiveInt32(PrimitiveArrowToVariantBuilder<'a, datatypes::Int32Type>),
+    PrimitiveInt64(PrimitiveArrowToVariantBuilder<'a, datatypes::Int64Type>),
+    PrimitiveUInt8(PrimitiveArrowToVariantBuilder<'a, datatypes::UInt8Type>),
+    PrimitiveUInt16(PrimitiveArrowToVariantBuilder<'a, datatypes::UInt16Type>),
+    PrimitiveUInt32(PrimitiveArrowToVariantBuilder<'a, datatypes::UInt32Type>),
+    PrimitiveUInt64(PrimitiveArrowToVariantBuilder<'a, datatypes::UInt64Type>),
+    PrimitiveFloat16(PrimitiveArrowToVariantBuilder<'a, datatypes::Float16Type>),
+    PrimitiveFloat32(PrimitiveArrowToVariantBuilder<'a, datatypes::Float32Type>),
+    PrimitiveFloat64(PrimitiveArrowToVariantBuilder<'a, datatypes::Float64Type>),
+    Decimal32(DecimalArrowToVariantBuilder<'a, datatypes::Decimal32Type, VariantDecimal4>),
+    Decimal64(DecimalArrowToVariantBuilder<'a, datatypes::Decimal64Type, VariantDecimal8>),
+    Decimal128(DecimalArrowToVariantBuilder<'a, datatypes::Decimal128Type, VariantDecimal16>),
     Decimal256(Decimal256ArrowToVariantBuilder<'a>),
-    TimestampSecond(TimestampArrowToVariantBuilder<'a, TimestampSecondType>),
-    TimestampMillisecond(TimestampArrowToVariantBuilder<'a, TimestampMillisecondType>),
-    TimestampMicrosecond(TimestampArrowToVariantBuilder<'a, TimestampMicrosecondType>),
-    TimestampNanosecond(TimestampArrowToVariantBuilder<'a, TimestampNanosecondType>),
-    Date32(DateArrowToVariantBuilder<'a, Date32Type>),
-    Date64(DateArrowToVariantBuilder<'a, Date64Type>),
-    Time32Second(TimeArrowToVariantBuilder<'a, Time32SecondType>),
-    Time32Millisecond(TimeArrowToVariantBuilder<'a, Time32MillisecondType>),
-    Time64Microsecond(TimeArrowToVariantBuilder<'a, Time64MicrosecondType>),
-    Time64Nanosecond(TimeArrowToVariantBuilder<'a, Time64NanosecondType>),
+    TimestampSecond(TimestampArrowToVariantBuilder<'a, datatypes::TimestampSecondType>),
+    TimestampMillisecond(TimestampArrowToVariantBuilder<'a, datatypes::TimestampMillisecondType>),
+    TimestampMicrosecond(TimestampArrowToVariantBuilder<'a, datatypes::TimestampMicrosecondType>),
+    TimestampNanosecond(TimestampArrowToVariantBuilder<'a, datatypes::TimestampNanosecondType>),
+    Date32(DateArrowToVariantBuilder<'a, datatypes::Date32Type>),
+    Date64(DateArrowToVariantBuilder<'a, datatypes::Date64Type>),
+    Time32Second(TimeArrowToVariantBuilder<'a, datatypes::Time32SecondType>),
+    Time32Millisecond(TimeArrowToVariantBuilder<'a, datatypes::Time32MillisecondType>),
+    Time64Microsecond(TimeArrowToVariantBuilder<'a, datatypes::Time64MicrosecondType>),
+    Time64Nanosecond(TimeArrowToVariantBuilder<'a, datatypes::Time64NanosecondType>),
     Binary(BinaryArrowToVariantBuilder<'a, i32>),
     LargeBinary(BinaryArrowToVariantBuilder<'a, i64>),
     BinaryView(BinaryViewArrowToVariantBuilder<'a>),
@@ -87,12 +82,12 @@ pub(crate) enum ArrowToVariantRowBuilder<'a> {
     Map(MapArrowToVariantBuilder<'a>),
     Union(UnionArrowToVariantBuilder<'a>),
     Dictionary(DictionaryArrowToVariantBuilder<'a>),
-    RunEndEncodedInt16(RunEndEncodedArrowToVariantBuilder<'a, Int16Type>),
-    RunEndEncodedInt32(RunEndEncodedArrowToVariantBuilder<'a, Int32Type>),
-    RunEndEncodedInt64(RunEndEncodedArrowToVariantBuilder<'a, Int64Type>),
+    RunEndEncodedInt16(RunEndEncodedArrowToVariantBuilder<'a, datatypes::Int16Type>),
+    RunEndEncodedInt32(RunEndEncodedArrowToVariantBuilder<'a, datatypes::Int32Type>),
+    RunEndEncodedInt64(RunEndEncodedArrowToVariantBuilder<'a, datatypes::Int64Type>),
 }
 
-impl<'a> ArrowToVariantRowBuilder<'a> {
+impl ArrowToVariantRowBuilder<'_> {
     /// Appends a single row at the given index to the supplied builder.
     pub fn append_row(
         &mut self,
@@ -174,13 +169,13 @@ pub(crate) fn make_arrow_to_variant_row_builder<'a>(
             DataType::Float32 => PrimitiveFloat32(PrimitiveArrowToVariantBuilder::new(array)),
             DataType::Float64 => PrimitiveFloat64(PrimitiveArrowToVariantBuilder::new(array)),
             DataType::Decimal32(_, scale) => {
-                Decimal32(Decimal32ArrowToVariantBuilder::new(array, options, *scale))
+                Decimal32(DecimalArrowToVariantBuilder::new(array, options, *scale))
             }
             DataType::Decimal64(_, scale) => {
-                Decimal64(Decimal64ArrowToVariantBuilder::new(array, options, *scale))
+                Decimal64(DecimalArrowToVariantBuilder::new(array, options, *scale))
             }
             DataType::Decimal128(_, scale) => {
-                Decimal128(Decimal128ArrowToVariantBuilder::new(array, options, *scale))
+                Decimal128(DecimalArrowToVariantBuilder::new(array, options, *scale))
             }
             DataType::Decimal256(_, scale) => {
                 Decimal256(Decimal256ArrowToVariantBuilder::new(array, options, *scale))
@@ -320,26 +315,28 @@ pub(crate) fn make_arrow_to_variant_row_builder<'a>(
 // worth the trouble, tho, because it makes for some pretty bulky and unwieldy macro expansions.
 macro_rules! define_row_builder {
     (
-        struct $name:ident<$lifetime:lifetime $(, $generic:ident: $bound:path )?>
+        struct $name:ident<$lifetime:lifetime $(, $generic:ident $( : $bound:path )? )*>
         $( where $where_path:path: $where_bound:path $(,)? )?
-        $({ $($field:ident: $field_type:ty),+ $(,)? })?,
+        $({ $( $field:ident: $field_type:ty ),+ $(,)? })?,
         |$array_param:ident| -> $array_type:ty { $init_expr:expr }
-        $(, |$value:ident| $(-> Option<$option_ty:ty>)? $value_transform:expr)?
+        $(, |$value:ident| $(-> Option<$option_ty:ty>)? $value_transform:expr )?
     ) => {
-        pub(crate) struct $name<$lifetime $(, $generic: $bound )?>
+        pub(crate) struct $name<$lifetime $(, $generic: $( $bound )? )*>
         $( where $where_path: $where_bound )?
         {
             array: &$lifetime $array_type,
             $( $( $field: $field_type, )+ )?
+            _phantom: std::marker::PhantomData<($( $generic, )*)>, // capture all type params
         }
 
-        impl<$lifetime $(, $generic: $bound+ )?> $name<$lifetime $(, $generic)?>
+        impl<$lifetime $(, $generic: $( $bound )? )*> $name<$lifetime $(, $generic)*>
         $( where $where_path: $where_bound )?
         {
-            pub(crate) fn new($array_param: &$lifetime dyn Array $(, $( $field: $field_type ),+ )?) -> Self {
+            pub(crate) fn new($array_param: &$lifetime dyn Array $( $(, $field: $field_type )+ )?) -> Self {
                 Self {
                     array: $init_expr,
                     $( $( $field, )+ )?
+                    _phantom: std::marker::PhantomData,
                 }
             }
 
@@ -356,7 +353,7 @@ macro_rules! define_row_builder {
                     // legitimate compiler warnings if an infallible value transform fails to use
                     // its first extra field.
                     $(
-                        #[allow(unused)]
+                        #[expect(unused)]
                         $( let $field = &self.$field; )+
                     )?
 
@@ -368,16 +365,16 @@ macro_rules! define_row_builder {
                         $(
                             // NOTE: The `?` macro expansion fails without the type annotation.
                             let Some(value): Option<$option_ty> = value else {
-                                if self.options.strict {
-                                    return Err(ArrowError::ComputeError(format!(
-                                        "Failed to convert value at index {index}: conversion failed",
-                                    )));
-                                } else {
+                                return if self.options.safe {
                                     // Overflow is encoded as Variant::Null,
                                     // distinct from None indicating a missing value
                                     builder.append_value(Variant::Null);
-                                    return Ok(());
-                                }
+                                    Ok(())
+                                } else {
+                                    Err(ArrowError::ComputeError(format!(
+                                        "Failed to convert value at index {index}: conversion failed",
+                                    )))
+                                };
                             };
                         )?
                     )?
@@ -401,49 +398,33 @@ define_row_builder!(
 );
 
 define_row_builder!(
-    struct Decimal32ArrowToVariantBuilder<'a> {
-        options: &'a CastOptions,
+    struct DecimalArrowToVariantBuilder<'a, A: DecimalType, V>
+    where
+        V: VariantDecimalType<Native = A::Native>,
+    {
+        options: &'a CastOptions<'a>,
         scale: i8,
     },
-    |array| -> arrow::array::Decimal32Array { array.as_primitive() },
-    |value| -> Option<_> { decimal_to_variant_decimal!(value, scale, i32, VariantDecimal4) }
+    |array| -> PrimitiveArray<A> { array.as_primitive() },
+    |value| -> Option<_> { V::try_new_with_signed_scale(value, *scale).ok() }
 );
 
-define_row_builder!(
-    struct Decimal64ArrowToVariantBuilder<'a> {
-        options: &'a CastOptions,
-        scale: i8,
-    },
-    |array| -> arrow::array::Decimal64Array { array.as_primitive() },
-    |value| -> Option<_> { decimal_to_variant_decimal!(value, scale, i64, VariantDecimal8) }
-);
-
-define_row_builder!(
-    struct Decimal128ArrowToVariantBuilder<'a> {
-        options: &'a CastOptions,
-        scale: i8,
-    },
-    |array| -> arrow::array::Decimal128Array { array.as_primitive() },
-    |value| -> Option<_> { decimal_to_variant_decimal!(value, scale, i128, VariantDecimal16) }
-);
-
+// Decimal256 needs a two-stage conversion via i128
 define_row_builder!(
     struct Decimal256ArrowToVariantBuilder<'a> {
-        options: &'a CastOptions,
+        options: &'a CastOptions<'a>,
         scale: i8,
     },
     |array| -> arrow::array::Decimal256Array { array.as_primitive() },
     |value| -> Option<_> {
-        // Decimal256 needs special handling - convert to i128 if possible
-        value.to_i128().and_then(|i128_val| {
-            decimal_to_variant_decimal!(i128_val, scale, i128, VariantDecimal16)
-        })
+        let value = value.to_i128();
+        value.and_then(|v| VariantDecimal16::try_new_with_signed_scale(v, *scale).ok())
     }
 );
 
 define_row_builder!(
     struct TimestampArrowToVariantBuilder<'a, T: ArrowTimestampType> {
-        options: &'a CastOptions,
+        options: &'a CastOptions<'a>,
         has_time_zone: bool,
     },
     |array| -> PrimitiveArray<T> { array.as_primitive() },
@@ -467,7 +448,7 @@ define_row_builder!(
     where
         i64: From<T::Native>,
     {
-        options: &'a CastOptions,
+        options: &'a CastOptions<'a>,
     },
     |array| -> PrimitiveArray<T> { array.as_primitive() },
     |value| -> Option<_> {
@@ -481,7 +462,7 @@ define_row_builder!(
     where
         i64: From<T::Native>,
     {
-        options: &'a CastOptions,
+        options: &'a CastOptions<'a>,
     },
     |array| -> PrimitiveArray<T> { array.as_primitive() },
     |value| -> Option<_> {
@@ -520,7 +501,7 @@ pub(crate) struct NullArrowToVariantBuilder;
 
 impl NullArrowToVariantBuilder {
     fn append_row(
-        &mut self,
+        &self,
         builder: &mut impl VariantBuilderExt,
         _index: usize,
     ) -> Result<(), ArrowError> {
@@ -567,54 +548,6 @@ impl<'a, L: ListLikeArray> ListArrowToVariantBuilder<'a, L> {
         }
         list_builder.finish();
         Ok(())
-    }
-}
-
-/// Trait for list-like arrays that can provide element ranges
-pub(crate) trait ListLikeArray: Array {
-    /// Get the values array
-    fn values(&self) -> &dyn Array;
-
-    /// Get the start and end indices for a list element
-    fn element_range(&self, index: usize) -> Range<usize>;
-}
-
-impl<O: OffsetSizeTrait> ListLikeArray for GenericListArray<O> {
-    fn values(&self) -> &dyn Array {
-        self.values()
-    }
-
-    fn element_range(&self, index: usize) -> Range<usize> {
-        let offsets = self.offsets();
-        let start = offsets[index].as_usize();
-        let end = offsets[index + 1].as_usize();
-        start..end
-    }
-}
-
-impl<O: OffsetSizeTrait> ListLikeArray for GenericListViewArray<O> {
-    fn values(&self) -> &dyn Array {
-        self.values()
-    }
-
-    fn element_range(&self, index: usize) -> Range<usize> {
-        let offsets = self.value_offsets();
-        let sizes = self.value_sizes();
-        let offset = offsets[index].as_usize();
-        let size = sizes[index].as_usize();
-        offset..(offset + size)
-    }
-}
-
-impl ListLikeArray for FixedSizeListArray {
-    fn values(&self) -> &dyn Array {
-        self.values()
-    }
-
-    fn element_range(&self, index: usize) -> Range<usize> {
-        let value_length = self.value_length().as_usize();
-        let offset = index * value_length;
-        offset..(offset + value_length)
     }
 }
 
@@ -911,11 +844,18 @@ mod tests {
     use super::*;
     use crate::{VariantArray, VariantArrayBuilder};
     use arrow::array::{ArrayRef, BooleanArray, Int32Array, StringArray};
+    use arrow::datatypes::Int32Type;
     use std::sync::Arc;
 
     /// Builds a VariantArray from an Arrow array using the row builder.
     fn execute_row_builder_test(array: &dyn Array) -> VariantArray {
-        execute_row_builder_test_with_options(array, CastOptions::default())
+        execute_row_builder_test_with_options(
+            array,
+            CastOptions {
+                safe: false,
+                ..Default::default()
+            },
+        )
     }
 
     /// Variant of `execute_row_builder_test` that allows specifying options
@@ -941,7 +881,14 @@ mod tests {
     /// Generic helper function to test row builders with basic assertion patterns.
     /// Uses execute_row_builder_test and adds simple value comparison assertions.
     fn test_row_builder_basic(array: &dyn Array, expected_values: Vec<Option<Variant>>) {
-        test_row_builder_basic_with_options(array, expected_values, CastOptions::default());
+        test_row_builder_basic_with_options(
+            array,
+            expected_values,
+            CastOptions {
+                safe: false,
+                ..Default::default()
+            },
+        );
     }
 
     /// Variant of `test_row_builder_basic` that allows specifying options
@@ -956,9 +903,9 @@ mod tests {
         for (i, expected) in expected_values.iter().enumerate() {
             match expected {
                 Some(variant) => {
-                    assert_eq!(variant_array.value(i), *variant, "Mismatch at index {}", i)
+                    assert_eq!(variant_array.value(i), *variant, "Mismatch at index {i}")
                 }
-                None => assert!(variant_array.is_null(i), "Expected null at index {}", i),
+                None => assert!(variant_array.is_null(i), "Expected null at index {i}"),
             }
         }
     }
@@ -1074,7 +1021,10 @@ mod tests {
         let run_ends = Int32Array::from(vec![2, 5, 6]);
         let run_array = RunArray::<Int32Type>::try_new(&run_ends, &values).unwrap();
 
-        let options = CastOptions::default();
+        let options = CastOptions {
+            safe: false,
+            ..Default::default()
+        };
         let mut row_builder =
             make_arrow_to_variant_row_builder(run_array.data_type(), &run_array, &options).unwrap();
 
@@ -1100,7 +1050,10 @@ mod tests {
         let run_ends = Int32Array::from(vec![2, 4, 5]);
         let run_array = RunArray::<Int32Type>::try_new(&run_ends, &values).unwrap();
 
-        let options = CastOptions::default();
+        let options = CastOptions {
+            safe: false,
+            ..Default::default()
+        };
         let mut row_builder =
             make_arrow_to_variant_row_builder(run_array.data_type(), &run_array, &options).unwrap();
         let mut array_builder = VariantArrayBuilder::new(5);
@@ -1151,7 +1104,10 @@ mod tests {
         let keys = Int32Array::from(vec![Some(0), None, Some(1), None, Some(2)]);
         let dict_array = DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).unwrap();
 
-        let options = CastOptions::default();
+        let options = CastOptions {
+            safe: false,
+            ..Default::default()
+        };
         let mut row_builder =
             make_arrow_to_variant_row_builder(dict_array.data_type(), &dict_array, &options)
                 .unwrap();
@@ -1183,7 +1139,10 @@ mod tests {
         let keys = Int32Array::from(vec![0, 1, 2, 0, 1, 2]);
         let dict_array = DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).unwrap();
 
-        let options = CastOptions::default();
+        let options = CastOptions {
+            safe: false,
+            ..Default::default()
+        };
         let mut row_builder =
             make_arrow_to_variant_row_builder(dict_array.data_type(), &dict_array, &options)
                 .unwrap();
@@ -1223,7 +1182,10 @@ mod tests {
         let dict_array =
             DictionaryArray::<Int32Type>::try_new(keys, Arc::new(struct_array)).unwrap();
 
-        let options = CastOptions::default();
+        let options = CastOptions {
+            safe: false,
+            ..Default::default()
+        };
         let mut row_builder =
             make_arrow_to_variant_row_builder(dict_array.data_type(), &dict_array, &options)
                 .unwrap();
@@ -1318,7 +1280,10 @@ mod tests {
         // Slice to get just the middle element: [[3, 4, 5]]
         let sliced_array = list_array.slice(1, 1);
 
-        let options = CastOptions::default();
+        let options = CastOptions {
+            safe: false,
+            ..Default::default()
+        };
         let mut row_builder =
             make_arrow_to_variant_row_builder(sliced_array.data_type(), &sliced_array, &options)
                 .unwrap();
@@ -1362,7 +1327,10 @@ mod tests {
             Some(arrow::buffer::NullBuffer::from(vec![true, false])),
         );
 
-        let options = CastOptions::default();
+        let options = CastOptions {
+            safe: false,
+            ..Default::default()
+        };
         let mut row_builder =
             make_arrow_to_variant_row_builder(outer_list.data_type(), &outer_list, &options)
                 .unwrap();
@@ -1410,8 +1378,8 @@ mod tests {
         let keys = StringArray::from(vec!["key1", "key2", "key3"]);
         let values = Int32Array::from(vec![1, 2, 3]);
         let entries_fields = Fields::from(vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("value", DataType::Int32, true),
+            Field::new(Field::MAP_KEY_FIELD_DEFAULT_NAME, DataType::Utf8, false),
+            Field::new(Field::MAP_VALUE_FIELD_DEFAULT_NAME, DataType::Int32, true),
         ]);
         let entries = StructArray::new(
             entries_fields.clone(),
@@ -1431,7 +1399,7 @@ mod tests {
 
         // Create the map field
         let map_field = Arc::new(Field::new(
-            "entries",
+            Field::MAP_ENTRIES_FIELD_DEFAULT_NAME,
             DataType::Struct(entries_fields),
             false, // Keys are non-nullable
         ));
@@ -1483,14 +1451,11 @@ mod tests {
         let string_array = StringArray::from(vec![None, None, Some("hello"), None, None, None]);
         let type_ids = [0, 1, 2, 1, 0, 0].into_iter().collect::<ScalarBuffer<i8>>();
 
-        let union_fields = UnionFields::new(
-            vec![0, 1, 2],
-            vec![
-                Field::new("int_field", DataType::Int32, false),
-                Field::new("float_field", DataType::Float64, false),
-                Field::new("string_field", DataType::Utf8, false),
-            ],
-        );
+        let union_fields = UnionFields::from_fields(vec![
+            Field::new("int_field", DataType::Int32, false),
+            Field::new("float_field", DataType::Float64, false),
+            Field::new("string_field", DataType::Utf8, false),
+        ]);
 
         let children: Vec<Arc<dyn Array>> = vec![
             Arc::new(int_array),
@@ -1531,14 +1496,11 @@ mod tests {
             .into_iter()
             .collect::<ScalarBuffer<i32>>();
 
-        let union_fields = UnionFields::new(
-            vec![0, 1, 2],
-            vec![
-                Field::new("int_field", DataType::Int32, false),
-                Field::new("float_field", DataType::Float64, false),
-                Field::new("string_field", DataType::Utf8, false),
-            ],
-        );
+        let union_fields = UnionFields::from_fields(vec![
+            Field::new("int_field", DataType::Int32, false),
+            Field::new("float_field", DataType::Float64, false),
+            Field::new("string_field", DataType::Utf8, false),
+        ]);
 
         let children: Vec<Arc<dyn Array>> = vec![
             Arc::new(int_array),
@@ -1555,7 +1517,10 @@ mod tests {
         .unwrap();
 
         // Test the row builder
-        let options = CastOptions::default();
+        let options = CastOptions {
+            safe: false,
+            ..Default::default()
+        };
         let mut row_builder =
             make_arrow_to_variant_row_builder(union_array.data_type(), &union_array, &options)
                 .unwrap();
@@ -1587,13 +1552,14 @@ mod tests {
         let string_array = StringArray::from(vec![None, Some("test")]);
         let type_ids = [1, 3].into_iter().collect::<ScalarBuffer<i8>>();
 
-        let union_fields = UnionFields::new(
+        let union_fields = UnionFields::try_new(
             vec![1, 3], // Non-contiguous type IDs
             vec![
                 Field::new("int_field", DataType::Int32, false),
                 Field::new("string_field", DataType::Utf8, false),
             ],
-        );
+        )
+        .unwrap();
 
         let children: Vec<Arc<dyn Array>> = vec![Arc::new(int_array), Arc::new(string_array)];
 
@@ -1606,7 +1572,10 @@ mod tests {
         .unwrap();
 
         // Test the row builder
-        let options = CastOptions::default();
+        let options = CastOptions {
+            safe: false,
+            ..Default::default()
+        };
         let mut row_builder =
             make_arrow_to_variant_row_builder(union_array.data_type(), &union_array, &options)
                 .unwrap();
@@ -1684,7 +1653,7 @@ mod tests {
                 Some(Variant::Null), // Overflow value becomes Variant::Null
                 Some(Variant::from(VariantDecimal16::try_new(123, 3).unwrap())),
             ],
-            CastOptions { strict: false },
+            CastOptions::default(),
         );
     }
 
